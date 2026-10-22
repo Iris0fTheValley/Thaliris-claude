@@ -103,7 +103,10 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
 - **全局提示词注册**：通过插件自身的 SessionStart、`agents/*.md` 和 skill，不改写用户的
   `~/.claude/CLAUDE.md`；卸载插件即全部移除。
 - **更新**：`claude plugin update thaliris@thaliris`（或 marketplace 自动更新），在新会话生效。
-  GitHub 来源安装到带版本号的缓存目录，进行中的会话仍用旧版本文件。用户选项与 `~/.thaliris` 数据跨版本保留；
+  GitHub 来源安装到带版本号的缓存目录（已实测：`plugins/cache/thaliris/thaliris/0.2.0`，Hook 脚本为 LF、
+  内置 Core 与锁一致、首次 Hook 自动发现系统 Python 3.11），进行中的会话仍用旧版本文件。Windows 上若把
+  `CLAUDE_CONFIG_DIR` 放在很深的目录，Git 克隆 marketplace 可能超出 260 字符路径上限；默认的 `~/.claude` 不受影响。
+  用户选项与 `~/.thaliris` 数据跨版本保留；
   lifecycle 文件带版本号，读到不认识的版本时报错而不是误读。内置 Core 随插件版本一起更新，
   `scripts/vendor_core.py --check --source <Core 仓库>` 校验内置字节与固定提交一致。
 
