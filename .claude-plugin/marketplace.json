@@ -1,0 +1,12 @@
+{
+  "name": "thaliris",
+  "owner": {"name": "Thaliris contributors"},
+  "description": "Thaliris context orchestration for Claude Code.",
+  "plugins": [
+    {
+      "name": "thaliris",
+      "source": "./",
+      "description": "Controller skill, fresh role subagents and evidence-continuity hooks over the shared Thaliris Core."
+    }
+  ]
+}

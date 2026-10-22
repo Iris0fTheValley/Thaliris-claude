@@ -1,0 +1,374 @@
+"""The Thaliris runner for Claude Code.
+
+Identity flags (`--native-session`, `--native-agent`) are appended by the
+PreToolUse hook from Host fields; a model never supplies them. Direct shared-OS
+invocation is not authentication, and missing identity stays UNKNOWN.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+from thaliris import authority as core_authority, core
+
+from . import __version__, hooks, roles, store
+
+_ROLE_TABLE_BEGIN, _ROLE_TABLE_END = "<!-- thaliris-roles:begin -->", "<!-- thaliris-roles:end -->"
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ValueError(message)
+
+
+def _parser() -> argparse.ArgumentParser:
+    # No abbreviations: `--native-s x` must not silently become an identity flag (H023).
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    common.add_argument("--native-session", help=argparse.SUPPRESS)
+    common.add_argument("--native-agent", help=argparse.SUPPRESS)
+    common.add_argument("--root", type=Path, help="project root (defaults to the session's task or the cwd)")
+    common.add_argument("--task-id", help="explicit task for read-only diagnostics")
+    parser = _Parser(prog="thaliris", description="Thaliris runner for Claude Code", allow_abbrev=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def add(name: str, help_text: str) -> argparse.ArgumentParser:
+        return commands.add_parser(name, parents=[common], help=help_text, allow_abbrev=False)
+
+    add("guidance", "print Controller guidance or one reference section").add_argument("--section")
+    add("bootstrap", "initialize the project for managed work and report navigation")
+    command = add("task-start", "admit a managed task from a human-selected authority contract file")
+    command.add_argument("goal")
+    command.add_argument("--contract", required=True, help="path to a UTF-8 JSON authority contract")
+    command = add("attach", "associate this session with an existing ACTIVE task")
+    command.add_argument("--reason", required=True)
+    add("status", "bounded routing and evidence status").add_argument("--evidence-offset", type=int, default=0)
+    add("get", "retrieve one task object by id").add_argument("id")
+    add("catalog", "list durable navigation").add_argument("path", nargs="?")
+    add("document-get", "read 1-8 selected durable documents").add_argument("paths", nargs="+")
+    for name, help_text in (("register", "register requirements or legacy handoff associations"),
+                            ("judge", "record a Controller requirement judgment"),
+                            ("promote", "promote selected records to .agent-memory"),
+                            ("document-maintain", "maintain selected durable documents")):
+        command = add(name, help_text)
+        command.add_argument("--base-revision", type=int, required=True)
+        _payload_args(command)
+    command = add("observe", "record one local observation with adapter provenance")
+    command.add_argument("--handoff-id", help="Controller import of a historical child result")
+    _payload_args(command)
+    command = add("mode", "switch execution mode on a human decision")
+    command.add_argument("--mode", required=True, choices=core_authority.MODES)
+    command.add_argument("--human-instruction", required=True)
+    command.add_argument("--base-revision", type=int, required=True)
+    command.add_argument("--expected-authority-sha256", required=True)
+    command = add("dispose", "end management of one dispatch and fence its grants")
+    command.add_argument("--handoff-id")
+    command.add_argument("--tool-use-id")
+    command.add_argument("--reason", required=True)
+    command = add("artifact", "register a task Artifact")
+    command.add_argument("--base-revision", type=int, required=True)
+    command.add_argument("--id", required=True)
+    command.add_argument("--path", required=True)
+    command.add_argument("--summary", required=True)
+    command.add_argument("--source-ref", action="append")
+    command = add("close", "record mechanical closure (DONE) after your product decision")
+    command.add_argument("--base-revision", type=int, required=True)
+    add("detach", "end this session's association; the task stays ACTIVE for a later attach").add_argument("--reason", required=True)
+    command = add("recover-authority", "restore anchored task bytes after an authority conflict and fence known children")
+    command.add_argument("--expected-authority-sha256", required=True)
+    command.add_argument("--reason", required=True)
+    add("render-agents", "regenerate agents/*.md and the skill role table").add_argument("--check", action="store_true")
+    add("version", "print the adapter version")
+    return parser
+
+
+def _payload_args(command: argparse.ArgumentParser) -> None:
+    group = command.add_mutually_exclusive_group(required=True)
+    group.add_argument("--json", dest="payload_json")
+    group.add_argument("--input")
+
+
+def _payload(args) -> dict:
+    raw = args.payload_json if args.payload_json is not None else Path(args.input).read_text(encoding="utf-8")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("payload must be a JSON object")
+    return value
+
+
+def _session(args) -> str:
+    session = store.native_id(args.native_session)
+    if session is None:
+        raise ValueError("NATIVE_IDENTITY_UNKNOWN: run the runner from Claude Code with the Thaliris plugin hooks active")
+    return session
+
+
+def _controller(args) -> str:
+    if args.native_agent is not None:
+        raise ValueError("CONTROLLER_ONLY: this operation belongs to the owning Controller")
+    return _session(args)
+
+
+def _task(args) -> tuple[Path, str]:
+    association = store.resolve_session(_session(args))
+    if association is None:
+        raise ValueError("NO_ACTIVE_TASK_FOR_SESSION: start a task, or `attach` this session to an existing one")
+    return association
+
+
+def _read_task(args) -> tuple[Path, str]:
+    """Read-only navigation may name a task explicitly; it is never an authority grant."""
+    if args.task_id:
+        return store.project_root(args.root or Path.cwd()), args.task_id
+    return _task(args)
+
+
+def _child_entry(ctx: dict, args) -> dict:
+    agent_id = store.native_id(args.native_agent)
+    entry = store.dispatch_for_agent(ctx["lifecycle"], agent_id) if agent_id else None
+    if entry is None or entry["binding"] not in store.EXACT_BINDINGS:
+        raise ValueError("NATIVE_IDENTITY_UNBOUND: report this in your final message instead")
+    if entry["disposed"]:
+        raise ValueError("DISPATCH_DISPOSED")
+    if entry["native_status"] in store.TERMINAL_STATUSES:
+        raise ValueError("DISPATCH_FINISHED: new work needs a fresh child")
+    return entry
+
+
+def _project(args) -> Path:
+    """The managed root is explicit or unambiguous; never guess among nested repositories (H138/H139)."""
+    if args.root is not None:
+        return store.project_root(args.root)
+    cwd = Path.cwd().resolve()
+    root = store.project_root(cwd)
+    if core._git_root(cwd) is None and not store.is_managed_project(root):
+        nested = []
+        for child in sorted(cwd.iterdir())[:200]:
+            if child.is_dir() and not child.name.startswith("."):
+                nested += [child] if (child / ".git").exists() else [
+                    grandchild for grandchild in sorted(child.iterdir())[:200]
+                    if grandchild.is_dir() and (grandchild / ".git").exists()]
+        if nested:
+            raise ValueError("AMBIGUOUS_PROJECT_ROOT: this directory is not a repository but contains repositories ("
+                             + ", ".join(path.relative_to(cwd).as_posix() for path in nested[:8])
+                             + "). Pass --root <the repository you mean>.")
+    return root
+
+
+def _status(root: Path, task_id: str, offset: int = 0) -> dict:
+    core.select_task(root, task_id)
+    result = core.task_status(root, offset)
+    lifecycle = store.read_lifecycle(root, task_id)
+    result["Claude Dispatches"] = [
+        {key: item.get(key) for key in ("handoff_id", "role", "native_status", "binding", "background", "disposed", "parent",
+                                        "requested_model", "observed_model", "observed_tools")}
+        | {"agent": store.native_hash(item["agent_id"]) if item.get("agent_id") else None,
+           "parent": item["parent"] if item["parent"] == "controller" else store.native_hash(item["parent"])}
+        for item in lifecycle["dispatches"][-16:]]
+    result["Claude Dispatch Count"] = len(lifecycle["dispatches"])
+    target = store.authority(root, task_id)
+    record = target.read()
+    result["Authority"] = None if record is None else {
+        "status": record["status"], "execution_mode": record["contract"]["execution_mode"],
+        "execution_constraint": record["contract"].get("execution_constraint"),
+        "sha256": core_authority.digest(target.path())}
+    return result
+
+
+def _render(check: bool) -> dict:
+    root = hooks.plugin_root()
+    outputs = dict(roles.rendered_agents())
+    skill = root / "skills" / "thaliris" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    start, end = text.index(_ROLE_TABLE_BEGIN) + len(_ROLE_TABLE_BEGIN), text.index(_ROLE_TABLE_END)
+    outputs["skills/thaliris/SKILL.md"] = text[:start] + "\n" + roles.render_role_table() + "\n" + text[end:]
+    drift = [name for name, content in outputs.items()
+             if not (root / name).is_file() or (root / name).read_text(encoding="utf-8") != content]
+    if not check:
+        for name in drift:
+            core._atomic_write(root / name, outputs[name].encode("utf-8"))
+    return {"ok": not (check and drift), "drift" if check else "written": drift}
+
+
+def run(args) -> dict:
+    name = args.command
+    if name == "version":
+        import platform
+        from importlib import metadata
+        return {"ok": True, "version": __version__, "plugin_root": hooks.plugin_root().as_posix(),
+                "python": platform.python_version(), "core_version": metadata.version("thaliris")}
+    if name == "render-agents":
+        return _render(args.check)
+    if name == "guidance":
+        base = hooks.plugin_root() / "skills" / "thaliris"
+        path = base / ("SKILL.md" if not args.section else f"{args.section}.md")
+        if args.section and (not path.resolve().is_relative_to(base.resolve()) or not path.is_file()):
+            raise ValueError("unknown guidance section; available: " + ", ".join(sorted(p.stem for p in base.glob("*.md") if p.name != "SKILL.md")))
+        return {"ok": True, "guidance": path.read_text(encoding="utf-8")}
+    if name == "bootstrap":
+        _controller(args)
+        root = _project(args)
+        initialized = None if store.is_managed_project(root) else core.init(root)
+        association = store.resolve_session(args.native_session)
+        return {"ok": True, "root": str(root), "initialized": initialized is not None,
+                "navigation": [".agent-memory/INDEX.md", ".milestones/INDEX.md"],
+                "associated_task": association[1] if association else None, "runner": hooks.runner_command()}
+    if name == "task-start":
+        session = _controller(args)
+        if store.resolve_session(session) is not None:
+            raise ValueError("SESSION_ALREADY_HAS_ACTIVE_TASK: close or abandon it first")
+        root = _project(args)
+        if args.contract.lstrip().startswith("{"):
+            # The contract is a file path, never inline JSON (H059).
+            raise ValueError("CONTRACT_FILE_PATH_REQUIRED: write the contract JSON to a file and pass its path")
+        contract = json.loads(Path(args.contract).read_text(encoding="utf-8"))
+        return store.start_task(root, args.goal, contract, session)
+    if name == "attach":
+        session = _controller(args)
+        if not args.task_id:
+            raise ValueError("attach requires --task-id")
+        root = _project(args)
+        with store.transaction(root, args.task_id):
+            pass  # The anchored authority must be ACTIVE and intact.
+        store.write_session(session, root, args.task_id, args.reason)
+        return {"ok": True, "task_id": args.task_id, "root": str(root)}
+    if name in {"status", "get"}:
+        root, task_id = _read_task(args)
+        if name == "status":
+            return _status(root, task_id, args.evidence_offset)
+        core.select_task(root, task_id)
+        return core.task_get(root, args.id)
+    if name in {"catalog", "document-get"}:
+        association = store.resolve_session(args.native_session)
+        root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())
+        return core.catalog(root, args.path) if name == "catalog" else core.document_get(root, args.paths)
+    root, task_id = _task(args)
+    if name == "observe":
+        payload = _payload(args)
+        with store.transaction(root, task_id) as ctx:
+            if args.native_agent is not None:
+                if args.handoff_id:
+                    raise ValueError("children never select a handoff id; the adapter supplies it")
+                _child_entry(ctx, args)
+                result = store.observe(ctx, payload, agent_id=args.native_agent, handoff_id=None)
+            else:
+                if not args.handoff_id:
+                    raise ValueError("Controller imports name the exact --handoff-id")
+                result = store.observe(ctx, payload, agent_id=None, handoff_id=args.handoff_id)
+        return {"ok": True, **result}
+    if name in {"promote", "document-maintain"}:
+        actor = "controller"
+        if args.native_agent is not None:
+            with store.transaction(root, task_id) as ctx:
+                entry = _child_entry(ctx, args)
+                if entry["role"] != "curator":
+                    raise ValueError("CURATOR_OR_CONTROLLER_ONLY")
+                actor = f"handoff:{entry['handoff_id']}" if entry["handoff_id"] else "curator"
+        else:
+            with store.transaction(root, task_id):
+                pass
+        core.select_task(root, task_id)
+        function = core.task_promote if name == "promote" else core.document_maintain
+        temporary = _payload_file(root, _payload(args))
+        try:
+            result = function(root, actor, args.base_revision, str(temporary))
+        finally:
+            temporary.unlink(missing_ok=True)
+        store.authority(root, task_id).checkpoint()
+        return result
+    _controller(args)
+    if name in {"register", "judge"}:
+        payload = _payload(args)
+        with store.transaction(root, task_id) as ctx:
+            store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
+            revision = ctx["state"]["revision"]
+        status = _status(root, task_id)
+        return {"ok": True, "task_id": task_id, "revision": revision, "Evidence Continuity": status["Evidence Continuity"]}
+    if name == "dispose":
+        with store.transaction(root, task_id) as ctx:
+            matches = [item for item in ctx["lifecycle"]["dispatches"]
+                       if (args.handoff_id and item["handoff_id"] == args.handoff_id) or (args.tool_use_id and item["tool_use_id"] == args.tool_use_id)]
+            if len(matches) != 1:
+                raise ValueError("DISPATCH_NOT_FOUND: name exactly one --handoff-id or --tool-use-id")
+            entry = matches[0]
+            entry["disposed"] = True
+            store.note(entry, "disposed", reason=args.reason[:500])
+            ctx["lifecycle_changed"] = True
+        # Disposal ends management and fences grants; it proves nothing about native termination.
+        return {"ok": True, "handoff_id": entry["handoff_id"], "native_status": entry["native_status"], "native_termination": "UNKNOWN"
+                if entry["native_status"] in store.UNRESOLVED_STATUSES else entry["native_status"]}
+    if name == "mode":
+        unresolved = store.unresolved(store.read_lifecycle(root, task_id))
+        if unresolved:
+            raise ValueError(f"UNRESOLVED_CHILD_DISPATCHES: {len(unresolved)} pending/running; wait for them or `dispose` them first")
+        return store.authority(root, task_id).switch_mode(args.expected_authority_sha256, args.base_revision, args.mode, args.human_instruction)
+    if name == "artifact":
+        with store.transaction(root, task_id):
+            pass
+        core.select_task(root, task_id)
+        result = core.task_artifact(root, args.base_revision, args.id, args.path, args.summary,
+                                    producer="controller", registered_by="claude:controller", evidence_refs=args.source_ref)
+        store.authority(root, task_id).checkpoint()
+        return result
+    if name == "close":
+        with store.transaction(root, task_id) as ctx:
+            unresolved = store.unresolved(ctx["lifecycle"])
+            if unresolved:
+                raise ValueError("CHILD_EXECUTION_UNRESOLVED: " + ", ".join(
+                    f"{item['role']}:{item['handoff_id'] or item['tool_use_id']}={item['native_status']}" for item in unresolved)
+                    + ". Wait for terminal evidence or `dispose` the dependency.")
+            if ctx["state"]["revision"] != args.base_revision:
+                raise ValueError("task revision conflict")
+            ctx["state"]["status"] = "DONE"
+            ctx["state"]["revision"] += 1
+            ctx["state_changed"] = True
+        return {"ok": True, "task_id": task_id, "status": "DONE", "revision": args.base_revision + 1,
+                "note": "DONE records mechanical closure; it is not product acceptance.",
+                "Evidence Continuity": _status(root, task_id)["Evidence Continuity"]}
+    if name == "detach":
+        store.clear_session(args.native_session)
+        return {"ok": True, "task_id": task_id, "status": "ACTIVE", "note": "Session association removed; authority and ledger are unchanged."}
+    if name == "recover-authority":
+        lifecycle_path = store.lifecycle_path(root, task_id)
+
+        def fence(record: dict) -> None:
+            # Known children lose their grants; their native termination stays UNKNOWN.
+            lifecycle = store.read_lifecycle(root, task_id)
+            for entry in lifecycle["dispatches"]:
+                if not entry["disposed"]:
+                    entry["disposed"] = True
+                    store.note(entry, "fenced-by-recovery", reason=args.reason[:500])
+            store.write_lifecycle(root, task_id, lifecycle)
+
+        result = store.authority(root, task_id).recover(
+            args.expected_authority_sha256, args.reason, restore_adapter=fence,
+            archive_paths={store.LIFECYCLE_NAME: lifecycle_path} if lifecycle_path.is_file() else {})
+        return {**result, "native_termination": "UNKNOWN"}
+    raise ValueError(f"unsupported command: {name}")
+
+
+def _payload_file(root: Path, payload: dict) -> Path:
+    path = root / ".context" / f".claude-input-{store.new_handoff_id()}.json"
+    core._atomic_write(path, json.dumps(payload).encode("utf-8"))
+    return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["hook"]:
+        return hooks.main(argv[1] if len(argv) > 1 else "")
+    try:
+        for flag in ("--native-session", "--native-agent"):
+            # argparse keeps the last repeated value; identity must appear at most once (H023).
+            if sum(item == flag or item.startswith(flag + "=") for item in argv) > 1:
+                raise ValueError(f"DUPLICATE_IDENTITY_FLAG: {flag}")
+        result = run(_parser().parse_args(argv))
+    except core.TaskStateSchemaIncompatible as exc:
+        result, code = {"ok": False, **exc.diagnostic}, 3
+    except (ValueError, OSError, RuntimeError, KeyError) as exc:
+        result, code = {"ok": False, "error": str(exc)}, 2
+    else:
+        code = 0 if result.get("ok", True) else 3
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    return code

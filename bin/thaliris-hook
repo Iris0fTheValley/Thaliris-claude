@@ -1,0 +1,54 @@
+#!/bin/sh
+# Hook entry for Claude Code (invoked as `sh .../thaliris-hook <Event> [--filter]`,
+# the same convention as Anthropic's own plugins).
+#
+# Bash/Edit/Write calls are most of a session's tool calls, and the plugin is
+# user-scoped, so this entry first decides without Python whether the adapter
+# could have anything to say. `--filter` passes a call on only when its payload
+# mentions Thaliris, `.context`, settings or the lifecycle file; every decision
+# the Python guards can make for such a call needs one of those (a Thaliris
+# child's agent_type contains "thaliris"). UserPromptSubmit runs every turn and
+# is skipped while no session has a Thaliris task. With a cached Python >= 3.11
+# the rest starts one interpreter; on a cache miss any Python runs the launcher,
+# which discovers and caches one. With no Python the hook stays transparent.
+event=$1
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+home=${THALIRIS_CLAUDE_HOME:-$HOME/.thaliris/claude}
+
+has_task() {
+  for association in "$home"/sessions/*.json; do
+    [ -e "$association" ] && return 0
+  done
+  return 1
+}
+
+if [ "$event" = "UserPromptSubmit" ] && ! has_task; then
+  exit 0
+fi
+payload=$(cat)
+if [ "$2" = "--filter" ]; then
+  case $payload in
+    *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*) ;;
+    *) exit 0 ;;
+  esac
+fi
+
+run() {
+  printf '%s' "$payload" | "$@" "$bin_dir/thaliris.py" hook "$event"
+  exit $?
+}
+
+if [ -z "$THALIRIS_CLAUDE_PYTHON" ] && [ -f "$home/runtime/python" ]; then
+  cached=$(cat "$home/runtime/python")
+  if [ -n "$cached" ] && [ -f "$cached" ]; then
+    run "$cached"
+  fi
+fi
+
+for candidate in python3 python py; do
+  # `-c` without stdin: a Windows Store stub fails here harmlessly.
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "import sys" </dev/null >/dev/null 2>&1; then
+    run "$candidate"
+  fi
+done
+exit 0
