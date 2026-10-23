@@ -83,15 +83,50 @@ def _is_operator(token: str) -> bool:
     return bool(token) and all(char in "();<>|&" for char in token)
 
 
+def shell_layout(command: str) -> set[str]:
+    """Shell structure `shlex` hides: an unquoted `#` comment and unquoted line breaks.
+
+    `shlex` drops comments and treats a newline as whitespace, so `runner status # note`
+    and `runner status<newline>rm x` both tokenize as plain arguments. The shell, though,
+    ends the first command at the comment (an appended identity flag would land inside
+    it) and runs the second line as a separate command.
+    """
+    found: set[str] = set()
+    text = command.strip()
+    single = double = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and not single and index + 1 < len(text):
+            nxt = text[index + 1]
+            if nxt == "\r" and text[index + 2:index + 3] == "\n":
+                index += 3  # line continuation
+            else:
+                index += 2
+            continue
+        if char == "'" and not double:
+            single = not single
+        elif char == '"' and not single:
+            double = not double
+        elif not single and not double:
+            if char in "\r\n":
+                found.add("newline")
+            elif char == "#" and (index == 0 or text[index - 1] in " \t\r\n;&|()<>"):
+                found.add("comment")
+        index += 1
+    return found
+
+
 def runner_invocation(command: str, runner: str) -> dict | None:
     """Recognize the Thaliris runner; return its subcommand and whether it is direct.
 
     A direct invocation is optional interpreter tokens, the runner path and
-    plain arguments: no operators, redirections, expansions or wrappers.
+    plain arguments: no operators, redirections, expansions, comments, extra
+    lines or wrappers. `problems` names why a recognised invocation is not direct.
     """
     parts = tokens(command.strip().removeprefix("& ").removeprefix("&"))
     if parts is None:
-        return {"direct": False, "subcommand": None} if norm_path(runner) in norm_path(command) else None
+        return {"direct": False, "subcommand": None, "problems": ["unparseable"]} if norm_path(runner) in norm_path(command) else None
     expected = norm_path(runner)
     indexes = [index for index, token in enumerate(parts) if norm_path(token) == expected]
     if not indexes:
@@ -101,10 +136,63 @@ def runner_invocation(command: str, runner: str) -> dict | None:
     # Only an interpreter may precede the runner: `python`, `py -3`, or an absolute path to one.
     prefix_ok = all(re.fullmatch(r"-3(\.\d+)?", item) or re.fullmatch(r"(py|python(3(\.\d+)?)?)(\.exe)?",
                     item.replace("\\", "/").rsplit("/", 1)[-1], re.IGNORECASE) for item in parts[:index])
-    direct = (len(indexes) == 1 and prefix_ok and not any(_is_operator(item) for item in parts)
-              and not dynamic_expansion(command))
+    problems = sorted(shell_layout(command))
+    if len(indexes) > 1:
+        problems.append("repeated")
+    if not prefix_ok:
+        problems.append("prefix")
+    if any(_is_operator(item) for item in parts):
+        problems.append("operator")
+    if dynamic_expansion(command):
+        problems.append("expansion")
     subcommand = next((item for item in rest if not item.startswith("-")), None)
-    return {"direct": direct, "subcommand": subcommand, "forged_identity": any(item.split("=", 1)[0] in IDENTITY_FLAGS for item in rest)}
+    result = {"direct": not problems, "subcommand": subcommand,
+              "forged_identity": any(item.split("=", 1)[0] in IDENTITY_FLAGS for item in rest)}
+    if problems:
+        result["problems"] = problems
+    return result
+
+
+_RUNNER_FILE = "/bin/thaliris.py"
+_RUNNER_TEXT = re.compile(r"[^\s'\"`;&|<>()]*thaliris\.py", re.IGNORECASE)
+
+
+def runner_misses(command: str, runner: str) -> list[dict]:
+    """Thaliris Claude runner paths a command names that are not this plugin's active runner.
+
+    Only a `<dir>/bin/thaliris.py` inside this plugin root, or beside it in the same plugin
+    cache (another installed version), counts as "evidently a Thaliris runner"; any other
+    `bin/thaliris.py` (a dev checkout run by tests, say) is not this adapter's concern.
+    Each miss is `{"path", "kind"}` with kind `backslash`, `version` or `path`.
+    """
+    expected = norm_path(runner)
+    root = expected[:-len(_RUNNER_FILE)]
+    parent = root.rsplit("/", 1)[0] if "/cache/" in root + "/" else None
+    candidates = [match.group(0) for match in _RUNNER_TEXT.finditer(command)]
+    candidates += [item for item in (tokens(command) or []) if "thaliris.py" in item.casefold()]
+    misses: list[dict] = []
+    for raw in candidates:
+        path = norm_path(raw)
+        inside = path.startswith(root + "/")
+        beside = parent is not None and path.startswith(parent + "/")
+        if not path.endswith(_RUNNER_FILE) or not (inside or beside):
+            continue
+        if path != expected:
+            miss = {"path": raw, "kind": "path" if inside else "version"}
+        elif "\\" in raw:
+            miss = {"path": raw, "kind": "backslash"}
+        else:
+            continue
+        if miss not in misses:
+            misses.append(miss)
+    if not misses and "\\" in command:
+        # A path with spaces and unquoted backslashes falls apart into fragments, but the whole runner path still shows up.
+        def fold(text: str) -> str:
+            text = text.replace("\\", "/")
+            return text.casefold() if os.name == "nt" else text
+        if fold(runner) in fold(command):
+            misses.append({"path": runner.replace("/", "\\"), "kind": "backslash"})
+    return misses
 
 
 def _segments(parts: list[str]) -> list[list[str]]:

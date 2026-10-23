@@ -104,7 +104,7 @@ def evidence_packet(root: Path, task_id: str) -> str | None:
     continuity = status["Evidence Continuity"]
     if not (continuity["unincorporated_total"] or continuity["unresolved_judgments_total"]):
         return None
-    lines = [f"Thaliris evidence for task {task_id} (revision {status['Task']['revision']}): "
+    lines = [f"Thaliris evidence for task {task_id} (task revision now {status['Task']['revision']}): "
              f"{continuity['unincorporated_total']} observation(s) not yet incorporated into a requirement judgment, "
              f"{continuity['unresolved_judgments_total']} unresolved repair/unknown judgment(s)."]
     for item in continuity["unincorporated"]:
@@ -241,6 +241,40 @@ def _child_fenced(payload: dict) -> bool:
     return bool(entry and entry["disposed"])
 
 
+_INDIRECT_CAUSES = {
+    "comment": "a `#` comment (the adapter appends your identity to the end of the command, which would land inside the comment)",
+    "newline": "more than one line (a line break outside quotes starts a separate command)",
+    "operator": "a pipe, `&&`, `;`, `&` or redirection",
+    "expansion": "command substitution or backticks outside single quotes",
+    "prefix": "a wrapper or other words before the interpreter and runner path",
+    "repeated": "the runner path appearing more than once",
+    "unparseable": "unbalanced quotes",
+}
+
+
+def _indirect_reason(problems: list[str]) -> str:
+    found = [_INDIRECT_CAUSES[item] for item in problems if item in _INDIRECT_CAUSES]
+    cause = "; ".join(found) if found else "something other than a plain interpreter, runner path and arguments"
+    return (f"Run the Thaliris runner as one direct command. This one is not direct: it has {cause}. Use exactly "
+            f"`{runner_command()} <command> <arguments>` with no pipes, `&&`, redirection, comments, line breaks, variables "
+            "or command substitution. Put prose in a quoted argument, or use the runner's flag forms "
+            "(`--text`, `--reasoning`, ...), instead of writing JSON files.")
+
+
+def _runner_miss_reason(misses: list[dict]) -> str:
+    first = misses[0]
+    cause = {
+        "backslash": f"the runner path `{first['path']}` is written with unquoted backslashes, which the shell strips; quote it "
+                     "or use forward slashes",
+        "version": f"`{first['path']}` is another installed version or location of the runner than this session's hook "
+                   f"(`{runner_path()}`), so the adapter cannot add your identity",
+        "path": f"`{first['path']}` is not the exact runner path this session's hook expects (`{runner_path()}`)",
+    }[first["kind"]]
+    return (f"This command runs a Thaliris runner that the adapter does not recognise as this session's runner: {cause}. "
+            f"Without recognition your identity is not added and the runner fails NATIVE_IDENTITY_UNKNOWN. Use exactly "
+            f"`{runner_command()} <command> <arguments>` as one direct command.")
+
+
 def _shell(payload: dict, tool_input: dict) -> dict | None:
     command = tool_input.get("command")
     if not isinstance(command, str):
@@ -248,10 +282,13 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
     caller = _caller(payload)
     is_child, caller_role, agent_id = caller["child"], caller["role"], caller["agent_id"]
     invocation = guards.runner_invocation(command, runner_path())
-    if invocation is not None:
+    if invocation is None:
+        misses = guards.runner_misses(command, runner_path())
+        if misses:
+            return _deny(_runner_miss_reason(misses))
+    else:
         if not invocation["direct"]:
-            return _deny("Run the Thaliris runner as one direct command, without pipes, `&&`, redirection, variables "
-                         "or command substitution. Write JSON payloads to a file in a separate call if quoting is awkward.")
+            return _deny(_indirect_reason(invocation.get("problems") or []))
         if invocation["forged_identity"]:
             return _deny("`--native-session` and `--native-agent` are supplied by the adapter hook; remove them.")
         subcommand = invocation["subcommand"]
@@ -373,8 +410,9 @@ def post_tool_use(payload: dict) -> dict | None:
     response = payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     agent_id, status = store.native_id(response.get("agentId")), response.get("status")
-    summary = None
+    summary, revision = None, None
     with store.transaction(root, task_id, observe_only=True) as ctx:
+        revision = ctx["state"]["revision"]
         entry = next((item for item in ctx["lifecycle"]["dispatches"] if item["tool_use_id"] == payload.get("tool_use_id")), None)
         if entry is not None:
             if agent_id:
@@ -400,6 +438,7 @@ def post_tool_use(payload: dict) -> dict | None:
             "was launched in the background; its completion notification is the result, not this acknowledgement"
             if status == "async_launched" else f"reported status {status!r}")
         lines.append(f"Thaliris {summary['role']} dispatch {summary['handoff_id'] or '(no evidence association)'} {state}. "
+                     f"Task revision now {revision}: pass it as `--base-revision` to your next `judge`, `task-update` or `close`. "
                      "Native completion is execution termination only; you judge the result against the requirements.")
         if summary["handoff_id"] is None:
             lines.append("This dispatch has no evidence association, so its observations could not persist. "

@@ -13,7 +13,7 @@ import sys
 
 from thaliris import authority as core_authority, core, identity
 
-from . import __version__, hooks, roles, store
+from . import __version__, hooks, inputs, roles, store
 
 _IDENTITY_READS = frozenset({"identity-status", "identity-get", "identity-trace"})
 _IDENTITY_MUTATIONS = frozenset({"identity-amend", "identity-challenge", "identity-relate"})
@@ -40,9 +40,11 @@ def _parser() -> argparse.ArgumentParser:
 
     add("guidance", "print Controller guidance or one reference section").add_argument("--section")
     add("bootstrap", "initialize the project for managed work and report navigation")
-    command = add("task-start", "admit a managed task from a human-selected authority contract file")
+    command = add("task-start", "admit a managed task from a human-selected authority contract (a file, or the contract flags)")
     command.add_argument("goal")
-    command.add_argument("--contract", required=True, help="path to a UTF-8 JSON authority contract")
+    command.add_argument("--contract", help="path to a JSON authority contract (UTF-8, UTF-8 BOM or UTF-16 BOM); "
+                                            "alternatively give the contract flags, never both")
+    inputs.add_flags(command, "task-start")
     command = add("attach", "associate this session with an existing ACTIVE task")
     command.add_argument("--reason", required=True)
     add("status", "bounded routing and evidence status").add_argument("--evidence-offset", type=int, default=0)
@@ -56,6 +58,8 @@ def _parser() -> argparse.ArgumentParser:
         command = add(name, help_text)
         command.add_argument("--base-revision", type=int, required=True)
         _payload_args(command)
+        if name in inputs.FLAGS:
+            inputs.add_flags(command, name)
     add("identity-status", "project identity state, items and open challenges (read-only; absent identity is normal)")
     command = add("identity-get", "read the recorded project identity, selected items, one amendment or one challenge")
     command.add_argument("--version", type=int)
@@ -76,9 +80,11 @@ def _parser() -> argparse.ArgumentParser:
                                  "Active Work, Pending Results, milestone")
     command.add_argument("--base-revision", type=int, required=True)
     _payload_args(command)
+    inputs.add_flags(command, "task-update")
     command = add("observe", "record one local observation with adapter provenance")
     command.add_argument("--handoff-id", help="Controller import of a historical child result")
     _payload_args(command)
+    inputs.add_flags(command, "observe")
     command = add("mode", "switch execution mode on a human decision")
     command.add_argument("--mode", required=True, choices=core_authority.MODES)
     command.add_argument("--human-instruction", required=True)
@@ -111,13 +117,23 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _payload_args(command: argparse.ArgumentParser) -> None:
-    group = command.add_mutually_exclusive_group(required=True)
-    group.add_argument("--json", dest="payload_json")
-    group.add_argument("--input")
+    group = command.add_mutually_exclusive_group()
+    group.add_argument("--json", dest="payload_json", help="the payload as JSON text")
+    group.add_argument("--input", help="a payload file: UTF-8, UTF-8 BOM or UTF-16 BOM")
 
 
-def _payload(args) -> dict:
-    raw = args.payload_json if args.payload_json is not None else Path(args.input).read_text(encoding="utf-8")
+def _payload(args, state: dict | None = None, **options) -> dict:
+    """The call's payload: --json, --input, or the command's flag form (never a mix)."""
+    name = args.command
+    flagged = name in inputs.FLAGS and inputs.flag_form(args, name)
+    given = args.payload_json is not None or args.input is not None
+    if flagged and given:
+        raise ValueError("PAYLOAD_SOURCE_CONFLICT: use either --json/--input or the flag form, not both")
+    if flagged:
+        return inputs.build(args, name, state, **options)
+    if not given:
+        raise ValueError("PAYLOAD_REQUIRED: pass --json, --input" + (" or the flag form (see --help)" if name in inputs.FLAGS else ""))
+    raw = args.payload_json if args.payload_json is not None else inputs.read_text(args.input)
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("payload must be a JSON object")
@@ -127,7 +143,12 @@ def _payload(args) -> dict:
 def _session(args) -> str:
     session = store.native_id(args.native_session)
     if session is None:
-        raise ValueError("NATIVE_IDENTITY_UNKNOWN: run the runner from Claude Code with the Thaliris plugin hooks active")
+        raise ValueError(
+            "NATIVE_IDENTITY_UNKNOWN: the Claude Code hook did not add your identity to this call. Likely causes: the command was "
+            "not one plain direct invocation (a trailing or leading `#` comment, a pipe, `&&`, `;`, redirection, an extra line); "
+            "the runner path was written with unquoted backslashes or is another plugin version's path than this session's hook "
+            "expects; or the runner was started outside Claude Code with the Thaliris plugin hooks active. Run exactly one "
+            f"direct command: {hooks.runner_command()} {getattr(args, 'command', '<command>')} <arguments>")
     return session
 
 
@@ -334,10 +355,20 @@ def run(args) -> dict:
         if store.resolve_session(session) is not None:
             raise ValueError("SESSION_ALREADY_HAS_ACTIVE_TASK: close or abandon it first")
         root = _project(args)
-        if args.contract.lstrip().startswith("{"):
-            # The contract is a file path, never inline JSON (H059).
-            raise ValueError("CONTRACT_FILE_PATH_REQUIRED: write the contract JSON to a file and pass its path")
-        contract = json.loads(Path(args.contract).read_text(encoding="utf-8"))
+        flagged = inputs.flag_form(args, "task-start")
+        if flagged and args.contract is not None:
+            raise ValueError("PAYLOAD_SOURCE_CONFLICT: use either --contract <file> or the contract flags, not both")
+        if flagged:
+            contract = inputs.build(args, "task-start")
+        elif args.contract is None:
+            raise ValueError("CONTRACT_REQUIRED: pass --contract <file>, or --human-instruction --boundary --invariants "
+                             "--acceptance --execution-mode (optionally --execution-constraint)")
+        elif args.contract.lstrip().startswith("{"):
+            # --contract names a file, never inline JSON (H059): the flags are the inline form.
+            raise ValueError("CONTRACT_FILE_PATH_REQUIRED: --contract takes a file path; pass the contract as flags "
+                             "(--human-instruction --boundary --invariants --acceptance --execution-mode) instead of JSON text")
+        else:
+            contract = json.loads(inputs.read_text(args.contract))
         result = store.start_task(root, args.goal, contract, session)
         result["agents_dir_created"] = store.ensure_agents_dir(root)
         return result
@@ -373,16 +404,17 @@ def run(args) -> dict:
         return core.catalog(root, args.path) if name == "catalog" else core.document_get(root, args.paths)
     root, task_id = _task(args)
     if name == "observe":
-        payload = _payload(args)
         with store.transaction(root, task_id) as ctx:
             if args.native_agent is not None:
                 if args.handoff_id:
                     raise ValueError("children never select a handoff id; the adapter supplies it")
-                _child_entry(ctx, args)
+                entry = _child_entry(ctx, args)
+                payload = _payload(args, ctx["state"], prefix=(entry["handoff_id"] or "") + ".")
                 result = store.observe(ctx, payload, agent_id=args.native_agent, handoff_id=None)
             else:
                 if not args.handoff_id:
                     raise ValueError("Controller imports name the exact --handoff-id")
+                payload = _payload(args, ctx["state"], prefix=args.handoff_id + ".", qualified=True)
                 result = store.observe(ctx, payload, agent_id=None, handoff_id=args.handoff_id)
         return {"ok": True, **result}
     if name in {"promote", "document-maintain"}:
@@ -412,17 +444,16 @@ def run(args) -> dict:
         with store.transaction(root, task_id):
             pass  # The anchored authority must be ACTIVE and intact.
         core.select_task(root, task_id)
-        source = args.input if args.input is not None else _payload(args)
+        source = _payload(args)  # tolerant decoding; Core receives the parsed object
         result = getattr(identity, name.replace("-", "_"))(root, "claude:controller", args.base_revision, source)
         store.authority(root, task_id).checkpoint()
         return result
     if name == "task-update":
-        payload = _payload(args)
+        with store.transaction(root, task_id) as ctx:  # the anchored authority must be ACTIVE and intact
+            payload = _payload(args, ctx["state"])
         for record in payload.get("records") or []:
             if isinstance(record, dict) and {"producer", "revision"} & set(record):
                 raise ValueError("TASK_UPDATE_PROVENANCE: the runner supplies record producer and revision")
-        with store.transaction(root, task_id):
-            pass  # The anchored authority must be ACTIVE and intact.
         core.select_task(root, task_id)
         temporary = _payload_file(root, payload)
         try:
@@ -436,8 +467,8 @@ def run(args) -> dict:
                                            "Pending Results": state["pending_results"], "Current Records": records,
                                            "Current Record Count": total}}
     if name in {"register", "judge"}:
-        payload = _payload(args)
         with store.transaction(root, task_id) as ctx:
+            payload = _payload(args, ctx["state"])
             store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
             revision = ctx["state"]["revision"]
         status = _status(root, task_id)
