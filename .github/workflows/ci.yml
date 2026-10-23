@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Core is vendored under vendor/ and pinned by vendor/core.lock.json; the
+      # suite imports it from there, so the thaliris dependency is not resolved
+      # from an index (--no-deps) and only the test extra is installed explicitly.
+      - run: python -m pip install 'pytest>=8.0'
+      - run: python -m pip install --no-deps -e .
+      - run: python -c "from pathlib import Path; Path('results').mkdir(exist_ok=True)"
+      - name: Vendored Core matches its lock
+        run: python scripts/vendor_core.py --check
+      # Includes the generated-agent / role-table drift check (tests/test_roles.py).
+      - name: Test suite
+        if: ${{ !cancelled() }}
+        run: python -m pytest --junitxml=results/tests.xml
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: test-results-${{ matrix.os }}-python-${{ matrix.python }}
+          path: results/*.xml
