@@ -170,22 +170,32 @@ def direct_core_call(command: str) -> bool:
     return False
 
 
+def _folded_relative(path: Path, base: Path) -> str | None:
+    """`path` relative to `base`, compared case-insensitively on every platform.
+
+    A case variant of a protected path is the same file on Windows and macOS, and
+    `Path.resolve()` does not canonicalize case everywhere (not on macOS), so
+    exact matching would let `.CONTEXT/...` through. On a case-sensitive
+    filesystem this only refuses paths that collide with a protected one by case.
+    """
+    folded, prefix = path.as_posix().casefold(), base.as_posix().casefold().rstrip("/")
+    if folded == prefix:
+        return "."
+    return folded[len(prefix) + 1:] if folded.startswith(prefix + "/") else None
+
+
 def protected_target(root: Path, target: str, *, controller: bool) -> bool:
     """File-tool target check. Children may not touch Controller/security state;
     the Controller may not hand-edit the ledger or lifecycle (it uses the runner)."""
     try:
         path = Path(target)
         path = (path if path.is_absolute() else root / path).resolve()
-        relative = path.relative_to(root.resolve()).as_posix()
-    except (ValueError, OSError):
-        relative = None
-    if relative is None:
+        relative = _folded_relative(path, root.resolve())
         thaliris_home = (Path.home() / ".thaliris").resolve()
-        try:
-            Path(target).resolve().relative_to(thaliris_home)
-            return True
-        except (ValueError, OSError):
-            return False
+    except (ValueError, OSError):
+        return False
+    if relative is None:
+        return _folded_relative(path, thaliris_home) is not None
     if controller:
         return relative in {".context/state.json", ".context/claude-roles.json"} or relative.startswith((".context/tasks/", ".context/backups/"))
     return relative == ".context" or relative.startswith(".context/") or relative in {".claude/settings.json", ".claude/settings.local.json"}

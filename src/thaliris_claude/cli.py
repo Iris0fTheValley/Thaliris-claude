@@ -271,9 +271,9 @@ def run(args) -> dict:
     name = args.command
     if name == "version":
         import platform
-        from importlib import metadata
+        import thaliris  # the Core actually imported (the vendored, pinned copy), not an installed distribution
         return {"ok": True, "version": __version__, "plugin_root": hooks.plugin_root().as_posix(),
-                "python": platform.python_version(), "core_version": metadata.version("thaliris")}
+                "python": platform.python_version(), "core_version": thaliris.__version__}
     if name == "roles":
         association = store.resolve_session(args.native_session)
         root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())

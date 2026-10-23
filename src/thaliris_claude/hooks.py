@@ -289,7 +289,7 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         if guards.direct_core_call(command) and not any(name in command for name in _READ_ONLY_CORE):
             return _deny("In a managed task, mutate the ledger through the Thaliris runner so authority stays anchored.")
         ledger = (".context/tasks", ".context/state.json", store.LIFECYCLE_NAME, store.ROLES_NAME)
-        if guards.obvious_write(command) and any(name in command.replace("\\", "/") for name in ledger):
+        if guards.obvious_write(command) and any(name.casefold() in command.replace("\\", "/").casefold() for name in ledger):
             return _deny("Hand edits to the task ledger or lifecycle break authority anchoring; use the runner.")
     return None
 
