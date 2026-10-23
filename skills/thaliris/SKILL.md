@@ -104,8 +104,8 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
   convergence, including assigned tests, sync, docs and Git closure.
 - **Focused Implementer** owns the full reasoning/implementation/feedback loop
   when invariants are coupled or effects are nonlocal, and returns at semantic
-  convergence. Follow-up regression, sync and Git closure then go to a fresh
-  ordinary Implementer if you assign them.
+  convergence. Follow-up regression, sync, push and CI observation then go to a
+  fresh ordinary Implementer on `haiku` (low effort) if you assign them.
 - **Reviewer** is an optional, fresh, non-writing challenge after convergence.
   Use it when an independent challenge adds real value, not by default.
 - **Reasoning Specialist** challenges your framing when that could change
@@ -114,17 +114,33 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
 **Choosing models is yours.** The table shows defaults, which apply only when you
 set no `model`. Unless the user chose `role-defaults` (your session context says
 which), set `model` on each Agent call as the work requires; the adapter never
-overrides or refuses your choice. For a Focused Implementer, `opus` suits coupled
-work that crosses modules or contracts, involves concurrency, lifecycle or timing,
-has an unclear causal model, or follows a failed attempt or a decision-basis
-finding; `sonnet` suits local coupling with a clear causal model. The one thing
-that binds you is a frozen `claude-model:` constraint the user wrote into the
-task's contract. Model choice never changes a role's responsibilities or
-permissions. **Effort** is yours in the same way: set `effort` (`low`, `medium`,
-`high`, `xhigh`, `max`) on an Agent call when a dispatch needs more or less
-reasoning depth than the role's default. The hook refuses other values and records
-the requested effort per dispatch (`status`); effort never changes a role's
-responsibilities or permissions.
+overrides or refuses your choice. **Division of labor and cognitive isolation come
+first**: decide the Workstream's shape, role and self-contained working set before
+thinking about cost. Never merge separable Workstreams, skip a fitting role or hand
+a child unselected context to save a dispatch, and never pick a larger model to
+make up for a vague handoff; fix the handoff. Then pick the cheapest model and
+effort that fit that working set:
+
+- `haiku`, effort `low`: fully specified, deterministic local work. Git closure
+  (commit, amend, push), pin or version bumps, applying an already-decided edit,
+  regenerating derived outputs, re-running assigned regression, and long-running
+  observation of CI, a build or a release until terminal evidence.
+- `sonnet`: local work with a clear causal model, an ordinary Implementer whose
+  work needs real reading or judgment, Curator.
+- `opus`: a Focused Implementer for coupled work that crosses modules or
+  contracts, involves concurrency, lifecycle or timing, has an unclear causal
+  model, or follows a failed attempt or a decision-basis finding; a Reasoning
+  Specialist or Reviewer whose challenge is decision-critical.
+
+Keep long waits off expensive children: when a Focused Implementer converges, send
+push, CI observation and remaining deterministic closure to a fresh `haiku`
+Implementer. Move work up a tier only on evidence (a failure whose cause is not
+mechanical), by routing that finding to a fresh, suitably chosen role. The one
+thing that binds you is a frozen `claude-model:` constraint the user wrote into the
+task's contract. **Effort** is yours in the same way: set `effort` (`low`,
+`medium`, `high`, `xhigh`, `max`) on an Agent call, as above. The hook refuses
+other values and records the requested effort per dispatch (`status`). Model and
+effort never change a role's responsibilities or permissions.
 
 **Defining and adjusting roles.** The six built-in roles are a starting set, not
 a fixed system. When a recurring shape of work fits none of them, define one:

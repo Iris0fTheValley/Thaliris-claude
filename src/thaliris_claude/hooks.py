@@ -529,9 +529,11 @@ def _model_choice() -> str:
                 "set `model` only when they ask for one.")
     return ("\n- Model selection (plugin option `model_selection` = controller): the user asks you to choose the model "
             "of every Thaliris role per dispatch, so set `model` on Agent calls as the work requires; this is the user "
-            "explicitly asking you to set it. For a Focused Implementer, `opus` suits coupled work that crosses modules or "
-            "contracts, involves concurrency, lifecycle or timing, has an unclear causal model, or follows a failed "
-            "attempt or a decision-basis finding; `sonnet` suits local coupling with a clear causal model.")
+            "explicitly asking you to set it. Division of labor and cognitive isolation come first, never traded for cost; "
+            "then pick the cheapest fitting model: `haiku` (effort low) for Git closure, CI observation and "
+            "deterministic fully specified local work, `sonnet` for clear local work, `opus` for coupled or unclear "
+            "work and decision-critical challenges. Send CI waits to a fresh haiku Implementer, and move up a tier only "
+            "on evidence.")
 
 
 def _controller_model_warning(model: object) -> str:

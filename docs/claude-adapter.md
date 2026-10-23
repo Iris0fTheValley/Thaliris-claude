@@ -93,7 +93,7 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
 | --- | --- | --- |
 | `default_execution_mode` | `delegated` | 受管任务的常驻执行模式。选 `delegated` 即用户对 `thaliris:*` 子代理的常驻请求（见下文 Pro 计划限制） |
 | `auto_approve_runner` | 开 | Hook 只批准“单条直接调用本插件 Runner”的命令，避免受管流程每步停下来问权限；plan 模式下只批准只读子命令；串接其他命令一律拒绝 |
-| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型（设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
+| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型：先定分工与认知隔离，再选能胜任的最便宜模型与 effort（`haiku`/low 用于 Git 收尾、CI 观察与确定性本地工作，`sonnet` 用于因果清晰的本地工作，`opus` 用于耦合或不清晰的工作；设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
 
 无需其他步骤：
 

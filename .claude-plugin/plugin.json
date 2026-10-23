@@ -33,7 +33,7 @@
     "model_selection": {
       "type": "string",
       "title": "Who chooses each role's model",
-      "description": "controller: the Controller chooses the model of every Thaliris role per dispatch as the work requires (e.g. sonnet or opus for a Focused Implementer by difficulty); choosing this is your request that it set the model. role-defaults: each role uses its default model unless you ask for another.",
+      "description": "controller: the Controller chooses the model of every Thaliris role per dispatch as the work requires, after division of labor (e.g. haiku for Git closure and CI observation, sonnet for clear local work, opus for coupled or unclear work); choosing this is your request that it set the model. role-defaults: each role uses its default model unless you ask for another.",
       "options": [
         "controller",
         "role-defaults"

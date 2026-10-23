@@ -209,6 +209,6 @@ claude plugin marketplace add Iris0fTheValley/Thaliris-claude
 claude plugin install thaliris@thaliris
 ~~~
 
-启用时会询问三个选项，之后可用 `/plugin configure thaliris@thaliris` 修改：`default_execution_mode`（delegated、controller-direct 或 single-agent；选 delegated 即对 `thaliris:*` 子代理的常驻请求）、`model_selection`（controller 时由 Controller 为每个角色按需选择模型；role-defaults 时使用各角色默认模型）和 `auto_approve_runner`（只批准本插件 Runner 的单条直接调用）。首次会话自动寻找并缓存 Python 运行时。全局 Controller 提示由插件的 SessionStart 注入，不改写用户的 CLAUDE.md，卸载插件即移除。项目在第一个受管任务时由 Controller 运行 `bootstrap` 初始化，不执行 `git init`。
+启用时会询问三个选项，之后可用 `/plugin configure thaliris@thaliris` 修改：`default_execution_mode`（delegated、controller-direct 或 single-agent；选 delegated 即对 `thaliris:*` 子代理的常驻请求）、`model_selection`（controller 时由 Controller 先定分工，再为每个角色选能胜任的最便宜模型：haiku 用于 Git 收尾与 CI 观察，sonnet 用于清晰的本地工作，opus 用于耦合或不清晰的工作；role-defaults 时使用各角色默认模型）和 `auto_approve_runner`（只批准本插件 Runner 的单条直接调用）。首次会话自动寻找并缓存 Python 运行时。全局 Controller 提示由插件的 SessionStart 注入，不改写用户的 CLAUDE.md，卸载插件即移除。项目在第一个受管任务时由 Controller 运行 `bootstrap` 初始化，不执行 `git init`。
 
 更新用 `claude plugin update thaliris@thaliris`，在新会话生效；用户选项和 `~/.thaliris` 数据跨版本保留。安装、更新或修改用户级配置属于 Host 维护，需要用户明确授权；磁盘上的文件变化不代表正在运行的会话已经加载。更多约束、真实 Host 探针结果和历史问题对照见[适配层说明](docs/claude-adapter.md)。

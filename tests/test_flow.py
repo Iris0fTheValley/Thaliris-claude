@@ -416,3 +416,9 @@ def test_session_start_warns_about_a_small_controller(task, monkeypatch):
     assert "choose the model" in text
     strong = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))
     assert "small model" not in strong["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_start_controller_model_guidance_puts_division_of_labor_first(task):
+    text = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))["hookSpecificOutput"]["additionalContext"]
+    assert "haiku" in text and "cheapest fitting model" in text
+    assert text.index("Division of labor") < text.index("cheapest fitting model")
