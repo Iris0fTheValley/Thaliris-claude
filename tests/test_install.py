@@ -25,7 +25,7 @@ def test_tests_and_runtime_use_the_vendored_core():
 
 def test_vendored_core_matches_its_lock_and_history():
     """The lock is checked against Git objects when the Core checkout is present (H046)."""
-    source = ROOT.parents[1] / "core" / "Thaliris"
+    source = Path(os.environ.get("THALIRIS_CORE_SOURCE") or ROOT.parents[1] / "core" / "Thaliris")
     args = [sys.executable, str(ROOT / "scripts" / "vendor_core.py"), "--check"]
     if (source / ".git").exists():
         args += ["--source", str(source)]
