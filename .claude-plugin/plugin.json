@@ -1,6 +1,6 @@
 {
   "name": "thaliris",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Thaliris context orchestration for Claude Code: a Controller skill, fresh role subagents, and hooks that bind native agent identity and evidence continuity to the shared Thaliris Core (vendored; needs only Python 3.11+).",
   "author": {
     "name": "Thaliris contributors"

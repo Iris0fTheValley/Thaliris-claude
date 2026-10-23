@@ -172,6 +172,8 @@ thaliris-core --root . --task-id "$TASK_ID" task-status
 
 任务状态保存结构化的事实、observation 和判断，不保存对话 transcript。持久化和交接是两个独立选择：记录下来的东西不会自动塞给每个角色。
 
+项目可以选择记录一份**项目身份**（`.project-identity/`，随仓库进入 Git）：跨任务的“项目是为了什么、什么不能被低层工作悄悄改写”。没有身份是正常状态；有身份时，Controller 在会话开头只看到一行摘要，按需读取。只有在人类所有者明确决定后才能通过 amendment 修改，证据只能提出 challenge。
+
 ## 不是什么
 
 不是 Agent runtime、工作流引擎、固定多代理流水线、向量数据库或 RAG 系统、全仓自动总结器，也不能替代源码、测试、编译器和运行时行为。
@@ -190,7 +192,7 @@ thaliris-core --root . --task-id "$TASK_ID" task-status
 
 Thaliris-claude 是一个 Claude Code 插件，把共享语义接入 Claude Code 原生的子代理、Skill、Hooks 与插件配置。它内置一份按固定提交锁定的 Thaliris Core（只用标准库），由 Core 提供任务记录、证据和 authority API；适配层负责会话与任务关联、原生身份与 handoff 绑定、角色边界守卫和证据重新呈现，不另建 Agent Runtime。
 
-主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理；六个默认角色不是固定体系，Controller 可以用 `register-role` 按任务创建、修改项目角色（`thaliris-<name>`，可选职责、模型、effort 与原生能力，不能放宽权限或绕过 Hook），用 `unregister-role` 移除；已派发的子代理始终按派发时的角色身份与权限运行。Controller 用 `task-update` 记录事实、决策、进展、未决事项和里程碑，压缩、恢复或新会话 `attach` 时重新呈现。默认模型如下，只在 Controller 未指定时使用；显式选择保留（`effort` 同样按派发选择并记录），任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
+主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理；六个默认角色不是固定体系，Controller 可以用 `register-role` 按任务创建、修改项目角色（`thaliris-<name>`，可选职责、模型、effort 与原生能力，不能放宽权限或绕过 Hook），用 `unregister-role` 移除；已派发的子代理始终按派发时的角色身份与权限运行。Controller 用 `identity-status` / `identity-get` / `identity-trace` 按需读取项目身份，用 `identity-amend` / `identity-challenge` / `identity-relate` 记录修改（仅 Controller）。Controller 用 `task-update` 记录事实、决策、进展、未决事项和里程碑，压缩、恢复或新会话 `attach` 时重新呈现。默认模型如下，只在 Controller 未指定时使用；显式选择保留（`effort` 同样按派发选择并记录），任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
 
 | 角色 | 默认模型 |
 | --- | --- |

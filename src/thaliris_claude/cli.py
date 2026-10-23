@@ -11,10 +11,12 @@ import json
 from pathlib import Path
 import sys
 
-from thaliris import authority as core_authority, core
+from thaliris import authority as core_authority, core, identity
 
 from . import __version__, hooks, roles, store
 
+_IDENTITY_READS = frozenset({"identity-status", "identity-get", "identity-trace"})
+_IDENTITY_MUTATIONS = frozenset({"identity-amend", "identity-challenge", "identity-relate"})
 _ROLE_TABLE_BEGIN, _ROLE_TABLE_END = "<!-- thaliris-roles:begin -->", "<!-- thaliris-roles:end -->"
 
 
@@ -51,6 +53,22 @@ def _parser() -> argparse.ArgumentParser:
                             ("judge", "record a Controller requirement judgment"),
                             ("promote", "promote selected records to .agent-memory"),
                             ("document-maintain", "maintain selected durable documents")):
+        command = add(name, help_text)
+        command.add_argument("--base-revision", type=int, required=True)
+        _payload_args(command)
+    add("identity-status", "project identity state, items and open challenges (read-only; absent identity is normal)")
+    command = add("identity-get", "read the recorded project identity, selected items, one amendment or one challenge")
+    command.add_argument("--version", type=int)
+    command.add_argument("--item", action="append")
+    command.add_argument("--amendment")
+    command.add_argument("--challenge")
+    command = add("identity-trace", "trace registered relations around one identity-plane ref")
+    command.add_argument("ref")
+    command.add_argument("--direction", choices=("up", "down", "both"), default="both")
+    command.add_argument("--depth", type=int, default=1)
+    for name, help_text in (("identity-amend", "record an amendment on the human owner's explicit decision (Controller)"),
+                            ("identity-challenge", "open or dismiss a project identity challenge (Controller)"),
+                            ("identity-relate", "register or retract purpose relations (Controller)")):
         command = add(name, help_text)
         command.add_argument("--base-revision", type=int, required=True)
         _payload_args(command)
@@ -332,16 +350,26 @@ def run(args) -> dict:
             pass  # The anchored authority must be ACTIVE and intact.
         store.write_session(session, root, args.task_id, args.reason)
         # A new session lost the conversation: hand back what the Controller recorded.
-        return {"ok": True, "task_id": args.task_id, "root": str(root), "Task Context": store.task_context_text(ctx["state"])}
+        result = {"ok": True, "task_id": args.task_id, "root": str(root), "Task Context": store.task_context_text(ctx["state"])}
+        summary = store.identity_summary(root)
+        if summary:
+            result["Project Identity"] = summary
+        return result
     if name in {"status", "get"}:
         root, task_id = _read_task(args)
         if name == "status":
             return _status(root, task_id, args.evidence_offset)
         core.select_task(root, task_id)
         return core.task_get(root, args.id)
-    if name in {"catalog", "document-get"}:
+    if name in {"catalog", "document-get"} | _IDENTITY_READS:
         association = store.resolve_session(args.native_session)
         root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())
+        if name == "identity-status":
+            return identity.identity_status(root)
+        if name == "identity-get":
+            return identity.identity_get(root, version=args.version, items=args.item, amendment=args.amendment, challenge=args.challenge)
+        if name == "identity-trace":
+            return identity.identity_trace(root, args.ref, args.direction, args.depth)
         return core.catalog(root, args.path) if name == "catalog" else core.document_get(root, args.paths)
     root, task_id = _task(args)
     if name == "observe":
@@ -378,6 +406,16 @@ def run(args) -> dict:
         store.authority(root, task_id).checkpoint()
         return result
     _controller(args)
+    if name in _IDENTITY_MUTATIONS:
+        # Identity mutations never bump the task revision and are not memory promotion; the Controller's act, on the
+        # human owner's decision carried in the payload. Core records the actor and task provenance.
+        with store.transaction(root, task_id):
+            pass  # The anchored authority must be ACTIVE and intact.
+        core.select_task(root, task_id)
+        source = args.input if args.input is not None else _payload(args)
+        result = getattr(identity, name.replace("-", "_"))(root, "claude:controller", args.base_revision, source)
+        store.authority(root, task_id).checkpoint()
+        return result
     if name == "task-update":
         payload = _payload(args)
         for record in payload.get("records") or []:
@@ -473,6 +511,24 @@ def _payload_file(root: Path, payload: dict) -> Path:
     return path
 
 
+def _emit(text: str) -> None:
+    """Write runner output as UTF-8 bytes whatever the console codec is.
+
+    Runner output stays human-readable (not ASCII-escaped), but a redirected or
+    piped Windows stdout defaults to a legacy code page (cp1252) that cannot
+    encode Chinese; writing through the text layer would raise after the work
+    was done. Bytes go to the underlying buffer; a stream without one is a test double.
+    """
+    stream = sys.stdout
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        stream.write(text)
+        return
+    stream.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["hook"]:
@@ -489,5 +545,5 @@ def main(argv: list[str] | None = None) -> int:
         result, code = {"ok": False, "error": str(exc)}, 2
     else:
         code = 0 if result.get("ok", True) else 3
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    _emit(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     return code

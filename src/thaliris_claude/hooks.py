@@ -21,7 +21,8 @@ AGENT_TOOLS = frozenset({"Agent", "Task"})
 SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 _MARKER = re.compile(r"^[ \t]*thaliris-evidence:[ \t]*(\{.*\})[ \t]*$", re.MULTILINE)
-_READ_ONLY_CORE = ("task-status", "task-get", "task-show", "catalog", "document-get", "version", "stale", "milestone-check")
+_READ_ONLY_CORE = ("task-status", "task-get", "task-show", "catalog", "document-get", "version", "stale", "milestone-check",
+                  "identity-status", "identity-get", "identity-trace")
 
 
 class Refusal(Exception):
@@ -281,7 +282,7 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         if writes and caller["writes"] is False:
             return _deny(f"The {caller_role} role is non-writing; this command looks like a write. Report what should change instead.")
         if writes and guards.mentions_protected(command):
-            return _deny("Children cannot change Controller or security state (.context/, Thaliris authority, Claude settings).")
+            return _deny("Children cannot change Controller or security state (.context/, .project-identity/, Thaliris authority, Claude settings).")
         if writes and _child_fenced(payload):
             return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
         return None
@@ -307,7 +308,7 @@ def _file(payload: dict, tool_input: dict) -> dict | None:
         if _child_fenced(payload):
             return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
         if store.is_managed_project(root) and guards.protected_target(root, target, controller=False):
-            return _deny("Children cannot change Controller or security state (.context/, Claude settings).")
+            return _deny("Children cannot change Controller or security state (.context/, .project-identity/, Claude settings).")
         return None
     if store.is_managed_project(root) and guards.protected_target(root, target, controller=True):
         return _deny("Hand edits to the task ledger or lifecycle break authority anchoring; use the Thaliris runner.")
@@ -502,7 +503,8 @@ subagents own the local working sets you hand them.
 - Runner: `{runner}` (in PowerShell, prefix it with `& `). Run it as one direct
   command; the hooks add your identity.
 - Durable navigation lives in `.agent-memory/INDEX.md` and `.milestones/INDEX.md`;
-  read them explicitly when a managed task needs them."""
+  read them explicitly when a managed task needs them. A project identity, when one
+  exists, is read on demand with the runner's `identity-status` / `identity-get`."""
 
 MODE_SETTING = "CLAUDE_PLUGIN_OPTION_DEFAULT_EXECUTION_MODE"
 MODEL_SETTING = "CLAUDE_PLUGIN_OPTION_MODEL_SELECTION"
@@ -576,6 +578,10 @@ def session_start(payload: dict) -> dict | None:
     if payload.get("source") in {"compact", "resume", "clear"}:
         store.forget_packet(payload.get("session_id"))  # context was lost; show pending evidence again
     association = store.resolve_session(payload.get("session_id"))
+    summary = store.identity_summary(association[0] if association
+                                     else store.project_root(Path(payload.get("cwd") or ".")))
+    if summary:  # navigation only; nothing at all when the project has no identity
+        text += f"\n- {summary}"
     if payload.get("source") in {"startup", "resume"}:
         # A process start fixes which agent directories the Host watches (see `register-role`).
         store.note_session_agents_dir(payload.get("session_id"), association[0] if association
@@ -663,7 +669,9 @@ def main(event: str) -> int:
         result = _deny(f"Thaliris hook failure ({type(exc).__name__}); managed dispatch assurance is UNKNOWN.") if _fail_closed(event, payload) else None
     _probe_log(event, payload, result, error, started)
     if result is not None:
-        sys.stdout.write(json.dumps(result, ensure_ascii=False))
+        # ASCII-only JSON: valid for any decoder, so no console code page (cp1252 when piped on Windows) can make the
+        # hook crash after the work is done and silently drop the output (including the appended --native-session).
+        sys.stdout.write(json.dumps(result, ensure_ascii=True))
     return 0
 
 

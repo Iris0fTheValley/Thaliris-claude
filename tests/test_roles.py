@@ -66,7 +66,9 @@ def test_controller_skill_carries_the_protocol_tokens():
     meta = _frontmatter(skill)
     assert meta["name"] == "thaliris" and "main-thread" in meta["description"]
     for token in ("thaliris-evidence:", "task-start", "register", "judge", "dispose", "close", "guidance --section recovery",
-                  "execution_constraint", "delegated", "controller-direct", "single-agent"):
+                  "execution_constraint", "delegated", "controller-direct", "single-agent",
+                  "## 10. Project identity", "identity-status", "identity-get", "identity-trace", "identity-amend",
+                  "identity-challenge", "identity-relate", "human_instruction", "UNRECORDED_CHANGE"):
         assert token in skill, token
     assert re.search(r"\| Reviewer \| `thaliris:reviewer` \| `inherit` \| no \| investigator \|", skill)
     assert (ROOT / "skills/thaliris/recovery.md").is_file()

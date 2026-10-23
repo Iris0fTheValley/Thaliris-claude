@@ -61,7 +61,7 @@ Thaliris-claude/
 | 执行模式 delegated / controller-direct / single-agent | 存于 Core Authority；single-agent 拒绝 Thaliris 子代理；`mode` 需人类指令 + CAS |
 | 冻结执行约束 | `execution_constraint: "claude-model:<alias>"`，PreToolUse 强制并拒绝冲突覆盖 |
 | Reviewer 只读 | frontmatter `disallowedTools` + PreToolUse 拒绝文件写工具与明显写入的 Shell 命令（插件 Agent 的 `permissionMode`/`hooks` 字段会被 Claude 丢弃，已从二进制确认） |
-| 子代理不能改 Controller/安全状态 | `.context/`、`.claude/settings*.json`、`~/.thaliris` 写入拒绝；子代理禁止直接调用 `thaliris-core`、禁止加载 Controller skill；Authority 只锚定 Thaliris 自有的 `.context/config.json`（用户的 Claude 设置不锚定，避免合法编辑被当篡改、恢复时被回滚） |
+| 子代理不能改 Controller/安全状态 | `.context/`、`.project-identity/`、`.claude/settings*.json`、`~/.thaliris` 写入拒绝；子代理禁止直接调用 `thaliris-core`、禁止加载 Controller skill；Authority 只锚定 Thaliris 自有的 `.context/config.json`（用户的 Claude 设置不锚定，避免合法编辑被当篡改、恢复时被回滚） |
 | 委派矩阵与最大深度 2、每父级 1 个 Scanner | PreToolUse 依据 `agent_type`（Host 断言）与 lifecycle 校验 |
 | 已派发 child 的身份与权限不随配置漂移 | 预约时快照角色绑定；Hook 对已派发 child 按快照解释，角色文件改动或重新登记只影响之后的派发 |
 | Evidence Continuity | Core `evidence_continuity` 原样复用；子代理 `observe` 由适配层补全 handoff/candidate/refs 并以 handoff 前缀命名空间化 ID；Agent 结果送达时（PostToolUse，以及后台完成通知触发的 UserPromptSubmit）重新呈现未处置证据 |
@@ -178,6 +178,37 @@ Controller 记录的历史，不是新的验证。
 - Hook 只把摘要一致的注册角色当作**新派发**的 Thaliris 角色（只读、委派、证据绑定同内置角色）；文件被改动即对新派发
   失效为普通代理，子代理写文件不能自造受管角色。
 
+### 项目身份（`identity-*`）
+
+Core 0.5.0 的 Project Identity 平面（`src/thaliris/identity.py`，存于仓库内、随 Git 走的 `.project-identity/`）。身份是
+跨任务的项目级声明，不是 Task Authority、记忆或里程碑；分层只是 Controller 的推理模型，不是文件、权限或阶段。
+
+- **只读**（`identity-status`、`identity-get [--version N] [--item ID ...] [--amendment A-000N] [--challenge ID]`、
+  `identity-trace REF [--direction up|down|both] [--depth 1..4]`）：归入 `READ_ONLY_COMMANDS`（plan 模式也批准、子代理可用），
+  不需要任务，与 `catalog` 一样按会话关联根或 `--root`/cwd 解析项目。身份不存在时 `identity-status` 返回 `state: ABSENT`，
+  不报错。`UNRECORDED_CHANGE`（`IDENTITY.md` 与记录版本不一致）与 `INVALID`（链/快照不一致）是观察结果；读取仍服务记录版本，
+  `INVALID` 时读取拒绝。
+- **变更**（`identity-amend`、`identity-challenge`、`identity-relate`，`--base-revision <n>` 与 `--input <文件>`，亦接受 `--json`）：
+  归入 `CONTROLLER_COMMANDS`；PreToolUse 对子代理拒绝，Runner 再次以 `CONTROLLER_ONLY` 拒绝。要求会话已关联 ACTIVE 任务，
+  Core 在任务锁内以 `--base-revision` 做 CAS、记录 task_id 与 actor（`claude:controller`）、**不**递增任务 revision，成功后与
+  `task-update` 一样重新锚定 Authority。人类决定（`decision.decided_by`、`decision.human_instruction`）由 Controller 在载荷中断言，
+  Core 无法验证真人，与 Task Authority 的 `human_instruction` 同构。它不是 `promote` / `document-maintain`。
+- **子代理写保护**：`guards._PROTECTED_MARKERS` 与 `protected_target(controller=False)` 把 `.project-identity/` 加入子代理的写拒绝列表。
+  该列表与 Task Authority 的 `protected_paths`（`store.PROTECTED_PATHS`，只有 Thaliris 自有配置）是两份独立的列表：身份**没有**加入后者，
+  因此任务内的合法 amendment 不会触发 `TASK_AUTHORITY_SECURITY_CHANGED`。Controller 不被拦截（它通过 Runner 修改；绕过 Runner 的手改会被
+  Core 观察为 `UNRECORDED_CHANGE`/`INVALID`，再加 Git diff）。这与其他 obvious-write guard 一样不是沙箱：解释器等未知写入不在声明范围内。
+- **投递**：SessionStart 对所有来源（startup/resume/compact/clear），无论是否关联任务，仅在身份存在时追加 Core `identity_summary` 的一行
+  （不存在则什么都不加）；`attach` 在存在时于 `Project Identity` 键下返回同一行。`GLOBAL_GUIDANCE` 的导航项提示按需用 `identity-status` /
+  `identity-get` 读取。身份文本从不注入子代理（SubagentStart 不变）；Controller 只在 handoff 中摘录真正约束该子代理工作的条目。
+- **指导**：`SKILL.md` 第 10 节“Project identity”（准入第 2 步一句话指向它）。
+
+### 输出编码（Windows）
+
+重定向或管道下的 Windows `sys.stdout` 默认是 cp1252，写中文会抛 `UnicodeEncodeError`。Hook 在写出前崩溃时，进程非零退出且没有输出，
+`--native-session` 不会被追加，Runner 随后报告 `NATIVE_IDENTITY_UNKNOWN`；`PYTHONUTF8=1` 可规避但不能依赖。当前处理：Hook 输出改为纯 ASCII JSON
+（`ensure_ascii=True`，任何解码器都能读）；Runner 输出保持可读的中文，以 UTF-8 字节写入 `sys.stdout.buffer`。回归测试在
+`PYTHONIOENCODING=cp1252` 的子进程里分别跑 Hook 与 Runner（`tests/test_install.py`）。
+
 ### 执行参数：effort
 
 受管任务中，Thaliris 派发的 `effort` 只接受 `low|medium|high|xhigh|max`（其他值 PreToolUse 拒绝），lifecycle 记录
@@ -197,8 +228,8 @@ PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、
 
 | 谁 | 子命令 |
 | --- | --- |
-| 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` `roles` |
-| Controller | `bootstrap` `task-start` `attach` `detach` `task-update` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` `unregister-role` |
+| 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` `roles` `identity-status` `identity-get` `identity-trace` |
+| Controller | `bootstrap` `task-start` `attach` `detach` `task-update` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` `unregister-role` `identity-amend` `identity-challenge` `identity-relate` |
 | 子代理 | `observe`（Controller 用 `--handoff-id` 导入历史结果） |
 | Controller / Curator | `promote` `document-maintain` |
 

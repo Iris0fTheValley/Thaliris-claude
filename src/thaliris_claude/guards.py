@@ -14,12 +14,15 @@ import shlex
 
 # Subcommands only the owning Controller (main thread) may run.
 CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "mode", "dispose",
-                                 "close", "artifact", "recover-authority", "register-role", "unregister-role", "task-update"})
+                                 "close", "artifact", "recover-authority", "register-role", "unregister-role", "task-update",
+                                 # Project identity mutations: the Controller's act on the human owner's decision.
+                                 "identity-amend", "identity-challenge", "identity-relate"})
 # Curator may also maintain the selected durable documents.
 CURATOR_COMMANDS = frozenset({"promote", "document-maintain"})
 IDENTITY_FLAGS = ("--native-session", "--native-agent")
 # Runner subcommands that never write: safe to approve even in plan mode.
-READ_ONLY_COMMANDS = frozenset({"guidance", "status", "get", "catalog", "document-get", "version", "roles"})
+READ_ONLY_COMMANDS = frozenset({"guidance", "status", "get", "catalog", "document-get", "version", "roles",
+                                "identity-status", "identity-get", "identity-trace"})
 
 _WRITE_PROGRAMS = frozenset({
     "rm", "rmdir", "mv", "cp", "touch", "mkdir", "tee", "truncate", "dd", "ln", "chmod", "chown", "install", "patch", "unlink", "shred",
@@ -31,7 +34,9 @@ _GIT_WRITES = frozenset({"add", "commit", "checkout", "reset", "restore", "rm", 
 _PACKAGE_WRITES = frozenset({"install", "add", "remove", "uninstall", "update", "upgrade", "sync", "ci", "i"})
 _PACKAGE_MANAGERS = frozenset({"npm", "pnpm", "yarn", "pip", "pip3", "uv", "poetry", "cargo", "bun"})
 _SAFE_REDIRECT_TARGETS = frozenset({"/dev/null", "nul", "$null", "&1", "&2"})
-_PROTECTED_MARKERS = (".context", ".claude/settings", ".thaliris", "claude-lifecycle.json")
+# Child-write protection only. Deliberately separate from the Task Authority `protected_paths` (store.PROTECTED_PATHS):
+# anchoring the project identity there would make a legitimate in-task amendment trip TASK_AUTHORITY_SECURITY_CHANGED.
+_PROTECTED_MARKERS = (".context", ".claude/settings", ".thaliris", "claude-lifecycle.json", ".project-identity")
 
 
 def norm_path(value: str) -> str:
@@ -198,4 +203,5 @@ def protected_target(root: Path, target: str, *, controller: bool) -> bool:
         return _folded_relative(path, thaliris_home) is not None
     if controller:
         return relative in {".context/state.json", ".context/claude-roles.json"} or relative.startswith((".context/tasks/", ".context/backups/"))
-    return relative == ".context" or relative.startswith(".context/") or relative in {".claude/settings.json", ".claude/settings.local.json"}
+    return (relative == ".context" or relative.startswith(".context/") or relative in {".claude/settings.json", ".claude/settings.local.json"}
+            or relative == ".project-identity" or relative.startswith(".project-identity/"))

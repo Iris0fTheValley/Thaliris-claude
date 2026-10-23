@@ -1,3 +1,3 @@
 """Claude Code Host adapter for the shared Thaliris Core."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

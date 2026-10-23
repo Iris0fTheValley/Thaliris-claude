@@ -35,7 +35,9 @@ Implementer with a short handoff. Unless the user opts out:
    observations are then UNKNOWN.
 2. Read `.agent-memory/INDEX.md` and `.milestones/INDEX.md`, then any documents
    they point to that bear on this task (`<runner> document-get <path>...`, up to
-   eight per call).
+   eight per call). If your session context shows a project identity line, run
+   `<runner> identity-status` and read only the items this task touches
+   (section 10); no line means the project has none, which is normal.
 3. Write the **authority contract** to a UTF-8 JSON file (a separate tool call):
 
    ```json
@@ -398,7 +400,52 @@ edits selected documents with expected digests. Core validates paths, links and
 CAS; meaning is yours or the Curator's. `CHANGED` freshness is an observation, not
 invalidation — you decide whether to revalidate.
 
-## 10. Causal diagnosis
+## 10. Project identity
+
+A project identity is the project's cross-task statement of what it is for and what
+lower-level work must not silently redefine (identity, invariants, principles,
+directions, non-goals; the project chooses the structure). It sits above the rest:
+Task Authority freezes one task's intent, task memory and milestones keep what was
+learned, evidence says what was observed. Only an explicit, recorded amendment on
+the human owner's decision changes an identity; evidence can only challenge it. Most
+projects have none, and that is normal: nothing is blocked or nagged. Suggest
+establishing one only when the user's direction makes it useful, and only on their
+decision (an existing constitution or vision document can be the v1 text).
+
+Read it on demand, not by default: for directional or architectural work,
+replanning, conflicts across layers, and before turning an implementation limit
+into a principle; not for ordinary local repairs. `<runner> identity-status`
+(state, items, open challenges), `identity-get [--item ID ...] [--version N]
+[--amendment A-0001] [--challenge ID]`, `identity-trace <ref> [--direction
+up|down|both] [--depth 1-4]`. The recorded version is what reads serve; an
+`UNRECORDED_CHANGE` or `INVALID` state is an observation to tell the user about,
+not something to silently adopt. Legacy `.agent-memory` labels (`Kind:
+HARD_CONSTRAINT`, `Status: CURRENT`) confer no identity authority.
+
+When work seems to collide with it: **locate** the layer the problem lives in,
+**trace up** (`identity-trace`, registered relations only; no relation is not
+evidence of independence), **repair at the lowest sufficient layer**, and only if
+that cannot hold, **challenge up**: `<runner> identity-challenge --base-revision
+<n> --input <file>` with `{"targets":["identity:INV-1"],"summary":"...","text":"...",
+"evidence_refs":[...]}` records it without touching the identity. An
+**amendment** (`identity-amend`, same flags) is yours to make only when the human
+owner explicitly decided it: quote their words in `decision.human_instruction`
+(with `decided_by`), give `rationale` and, when lower repair was considered, `why_not_lower`,
+name `base_version` and `base_sha256` from `identity-status`, `resolves` any
+challenges it answers, and the full replacement `text`. The result lists
+registered dependents; you choose which to revalidate, since nothing propagates
+automatically. Dismiss a challenge that lower-level repair settled with `{"dismiss":
+"<id>","reason":"..."}`. Register relations (`identity-relate`: `serves`,
+`supports`, `challenges`, `supersedes`; none may target identity with `challenges`)
+only for significant decisions, designs and experiments.
+
+An amendment is not `promote` or `document-maintain`, never rewrites a running
+task's frozen contract (a task whose contract conflicts keeps it; tell the user, and
+only their decision starts a new task or changes intent), and children never
+amend, challenge or relate. Children get no identity text automatically: quote the
+item ids and text into a handoff only when they bind that child's work.
+
+## 11. Causal diagnosis
 
 Reuse the original failure and its smallest reproduction before changing
 behavior. Name the boundary that actually failed (receive, decode, JSON shape,
@@ -407,7 +454,7 @@ or reproduction supports them. Keep payloads, credentials and raw contracts out
 of diagnostics. Never weaken refusal, identity, ownership, isolation, completion
 or acceptance guarantees to get CI green.
 
-## 11. When things go wrong
+## 12. When things go wrong
 
 Missing Host fields are UNKNOWN, which is different from an actual identity
 conflict or a role violation. Damaged authority blocks only the managed controls

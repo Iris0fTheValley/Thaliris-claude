@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import uuid
 
-from thaliris import core
+from thaliris import core, identity
 from thaliris.authority import AuthorityStore, validate_contract
 
 # Only Thaliris-owned config is anchored. Anchoring user-owned Claude settings made
@@ -631,6 +631,18 @@ def current_records(state: dict, limit: int = 12, text_chars: int = 600) -> tupl
               "text": item["text"][:text_chars], "truncated": len(item["text"]) > text_chars,
               **({"supersedes": item["supersedes"]} if item.get("supersedes") else {})} for item in current[-limit:]]
     return shown, len(current)
+
+
+def identity_summary(root: Path) -> str | None:
+    """Core's one-line project identity summary, or None when absent or unreadable.
+
+    Navigation only: a hook must degrade rather than fail, and identity text is read
+    on demand (`identity-get`), never injected.
+    """
+    try:
+        return identity.identity_summary(root)
+    except Exception:  # noqa: BLE001 - OSError, bounded-read refusals, a repository Core cannot resolve
+        return None
 
 
 def task_context_text(state: dict, budget: int = 6000) -> str | None:
