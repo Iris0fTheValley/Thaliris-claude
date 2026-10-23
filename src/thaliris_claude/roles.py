@@ -36,6 +36,8 @@ class ClaudeExecutionBinding:
     allowed_delegation_targets: frozenset[str] = frozenset()
     controller_state_allowed: bool = False
     color: str | None = None
+    effort: str | None = None
+    agent_sha256: str | None = None  # registered roles: digest of the agent file the registry wrote
 
     @property
     def subagent_type(self) -> str | None:
@@ -441,13 +443,117 @@ def custom_role_id(name: str) -> str:
     return f"custom:{name}"
 
 
+# Native frontmatter a registered role may set. Anything that could widen a
+# boundary or bypass the adapter's hooks (permissionMode, mcpServers, hooks,
+# initialPrompt, ...) is deliberately absent and refused.
+CUSTOM_FIELDS = ("description", "instructions", "model", "effort", "tools", "disallowedTools", "writes", "scanner",
+                 "color", "maxTurns", "skills", "memory", "background", "isolation")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+COLORS = ("red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan")
+_TOOL = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+_SKILL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable", "inherit")  # store.MODEL_ALIASES; roles stays import-free
+# A full model id (`claude-opus-5-5`, a provider id) is also accepted by the Host;
+# the pattern only keeps the value one safe frontmatter token.
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
+
+
+def _names(value: object, pattern: re.Pattern, field: str, limit: int = 64) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > limit or not all(isinstance(item, str) and pattern.fullmatch(item) for item in value):
+        raise ValueError(f"ROLE_FIELD_INVALID: {field} is a list of names")
+    return list(dict.fromkeys(value))
+
+
+def validate_custom_record(record: dict) -> dict:
+    """Validate one complete registered-role record; return it normalized.
+
+    Every value becomes a single safe frontmatter token (or a JSON string), so a
+    record cannot smuggle extra frontmatter keys into the agent file.
+    """
+    unknown = set(record) - set(CUSTOM_FIELDS)
+    if unknown:
+        raise ValueError(f"ROLE_FIELDS_INVALID: {', '.join(sorted(unknown))} cannot be set; allowed: name, {', '.join(CUSTOM_FIELDS)}")
+    out: dict = {}
+    if not isinstance(record.get("description"), str) or not record["description"].strip() or len(record["description"]) > 1024:
+        raise ValueError("ROLE_DESCRIPTION_REQUIRED: say when the Controller should use this role (at most 1024 characters)")
+    out["description"] = record["description"].strip()
+    if not isinstance(record.get("instructions"), str) or not record["instructions"].strip() or len(record["instructions"]) > 16384:
+        raise ValueError("ROLE_INSTRUCTIONS_REQUIRED")
+    out["instructions"] = record["instructions"]
+    model = record.get("model")
+    if model is not None and (not isinstance(model, str) or not (model in _MODEL_ALIASES or _MODEL_ID.fullmatch(model))):
+        raise ValueError(f"ROLE_MODEL_INVALID: one of {', '.join(_MODEL_ALIASES)}, a full model id, or omitted")
+    out["model"] = model
+    effort = record.get("effort")
+    if effort is not None and effort not in EFFORT_LEVELS:
+        raise ValueError(f"ROLE_EFFORT_INVALID: one of {', '.join(EFFORT_LEVELS)} or omitted")
+    out["effort"] = effort
+    out["tools"] = _names(record.get("tools"), _TOOL, "tools")
+    out["disallowedTools"] = _names(record.get("disallowedTools"), _TOOL, "disallowedTools")
+    for flag, default in (("writes", True), ("scanner", False), ("background", False)):
+        value = record.get(flag, default)
+        if value is None:
+            value = default
+        if not isinstance(value, bool):
+            raise ValueError(f"ROLE_FIELD_INVALID: {flag} is true or false")
+        out[flag] = value
+    color = record.get("color")
+    if color is not None and color not in COLORS:
+        raise ValueError(f"ROLE_FIELD_INVALID: color is one of {', '.join(COLORS)}")
+    out["color"] = color
+    turns = record.get("maxTurns")
+    if turns is not None and (type(turns) is not int or not 1 <= turns <= 10000):
+        raise ValueError("ROLE_FIELD_INVALID: maxTurns is an integer from 1 to 10000")
+    out["maxTurns"] = turns
+    skills = _names(record.get("skills"), _SKILL, "skills", limit=32)
+    if skills and any(item.removeprefix(f"{PLUGIN_NAMESPACE}:") == PLUGIN_NAMESPACE for item in skills):
+        raise ValueError("ROLE_FIELD_INVALID: the thaliris skill is the Controller's routine, not a child's")
+    out["skills"] = skills
+    memory = record.get("memory")
+    if memory is not None and memory not in ("project", "local"):
+        raise ValueError("ROLE_FIELD_INVALID: memory is `project` or `local` (user-scope memory lives outside the project)")
+    if memory is not None and not out["writes"]:
+        raise ValueError("ROLE_FIELD_INVALID: memory needs file writes, so a `writes: false` role cannot have it")
+    out["memory"] = memory
+    isolation = record.get("isolation")
+    if isolation is not None and isolation != "worktree":
+        raise ValueError("ROLE_FIELD_INVALID: isolation is `worktree` or omitted (roles run locally, never remote)")
+    out["isolation"] = isolation
+    return out
+
+
+def mandatory_disallowed(writes: bool, scanner: bool) -> tuple[str, ...]:
+    """Tools a registered role can never be given back by its own disallowedTools choice."""
+    return (() if writes else _WRITE_TOOLS) + (() if scanner else ("Agent",))
+
+
 def custom_registration(name: str, record: dict) -> RoleRegistration:
-    delegates = frozenset({"investigator"}) if record.get("scanner") else frozenset()
+    writes, scanner = bool(record.get("writes", True)), bool(record.get("scanner"))
+    delegates = frozenset({"investigator"}) if scanner else frozenset()
+    disallowed = tuple(dict.fromkeys((*mandatory_disallowed(writes, scanner), *(record.get("disallowedTools") or ()))))
     return RoleRegistration(
         RoleSpec(custom_role_id(name), "", record.get("description", name)),
         ClaudeExecutionBinding(agent_name=CUSTOM_PREFIX + name, description=record.get("description", ""),
-                               model=record.get("model"), repo_write_allowed=bool(record.get("writes", True)),
-                               allowed_delegation_targets=delegates))
+                               model=record.get("model"), tools=tuple(record.get("tools") or ()),
+                               disallowed_tools=disallowed, repo_write_allowed=writes,
+                               allowed_delegation_targets=delegates, color=record.get("color"),
+                               effort=record.get("effort"), agent_sha256=record.get("sha256")))
+
+
+def binding_snapshot(role: str) -> dict | None:
+    """The identity and permissions a dispatch of `role` gets, frozen at dispatch time."""
+    registration = _registration(role)
+    if registration is None:
+        return None
+    binding = registration.binding
+    return {"role": role, "subagent_type": binding.subagent_type if role in ROLE_REGISTRY else binding.agent_name,
+            "source": "builtin" if role in ROLE_REGISTRY else "registered",
+            "writes": binding.repo_write_allowed, "delegates": sorted(binding.allowed_delegation_targets),
+            "default_model": binding.model, "default_effort": binding.effort,
+            "tools": list(binding.tools), "disallowed_tools": list(binding.disallowed_tools),
+            "agent_file_sha256": binding.agent_sha256}
 
 
 def load_custom_roles(records: dict[str, dict]) -> None:
@@ -497,12 +603,26 @@ def render_custom_agent(name: str, record: dict) -> str:
     lines = ["---", f"name: {binding.agent_name}", f"description: {json.dumps(binding.description)}"]
     if binding.model:
         lines.append(f"model: {binding.model}")
-    if record.get("tools"):
-        lines.append(f"tools: {', '.join(record['tools'])}")
-    disallowed = ([] if binding.repo_write_allowed else list(_WRITE_TOOLS)) + ([] if binding.allowed_delegation_targets else ["Agent"])
-    if disallowed:
-        lines.append(f"disallowedTools: {', '.join(disallowed)}")
-    lines += ["---", "", "<!-- Registered by the Thaliris Controller with `register-role`; re-register to change it. -->", "",
+    if binding.effort:
+        lines.append(f"effort: {binding.effort}")
+    if binding.tools:
+        lines.append(f"tools: {', '.join(binding.tools)}")
+    if binding.disallowed_tools:
+        lines.append(f"disallowedTools: {', '.join(binding.disallowed_tools)}")
+    if binding.color:
+        lines.append(f"color: {binding.color}")
+    if record.get("maxTurns"):
+        lines.append(f"maxTurns: {record['maxTurns']}")
+    if record.get("skills"):
+        lines.append(f"skills: {json.dumps(record['skills'])}")
+    if record.get("memory"):
+        lines.append(f"memory: {record['memory']}")
+    if record.get("background"):
+        lines.append("background: true")
+    if record.get("isolation"):
+        lines.append(f"isolation: {record['isolation']}")
+    lines += ["---", "", "<!-- Registered by the Thaliris Controller with `register-role`; update it with `register-role`, "
+              "remove it with `unregister-role`. -->", "",
               f"# Thaliris role: {name}", "", record["instructions"].strip(), ""]
     parts = [_SHARED] + ([_SCANNER] if binding.allowed_delegation_targets else []) + [_NOTIFICATION]
     return "\n".join(lines) + "\n".join(part.rstrip() + "\n" for part in parts)

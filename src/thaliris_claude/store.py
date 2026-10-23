@@ -129,6 +129,36 @@ def packet_is_new(session_id: str | None, packet: str) -> bool:
     return True
 
 
+def note_session_agents_dir(session_id: str | None, root: Path) -> None:
+    """Remember whether this Host process started with the project's `.claude/agents/`.
+
+    Claude Code watches agent directories that existed at session start, so this
+    fact decides whether a role registered later is usable on the next delegation.
+    Only process starts (startup, resume) record it; compaction keeps the process.
+    """
+    if not native_id(session_id):
+        return
+    try:
+        existed = (root / ".claude" / "agents").is_dir()
+        core._atomic_write(_session_path(session_id).with_suffix(".agents"), (json.dumps(
+            {"root": str(root), "agents_dir": existed, "at": now()}, sort_keys=True) + "\n").encode())
+    except OSError:
+        pass
+
+
+def agents_dir_at_session_start(session_id: str | None, root: Path) -> bool | None:
+    """True/False when recorded for this session and root; None is UNKNOWN."""
+    if not native_id(session_id):
+        return None
+    try:
+        value = json.loads(_session_path(session_id).with_suffix(".agents").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("root") != str(root) or not isinstance(value.get("agents_dir"), bool):
+        return None
+    return value["agents_dir"]
+
+
 ROLES_NAME = "claude-roles.json"
 
 
@@ -136,18 +166,44 @@ def _roles_path(root: Path) -> Path:
     return core._safe_without_final_symlink(root, f".context/{ROLES_NAME}")
 
 
+def _read_registry(root: Path) -> dict:
+    try:
+        registry = json.loads(_roles_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"version": 1, "roles": {}}
+    except (OSError, ValueError) as exc:
+        raise ValueError("CLAUDE_ROLE_REGISTRY_INVALID: the role registry could not be read") from exc
+    if not isinstance(registry, dict) or not isinstance(registry.get("roles", {}), dict):
+        raise ValueError("CLAUDE_ROLE_REGISTRY_INVALID: the role registry has an unexpected shape")
+    registry.setdefault("roles", {})
+    return registry
+
+
+def _write_registry(root: Path, registry: dict) -> None:
+    core._atomic_write(_roles_path(root), (json.dumps(registry, sort_keys=True, indent=2) + "\n").encode())
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
 def custom_role_records(root: Path) -> dict[str, dict]:
     """Controller-registered roles whose agent file still matches its recorded digest.
 
-    A missing or edited agent file is not a Thaliris role (UNKNOWN), so a child
-    cannot mint a managed role by writing an agent file of its own.
+    A missing or edited agent file is not a Thaliris role for a *new* dispatch
+    (UNKNOWN), so a child cannot mint a managed role by writing an agent file of
+    its own. Children already dispatched keep the role binding snapshot recorded
+    in their lifecycle entry instead (see `reserve`).
     """
     try:
-        registry = json.loads(_roles_path(root).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        registry = _read_registry(root)
+    except ValueError:
         return {}
     verified = {}
-    for name, record in (registry.get("roles") or {}).items() if isinstance(registry, dict) else ():
+    for name, record in registry["roles"].items():
         try:
             agent = core._safe_without_final_symlink(root, record["agent_file"])
             if hashlib.sha256(agent.read_bytes()).hexdigest() == record["sha256"]:
@@ -157,23 +213,84 @@ def custom_role_records(root: Path) -> dict[str, dict]:
     return verified
 
 
+def registered_role(root: Path, name: str) -> dict | None:
+    """One registry entry, verified or not (the base for an update)."""
+    record = _read_registry(root)["roles"].get(name)
+    return record if isinstance(record, dict) else None
+
+
+def agent_file(name: str) -> str:
+    return f".claude/agents/thaliris-{name}.md"
+
+
+def ensure_agents_dir(root: Path) -> bool:
+    """Create `.claude/agents/` so roles registered later land in a directory the Host watches.
+
+    Claude Code picks up new or edited agent files on the next delegation, except
+    in directories that did not exist when the session started. Returns whether
+    the directory had to be created; an empty directory changes no existing bytes.
+    """
+    path = core._safe_without_final_symlink(root, ".claude/agents")
+    if path.is_dir():
+        return False
+    path.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def _owned_agent_path(root: Path, name: str, previous: dict | None) -> Path:
+    """Refuse to touch an agent file whose bytes the registry did not write."""
+    path = core._safe_without_final_symlink(root, agent_file(name))
+    current = file_sha256(path)
+    if current is not None and (previous is None or previous.get("sha256") != current):
+        raise ValueError(f"ROLE_AGENT_FILE_NOT_OWNED: {agent_file(name)} exists and its bytes are not the ones this "
+                         "registry wrote (a user-owned file, or edited by hand). It was left untouched. Ask the user "
+                         "whether to keep, move or delete it, or register the role under another name.")
+    return path
+
+
 def register_role(ctx: dict, name: str, record: dict, agent_text: str) -> dict:
-    """Write the native agent file and its registry entry under the task lock."""
+    """Write the native agent file and its registry entry under the task lock.
+
+    The file is (re)written only when it is absent or still byte-identical to what
+    the registry last wrote; anything else is preserved and refused.
+    """
     root = ctx["root"]
-    relative = f".claude/agents/thaliris-{name}.md"
-    agent = core._safe_without_final_symlink(root, relative)
+    registry = _read_registry(root)
+    previous = registry["roles"].get(name) if isinstance(registry["roles"].get(name), dict) else None
+    path = _owned_agent_path(root, name, previous)
     payload = agent_text.encode("utf-8")
-    core._atomic_write(agent, payload)
-    path = _roles_path(root)
-    try:
-        registry = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        registry = {"version": 1, "roles": {}}
-    entry = {**record, "agent_file": relative, "sha256": hashlib.sha256(payload).hexdigest(),
+    core._atomic_write(path, payload)
+    entry = {**record, "agent_file": agent_file(name), "sha256": hashlib.sha256(payload).hexdigest(),
              "registered_at": now(), "registered_in_task": ctx["task_id"]}
-    registry.setdefault("roles", {})[name] = entry
-    core._atomic_write(path, (json.dumps(registry, sort_keys=True, indent=2) + "\n").encode())
+    if previous is not None:
+        entry["first_registered_at"] = previous.get("first_registered_at") or previous.get("registered_at")
+    registry["roles"][name] = entry
+    _write_registry(root, registry)
     return entry
+
+
+def unregister_role(ctx: dict, name: str) -> dict:
+    """Remove one registered role; delete its agent file only while the registry owns its bytes.
+
+    Children already dispatched keep their snapshot; only future dispatches change.
+    """
+    root = ctx["root"]
+    registry = _read_registry(root)
+    previous = registry["roles"].get(name)
+    if not isinstance(previous, dict):
+        raise ValueError("ROLE_NOT_REGISTERED")
+    path = core._safe_without_final_symlink(root, agent_file(name))
+    current = file_sha256(path)
+    if current is None:
+        result = "absent"
+    elif current == previous.get("sha256"):
+        path.unlink()
+        result = "deleted"
+    else:
+        result = "preserved: its bytes changed after registration, so it is now an ordinary unmanaged agent file"
+    del registry["roles"][name]
+    _write_registry(root, registry)
+    return {"agent_file": agent_file(name), "agent_file_result": result}
 
 
 def lifecycle_path(root: Path, task_id: str) -> Path:
@@ -247,6 +364,36 @@ def dispatch_for_agent(lifecycle: dict, agent_id: str) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def snapshot_identity(lifecycle: dict, agent_id: str | None, agent_type: object) -> dict | None:
+    """The role binding a running child was dispatched with.
+
+    A child bound to exactly one dispatch of the same native type gets that
+    dispatch's snapshot. A child not yet bound, whose type matches unresolved
+    dispatches, gets the most restrictive of their snapshots: that is not an
+    identity claim (no evidence binds to it), only the permissions any of them
+    could have. Entries without a snapshot (older adapters) yield None.
+    """
+    if not isinstance(agent_type, str):
+        return None
+    if agent_id is not None:
+        entry = dispatch_for_agent(lifecycle, agent_id)
+        if entry is not None:
+            snapshot = entry.get("role_binding")
+            if entry.get("subagent_type") == agent_type and entry.get("binding") != "conflict" and isinstance(snapshot, dict):
+                return {**snapshot, "bound": True}
+            return None
+    candidates = [item.get("role_binding") for item in lifecycle["dispatches"]
+                  if item.get("subagent_type") == agent_type and item.get("agent_id") is None
+                  and not item["disposed"] and item["native_status"] in UNRESOLVED_STATUSES]
+    if not candidates or not all(isinstance(item, dict) for item in candidates):
+        return None
+    delegates = set(candidates[0].get("delegates") or [])
+    for item in candidates[1:]:
+        delegates &= set(item.get("delegates") or [])
+    return {**candidates[0], "writes": all(item.get("writes") is True for item in candidates),
+            "delegates": sorted(delegates), "bound": False}
+
+
 def handoff(state: dict, handoff_id: str | None) -> dict | None:
     if handoff_id is None:
         return None
@@ -261,12 +408,19 @@ def new_handoff_id() -> str:
 
 
 def reserve(ctx: dict, *, role: str, subagent_type: str, tool_use_id: str, parent: str,
-            prompt: str, model: str | None, background: bool, association: dict | None) -> dict:
+            prompt: str, model: str | None, background: bool, association: dict | None,
+            effort: str | None = None, role_binding: dict | None = None) -> dict:
     """Record one native dispatch and, when associated, its Core handoff.
 
     ``parent`` is "controller" or the delegating child's native agent id.
     Nested Scanner lineage inherits the parent's candidate with empty
     requirement refs: provenance does not establish global relevance.
+
+    ``role_binding`` snapshots the role's identity and permissions as resolved
+    at dispatch. Hooks resolve this child from the snapshot for the rest of its
+    life, so a later edit or re-registration of the role never reinterprets it.
+    Both new fields are optional additions to a version-1 entry: entries written
+    before them fall back to resolving the role from the current registry.
     """
     lifecycle, state = ctx["lifecycle"], ctx["state"]
     if any(item.get("tool_use_id") == tool_use_id for item in lifecycle["dispatches"]):
@@ -292,7 +446,8 @@ def reserve(ctx: dict, *, role: str, subagent_type: str, tool_use_id: str, paren
         "tool_use_id": tool_use_id, "role": role, "subagent_type": subagent_type,
         "parent": parent, "handoff_id": record["id"] if record else None,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        "requested_model": model, "background": background, "agent_id": None,
+        "requested_model": model, "requested_effort": effort, "role_binding": role_binding,
+        "background": background, "agent_id": None,
         "binding": "unbound", "native_status": "reserved", "disposed": False,
         "created_at": now(), "events": [],
     }
@@ -466,6 +621,42 @@ def append_controller(ctx: dict, base_revision: int, payload: dict, kind: str) -
         raise ValueError("task revision conflict")
     core._append_continuity_state(ctx["state"], "controller", payload, kind)
     ctx["state_changed"] = True
+
+
+def current_records(state: dict, limit: int = 12, text_chars: int = 600) -> tuple[list[dict], int]:
+    """The most recent Controller records no later record supersedes (bounded), and their total count."""
+    superseded = {ref for item in state["records"] for ref in item.get("supersedes", [])}
+    current = [item for item in state["records"] if item["id"] not in superseded]
+    shown = [{"id": item["id"], "kind": item["kind"], "status": item["status"], "revision": item["revision"],
+              "text": item["text"][:text_chars], "truncated": len(item["text"]) > text_chars,
+              **({"supersedes": item["supersedes"]} if item.get("supersedes") else {})} for item in current[-limit:]]
+    return shown, len(current)
+
+
+def task_context_text(state: dict, budget: int = 6000) -> str | None:
+    """A bounded summary of the Controller's dynamic task context for re-injection.
+
+    It is what the Controller recorded with `task-update`, presented again after
+    compaction or resume so global semantic state is not re-investigated. It is
+    history the Controller wrote, not fresh verification.
+    """
+    records, total = current_records(state, limit=12, text_chars=400)
+    if not (state.get("current_milestone") or state["active_work"] or state["pending_results"] or records):
+        return None
+    lines = [f"Task context recorded by the Controller (revision {state['revision']}; history, re-verify what a decision depends on):"]
+    if state.get("current_milestone"):
+        lines.append(f"- Milestone: {state['current_milestone']}")
+    for title, values in (("Active Work", state["active_work"]), ("Pending Results", state["pending_results"])):
+        if values:
+            lines.append(f"- {title}:")
+            lines += [f"  - {value[:300]}" for value in values[:16]]
+            if len(values) > 16:
+                lines.append(f"  - … {len(values) - 16} more in `status`")
+    if records:
+        lines.append(f"- Current records ({len(records)} most recent of {total} not superseded):")
+        lines += [f"  - {item['id']} [{item['kind']}] {item['text']}{' …' if item['truncated'] else ''}" for item in records]
+    text, suffix = "\n".join(lines), "\n- … truncated; read the rest with `status` or `get <record id>`."
+    return text if len(text) <= budget else text[:budget - len(suffix)] + suffix
 
 
 def start_task(root: Path, goal: str, contract: dict, session_id: str) -> dict:

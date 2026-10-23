@@ -63,6 +63,7 @@ Thaliris-claude/
 | Reviewer 只读 | frontmatter `disallowedTools` + PreToolUse 拒绝文件写工具与明显写入的 Shell 命令（插件 Agent 的 `permissionMode`/`hooks` 字段会被 Claude 丢弃，已从二进制确认） |
 | 子代理不能改 Controller/安全状态 | `.context/`、`.claude/settings*.json`、`~/.thaliris` 写入拒绝；子代理禁止直接调用 `thaliris-core`、禁止加载 Controller skill；Authority 只锚定 Thaliris 自有的 `.context/config.json`（用户的 Claude 设置不锚定，避免合法编辑被当篡改、恢复时被回滚） |
 | 委派矩阵与最大深度 2、每父级 1 个 Scanner | PreToolUse 依据 `agent_type`（Host 断言）与 lifecycle 校验 |
+| 已派发 child 的身份与权限不随配置漂移 | 预约时快照角色绑定；Hook 对已派发 child 按快照解释，角色文件改动或重新登记只影响之后的派发 |
 | Evidence Continuity | Core `evidence_continuity` 原样复用；子代理 `observe` 由适配层补全 handoff/candidate/refs 并以 handoff 前缀命名空间化 ID；Agent 结果送达时（PostToolUse，以及后台完成通知触发的 UserPromptSubmit）重新呈现未处置证据 |
 | 原生完成 ≠ 验收；DONE 只是机械关闭 | lifecycle 记录 `completed/stopped`；`close` 只检查执行残留风险（reserved/launched/running 未处置即拒绝）；已结束的 child 不再获得 `observe` 权限，也不能被 `SendMessage` 复用于新工作 |
 | 处置不等于终止 | `dispose` 只结束管理并 fence 写入，`native_termination: UNKNOWN` |
@@ -140,12 +141,64 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
 
 ## Runner 子命令
 
-`register-role` 让 Controller 为反复出现的工作形态注册新角色：写入项目原生 agent `.claude/agents/thaliris-<name>.md`（带与内置角色相同的子代理契约），并在受保护的 `.context/claude-roles.json` 记录其摘要。Hook 只把摘要一致的注册角色当作 Thaliris 角色管理（只读、委派、证据绑定同内置角色）；文件被改动即失效为普通代理。实测（2.1.302）：注册后当前会话找不到该 agent，新会话即可派发。
+### 动态 Task Context（`task-update`）
+
+Controller 用 `task-update --base-revision <n> --json|--input` 维护任务的全局语义状态，直接映射 Core
+`task_update`（actor 为 `controller`，revision CAS，写后重新锚定 Authority）：`records` 追加事实、决策、进展、
+未决事项（`kind` 自定；更正用 `supersedes` 追加新记录而不改写历史；`producer`/`revision` 由 Runner 提供，
+载荷自带即拒绝），`active_work` / `pending_results` 整体替换（Core 限 64 条、每条 ≤4096 字符及总字节上限），
+`current_milestone` ≤128 字符，`evidence_refs` 追加来源。子代理调用在 PreToolUse 与 Runner 两层均被拒绝。
+
+读出：`status` 除 Core 的 Active Work / Pending Results / milestone 外，增加最近 12 条未被取代的记录
+（`Current Records`，文本截断）与总数；SessionStart（startup/resume/compact/clear 且会话已关联任务）注入有界摘要
+（≤6000 字符：里程碑、Active Work、Pending Results、最近记录）；新会话 `attach` 返回同一摘要。摘要是
+Controller 记录的历史，不是新的验证。
+
+### Controller 定义的角色（`register-role` / `unregister-role`）
+
+`register-role` 写入项目原生 agent `.claude/agents/thaliris-<name>.md`（带与内置角色相同的子代理契约），并在受保护的
+`.context/claude-roles.json` 记录其摘要。可配置字段：`description`、`instructions`（新角色必填）、`model`（别名、
+完整模型 ID 或 `inherit`）、`effort`、`tools`、`disallowedTools`、`writes`、`scanner`、`color`、`maxTurns`、`skills`
+（不可预载 `thaliris`）、`memory`（仅 `project`/`local`，且须 `writes: true`）、`background`、`isolation`（仅
+`worktree`）。`permissionMode`、`mcpServers`、`hooks`、`initialPrompt` 等可能扩大边界或绕过 Hook 的字段一律拒绝。
+`writes: false` 时写工具、`scanner: false` 时 `Agent` 始终进入 `disallowedTools`，Controller 自己的列表只能追加。
+每个值都校验为单个安全的 frontmatter 记号或 JSON 字符串，不能借值注入额外字段。
+
+- **修改**：同名再次 `register-role` 时只给要改的字段即与已登记记录合并（`null` 重置为默认）；`"replace": true`
+  则从头定义。`unregister-role <name>` 移除登记。
+- **保留用户字节**：目标文件已存在且不是登记表以当前摘要写下的字节（用户文件或被手改）时，`register-role`
+  拒绝（`ROLE_AGENT_FILE_NOT_OWNED`）且不改动文件；`unregister-role` 只删除摘要一致的文件，否则保留并说明。
+- **何时可用**：新会话一定可用。Host 文档（Claude Code sub-agents）说明 agent 目录被监视，新增或修改的 agent 文件在
+  下一次委派即生效，但会话启动时不存在的目录除外。实测（2.1.302，Windows，`claude -p`，haiku，临时仓库，单次调用以
+  `--settings` 禁用本插件）：启动前已放好的 agent 文件可派发；启动时 `.claude/agents/` 已存在、会话中新建 agent 文件，
+  即使等待 12 秒后派发仍报 “Agent type not found”；目录不存在时同样找不到。交互式会话是否热加载仍未验证。因此
+  `bootstrap` 与 `task-start` 仍预先创建该目录（满足文档条件、无副作用），SessionStart（startup/resume）记录本进程
+  启动时目录是否存在，`register-role` 回报 `next session`（确定）以及本会话是“可能”（文档条件满足但未实测成立）、
+  不可用还是 UNKNOWN，不承诺同会话可用。
+- Hook 只把摘要一致的注册角色当作**新派发**的 Thaliris 角色（只读、委派、证据绑定同内置角色）；文件被改动即对新派发
+  失效为普通代理，子代理写文件不能自造受管角色。
+
+### 执行参数：effort
+
+受管任务中，Thaliris 派发的 `effort` 只接受 `low|medium|high|xhigh|max`（其他值 PreToolUse 拒绝），lifecycle 记录
+`requested_effort`，角色默认值（注册角色的 frontmatter `effort`）记在派发快照的 `default_effort`，`status` 均可见。
+Host 的有效 effort（环境变量 `CLAUDE_CODE_EFFORT_LEVEL` 优先于两者）不在 Host 记录中，保持 UNKNOWN。内置角色不设默认
+effort。effort 不改变职责或权限。
+
+### 已派发角色的身份连续性
+
+PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、`subagent_type`、来源（builtin/registered）、
+`writes`、可委派目标、默认 model/effort、渲染出的 `tools`/`disallowedTools`、注册角色的 agent 文件摘要。此后 Hook
+按快照而非当前登记表解释该 child：已绑定（Host `meta.json` 或 Agent 结果）的 child 用自己条目的快照；尚未绑定但类型与
+未结束预约一致的 child 只获得这些快照中**最严格**的权限（不是身份认定，不绑定证据）。因此修改、重新登记或移除角色
+只影响之后的派发；`writes: false` 的 child 在文件被改后仍不能写；SubagentStart/SubagentStop 仍识别它，`stopped`
+照常记录，`close` 不被残留预约阻塞。新派发仍要求登记摘要一致。快照是 lifecycle 条目的可选新字段，
+`LIFECYCLE_VERSION` 保持 1：旧条目没有快照时回退到按登记表解析（旧行为），旧版适配层读新文件时忽略未知字段。
 
 | 谁 | 子命令 |
 | --- | --- |
 | 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` `roles` |
-| Controller | `bootstrap` `task-start` `attach` `detach` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` |
+| Controller | `bootstrap` `task-start` `attach` `detach` `task-update` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` `unregister-role` |
 | 子代理 | `observe`（Controller 用 `--handoff-id` 导入历史结果） |
 | Controller / Curator | `promote` `document-maintain` |
 
@@ -203,7 +256,7 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
 | H094、H098 | 锚定用户的 `.claude/settings.json`：合法编辑被判篡改，恢复会回滚用户字节 | 只锚定 `.context/config.json`；child 写设置仍被拒（`test_user_settings_edit_does_not_trip_authority`） |
 | H055、H057、H097 | 运行时损坏时 Hook 崩溃，受管派发静默放行，或反过来锁死一切 | 启动器捕获失败：普通工作透明；仅拒绝受管派发与 Reviewer 写（`test_broken_runtime_refuses_only_unguardable_actions`） |
 | H132、证据噪声 | 每回合重复注入同一证据包，或压缩后看不到 | 只在变化/压缩/恢复后注入；Agent 结果送达时总是呈现；`close` 输出附带证据包（`test_evidence_reaches_notification_turns_without_repeating`） |
-| H027、H111 | 只记录请求的模型，把配置当运行事实 | 记录 `requested_model` 与 Host 观测的 `observed_model`/`observed_tools`（`test_actual_tool_set_is_collected_after_the_child_stops`） |
+| H027、H111 | 只记录请求的模型，把配置当运行事实 | 记录 `requested_model`/`requested_effort` 与 Host 观测的 `observed_model`/`observed_tools`（`test_actual_tool_set_is_collected_after_the_child_stops`、`test_effort_is_validated_and_recorded`）；有效 effort 无 Host 记录，保持 UNKNOWN |
 | H059 | `--contract` 被传入 JSON 文本时报错难懂 | 明确 `CONTRACT_FILE_PATH_REQUIRED` |
 | H084 | 测试断言提示词措辞，改文案就炸 CI | 测试只断言协议性标记（命令、marker、报告标题、agent 类型）与生成同步 |
 | H096、H012 | 源码已改，但不知道 Host 实际加载的是哪份 | SessionStart 与 `version` 报告加载的适配层版本、插件路径、Python、Core 版本 |

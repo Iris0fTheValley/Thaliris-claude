@@ -190,7 +190,7 @@ thaliris-core --root . --task-id "$TASK_ID" task-status
 
 Thaliris-claude 是一个 Claude Code 插件，把共享语义接入 Claude Code 原生的子代理、Skill、Hooks 与插件配置。它内置一份按固定提交锁定的 Thaliris Core（只用标准库），由 Core 提供任务记录、证据和 authority API；适配层负责会话与任务关联、原生身份与 handoff 绑定、角色边界守卫和证据重新呈现，不另建 Agent Runtime。
 
-主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理，Controller 也可以用 `register-role` 注册新的项目角色（`thaliris-<name>`）。默认模型如下，只在 Controller 未指定时使用；显式选择保留，任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
+主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理；六个默认角色不是固定体系，Controller 可以用 `register-role` 按任务创建、修改项目角色（`thaliris-<name>`，可选职责、模型、effort 与原生能力，不能放宽权限或绕过 Hook），用 `unregister-role` 移除；已派发的子代理始终按派发时的角色身份与权限运行。Controller 用 `task-update` 记录事实、决策、进展、未决事项和里程碑，压缩、恢复或新会话 `attach` 时重新呈现。默认模型如下，只在 Controller 未指定时使用；显式选择保留（`effort` 同样按派发选择并记录），任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
 
 | 角色 | 默认模型 |
 | --- | --- |

@@ -120,17 +120,43 @@ has an unclear causal model, or follows a failed attempt or a decision-basis
 finding; `sonnet` suits local coupling with a clear causal model. The one thing
 that binds you is a frozen `claude-model:` constraint the user wrote into the
 task's contract. Model choice never changes a role's responsibilities or
-permissions.
+permissions. **Effort** is yours in the same way: set `effort` (`low`, `medium`,
+`high`, `xhigh`, `max`) on an Agent call when a dispatch needs more or less
+reasoning depth than the role's default. The hook refuses other values and records
+the requested effort per dispatch (`status`); effort never changes a role's
+responsibilities or permissions.
 
-**Registering a role.** When no built-in role fits a recurring shape of work, define
-one: `<runner> register-role --input <file>` with
-`{"name": "security-auditor", "description": "when to use it", "instructions": "what it owns and returns", "model": "opus", "writes": false, "scanner": true}`
-(`model`, `writes`, `scanner` and `tools` are optional). It becomes the native project
-agent `thaliris-security-auditor`, carrying the same child contract (selective
-handoff, evidence, honest UNKNOWN, final report), and the hooks manage it like a
-built-in role. `writes: false` makes it non-writing; `scanner: true` lets it use a
-Scanner. Claude Code loads the new agent only in a new session (the current one reports
-it as not found); `<runner> roles` lists what is registered.
+**Defining and adjusting roles.** The six built-in roles are a starting set, not
+a fixed system. When a recurring shape of work fits none of them, define one:
+`<runner> register-role --input <file>` with
+`{"name": "security-auditor", "description": "when to use it", "instructions": "what it owns and returns", "model": "opus", "effort": "high", "writes": false, "scanner": true}`.
+`description` and `instructions` are required for a new role. Optional native
+fields: `model` (alias, full model id or `inherit`), `effort`, `tools`,
+`disallowedTools`, `writes`, `scanner`, `color`, `maxTurns`, `skills`, `memory`
+(`project`/`local`, writing roles only), `background`, `isolation` (`worktree`).
+Fields that could widen a boundary or bypass the hooks (`permissionMode`,
+`mcpServers`, `hooks`, `initialPrompt`, ...) are refused. The role becomes the
+native project agent `thaliris-security-auditor`, carrying the same child contract
+(selective handoff, evidence, honest UNKNOWN, final report), and the hooks manage
+it like a built-in role. `writes: false` makes it non-writing (its write tools are
+always disallowed); `scanner: true` lets it use a Scanner (otherwise `Agent` is
+always disallowed).
+
+- **Adjust** a registered role by running `register-role` again with its `name`
+  and only the fields to change (`null` resets one to its default); add
+  `"replace": true` to start from scratch. `<runner> unregister-role <name>`
+  removes it. Children already dispatched keep the identity and permissions
+  recorded at their dispatch; changes apply to future dispatches only.
+- The runner never overwrites or deletes a `.claude/agents/thaliris-<name>.md` it
+  did not write (or that was edited by hand since); it reports
+  `ROLE_AGENT_FILE_NOT_OWNED` and the user decides about that file.
+- **When it is usable:** always from the next session. Claude Code documents
+  that a new agent file is also picked up on the next delegation when
+  `.claude/agents/` existed as the session started (`bootstrap` and `task-start`
+  create it), but a headless probe did not observe that, so treat same-session
+  use as possible, not promised: if the Agent tool reports the type as not found,
+  use it from a new session (or a built-in role now). `register-role` reports
+  which case applies. `<runner> roles` lists what is registered.
 
 **The Controller seat.** You should be the most capable model available (Opus).
 Never run the Controller on a small or low-capability model: it has to keep the
@@ -259,6 +285,30 @@ completion or requirement decision, run `<runner> status` if the latest packet i
 not in front of you. To import a
 historical child result, `observe --handoff-id <id>`; this neither reactivates the
 child nor establishes current truth.
+
+**Your task context.** Keep the task's global semantic state in the ledger, not
+only in your conversation, so a long task, a compaction or a later session does
+not re-investigate what is already settled. Update it whenever it changes in a
+way you would need to recover — a confirmed fact, a decision and its reason, a
+completed or started Workstream, an open item, a milestone:
+
+```
+<runner> task-update --base-revision <n> --input <file>
+{"records": [{"id": "D3", "kind": "decision", "text": "keep the parser; fix the caller (src/a.py:40)", "source_refs": []}],
+ "active_work": ["implementer: caller fix"], "pending_results": ["review of the caller fix"],
+ "current_milestone": "M2 caller fixed"}
+```
+
+Every key is optional. `records` are appended (`kind` is your label: `fact`,
+`decision`, `progress`, `open-item`, ...); correct one by appending a new record
+with `"supersedes": ["D1"]` rather than rewriting history. `active_work` and
+`pending_results` replace the current lists (at most 64 short entries; put long
+content in a record or Artifact); `current_milestone` is at most 128 characters.
+`status` shows these and the most recent current records; after compaction or
+resume the session start re-presents them, and `attach` returns them in a new
+session (for example after `/clear`). They are
+what you recorded, not fresh verification: re-check what a decision depends on.
+Only you update the task context; children report in their final message.
 
 ## 7. Endpoints and review
 

@@ -14,7 +14,7 @@ import shlex
 
 # Subcommands only the owning Controller (main thread) may run.
 CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "mode", "dispose",
-                                 "close", "artifact", "recover-authority", "register-role"})
+                                 "close", "artifact", "recover-authority", "register-role", "unregister-role", "task-update"})
 # Curator may also maintain the selected durable documents.
 CURATOR_COMMANDS = frozenset({"promote", "document-maintain"})
 IDENTITY_FLAGS = ("--native-session", "--native-agent")

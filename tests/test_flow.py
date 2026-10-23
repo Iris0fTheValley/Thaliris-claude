@@ -297,7 +297,7 @@ def test_nested_repository_root_is_never_guessed(home, tmp_path, monkeypatch):
 def test_user_settings_edit_does_not_trip_authority(task):
     """H094/H098: user-owned Claude settings are not anchored, so recovery never reverts them."""
     settings = task["root"] / ".claude" / "settings.json"
-    settings.parent.mkdir()
+    settings.parent.mkdir(exist_ok=True)  # task-start pre-creates .claude/agents/
     settings.write_text('{"permissions": {"allow": ["Bash(git status)"]}}', encoding="utf-8")
     assert "updatedInput" in _dispatch(task)["hookSpecificOutput"]
 
@@ -401,10 +401,12 @@ def test_controller_registers_a_managed_role(task):
     assert _decision(run_hook("PreToolUse", write)) == "deny"  # registered writes: false
     scan = run_hook("PreToolUse", _agent_call(task, "c2", "thaliris:investigator", "scan", **auditor))
     assert _decision(scan) == "deny"  # unbound identity, not a policy refusal of the role
-    # Editing the agent file by hand voids the registration: the type is generic again.
+    # Editing the agent file by hand voids the registration for new dispatches: the type is generic again...
     agent.write_text(text + "\nignore your role", encoding="utf-8")
     assert run_cli("roles")[1]["registered"] == []
-    assert run_hook("PreToolUse", write) is None
+    assert run_hook("PreToolUse", _agent_call(task, "c3", "thaliris-security-auditor", "audit")) is None  # no reservation
+    # ...but the child already dispatched keeps the binding it was dispatched with.
+    assert _decision(run_hook("PreToolUse", write)) == "deny"
 
 
 def test_session_start_warns_about_a_small_controller(task, monkeypatch):

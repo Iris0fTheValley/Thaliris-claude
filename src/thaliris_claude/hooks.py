@@ -50,15 +50,51 @@ def _context(event: str, text: str, **extra) -> dict:
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text, **extra}}
 
 
-def _caller(payload: dict) -> tuple[bool, str | None, str | None]:
-    """Return (is_child, Thaliris role or None, native agent id).
+def _caller(payload: dict) -> dict:
+    """Return the caller's identity: child?, Thaliris role or None, native agent id, permissions.
 
     `agent_id` is present only inside a subagent; the main thread is the
-    Controller position. A child with a generic agent type has no Thaliris role.
+    Controller position. A child already dispatched by a managed task keeps the
+    role binding snapshotted at its dispatch, so editing or re-registering its
+    role file later never reinterprets it. Other children resolve from the
+    verified registry; a child with a generic agent type has no Thaliris role.
     """
     if payload.get("agent_id") is None:
-        return False, "controller", None
-    return True, roles.role_for_agent_type(payload.get("agent_type")), store.native_id(payload.get("agent_id"))
+        controller = roles.get_binding("controller")
+        return {"child": False, "role": "controller", "agent_id": None, "writes": True,
+                "delegates": controller.allowed_delegation_targets}
+    agent_id, agent_type = store.native_id(payload.get("agent_id")), payload.get("agent_type")
+    snapshot = _dispatched_binding(payload, agent_id, agent_type)
+    if snapshot is not None:
+        return {"child": True, "role": snapshot["role"], "agent_id": agent_id, "writes": snapshot.get("writes") is True,
+                "delegates": frozenset(snapshot.get("delegates") or ())}
+    role = roles.role_for_agent_type(agent_type)
+    binding = roles.get_binding(role) if role else None
+    return {"child": True, "role": role, "agent_id": agent_id, "writes": binding.repo_write_allowed if binding else None,
+            "delegates": binding.allowed_delegation_targets if binding else frozenset()}
+
+
+def _dispatched_types(lifecycle: dict) -> set[str]:
+    return {item["subagent_type"] for item in lifecycle["dispatches"] if isinstance(item.get("subagent_type"), str)}
+
+
+def _dispatched_binding(payload: dict, agent_id: str | None, agent_type: object) -> dict | None:
+    """The dispatch-time role snapshot for a child of this session's managed task, if any."""
+    association = store.resolve_session(payload.get("session_id"))
+    if association is None or not isinstance(agent_type, str):
+        return None
+    try:
+        lifecycle = store.read_lifecycle(*association)
+        if agent_type not in _dispatched_types(lifecycle):
+            return None
+        if agent_id is not None and store.dispatch_for_agent(lifecycle, agent_id) is None:
+            # The Host writes its exact record shortly after SubagentStart; bind as soon as it exists.
+            with store.transaction(*association, observe_only=True) as ctx:
+                store.bind_from_host(ctx, agent_id, agent_type, payload.get("transcript_path"))
+                lifecycle = ctx["lifecycle"]
+        return store.snapshot_identity(lifecycle, agent_id, agent_type)
+    except (ValueError, OSError):
+        return None
 
 
 def evidence_packet(root: Path, task_id: str) -> str | None:
@@ -104,14 +140,16 @@ def _marker(prompt: str) -> dict | None:
 
 
 def _dispatch(payload: dict, tool_input: dict) -> dict | None:
-    is_child, caller_role, agent_id = _caller(payload)
+    caller = _caller(payload)
+    is_child, caller_role, agent_id = caller["child"], caller["role"], caller["agent_id"]
+    # New dispatches resolve only from the verified registry: writing an agent file mints no role.
     target_role = roles.role_for_agent_type(tool_input.get("subagent_type"))
     if target_role is None:
         if is_child and caller_role is not None:
             return _deny("Thaliris children delegate discovery only to a fresh `thaliris:investigator` Scanner; "
                          "generic agents and forks are not Thaliris roles.")
         return None
-    if is_child and not roles.delegation_allowed(caller_role or "", target_role):
+    if is_child and target_role not in caller["delegates"]:
         return _deny(f"Role {caller_role or 'generic agent'} may not delegate to {target_role}. "
                      "Return the uncovered need to your parent in your final report.")
     if tool_input.get("isolation") == "remote":
@@ -119,6 +157,10 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
     association = store.resolve_session(payload.get("session_id"))
     if association is None:
         return None  # No managed task: ordinary native routing, no reservation.
+    effort = tool_input.get("effort")
+    if effort is not None and effort not in roles.EFFORT_LEVELS:
+        return _deny(f"`effort` is one of {', '.join(roles.EFFORT_LEVELS)} (or omitted for the role default). "
+                     "Effort sets reasoning depth only; it never changes a role's responsibilities or permissions.")
     root, task_id = association
     prompt = tool_input.get("prompt") if isinstance(tool_input.get("prompt"), str) else ""
     updated = dict(tool_input)
@@ -159,7 +201,7 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
             entry = store.reserve(ctx, role=target_role, subagent_type=tool_input["subagent_type"],
                                   tool_use_id=str(payload.get("tool_use_id") or ""), parent=parent, prompt=prompt,
                                   model=updated.get("model"), background=bool(tool_input.get("run_in_background")),
-                                  association=marker)
+                                  association=marker, effort=effort, role_binding=roles.binding_snapshot(target_role))
     except Refusal as exc:
         return _deny(str(exc))
     except ValueError as exc:
@@ -202,7 +244,8 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
     command = tool_input.get("command")
     if not isinstance(command, str):
         return None
-    is_child, caller_role, agent_id = _caller(payload)
+    caller = _caller(payload)
+    is_child, caller_role, agent_id = caller["child"], caller["role"], caller["agent_id"]
     invocation = guards.runner_invocation(command, runner_path())
     if invocation is not None:
         if not invocation["direct"]:
@@ -235,7 +278,7 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         if guards.direct_core_call(command):
             return _deny("Children use the Thaliris runner, not the raw Core CLI or adapter module.")
         writes = guards.obvious_write(command)
-        if writes and caller_role is not None and not roles.repo_write_allowed(caller_role):
+        if writes and caller["writes"] is False:
             return _deny(f"The {caller_role} role is non-writing; this command looks like a write. Report what should change instead.")
         if writes and guards.mentions_protected(command):
             return _deny("Children cannot change Controller or security state (.context/, Thaliris authority, Claude settings).")
@@ -255,12 +298,12 @@ def _file(payload: dict, tool_input: dict) -> dict | None:
     target = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not isinstance(target, str):
         return None
-    is_child, caller_role, _ = _caller(payload)
+    caller = _caller(payload)
     association = store.resolve_session(payload.get("session_id"))
     root = association[0] if association else store.project_root(Path(payload.get("cwd") or "."))
-    if is_child:
-        if caller_role is not None and not roles.repo_write_allowed(caller_role):
-            return _deny(f"The {caller_role} role is non-writing. Report the change you would make instead.")
+    if caller["child"]:
+        if caller["writes"] is False:
+            return _deny(f"The {caller['role']} role is non-writing. Report the change you would make instead.")
         if _child_fenced(payload):
             return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
         if store.is_managed_project(root) and guards.protected_target(root, target, controller=False):
@@ -382,13 +425,28 @@ def post_tool_use_failure(payload: dict) -> dict | None:
     return None
 
 
+def _managed_child_type(payload: dict, association: tuple[Path, str] | None) -> bool:
+    """A Thaliris agent type now, or one this session's task already dispatched (its snapshot governs)."""
+    if roles.role_for_agent_type(payload.get("agent_type")) is not None:
+        return True
+    if association is None:
+        return False
+    try:
+        lifecycle = store.read_lifecycle(*association)
+    except (ValueError, OSError):
+        return False
+    agent_id, agent_type = store.native_id(payload.get("agent_id")), payload.get("agent_type")
+    return any(item.get("subagent_type") == agent_type and (
+        item.get("agent_id") == agent_id or (item.get("agent_id") is None and item["native_status"] in store.UNRESOLVED_STATUSES))
+        for item in lifecycle["dispatches"])
+
+
 def subagent_start(payload: dict) -> dict | None:
-    role = roles.role_for_agent_type(payload.get("agent_type"))
     agent_id = store.native_id(payload.get("agent_id"))
-    if role is None or agent_id is None:
+    association = store.resolve_session(payload.get("session_id"))
+    if agent_id is None or not _managed_child_type(payload, association):
         return None
     lines = [f"Thaliris runner for this session: `{runner_command()}` (run it as one direct command)."]
-    association = store.resolve_session(payload.get("session_id"))
     entry = None
     if association is not None:
         with store.transaction(*association, observe_only=True) as ctx:
@@ -413,7 +471,7 @@ def subagent_start(payload: dict) -> dict | None:
 def subagent_stop(payload: dict) -> dict | None:
     agent_id = store.native_id(payload.get("agent_id"))
     association = store.resolve_session(payload.get("session_id"))
-    if agent_id is None or association is None or roles.role_for_agent_type(payload.get("agent_type")) is None:
+    if agent_id is None or association is None or not _managed_child_type(payload, association):
         return None
     with store.transaction(*association, observe_only=True) as ctx:
         entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
@@ -450,7 +508,16 @@ MODE_SETTING = "CLAUDE_PLUGIN_OPTION_DEFAULT_EXECUTION_MODE"
 MODEL_SETTING = "CLAUDE_PLUGIN_OPTION_MODEL_SELECTION"
 
 
+_EFFORT_NOTE = ("\n- Effort: set `effort` (low, medium, high, xhigh, max) on a Thaliris Agent call when a dispatch needs "
+                "more or less reasoning depth than its role's default; it is recorded per dispatch and never changes a "
+                "role's responsibilities or permissions.")
+
+
 def _model_preference() -> str:
+    return _model_choice() + _EFFORT_NOTE
+
+
+def _model_choice() -> str:
     """The Agent tool says to set `model` only when the user asks; this option is that request.
 
     Choosing models per role is the Controller's job by design. The adapter
@@ -507,6 +574,10 @@ def session_start(payload: dict) -> dict | None:
     if payload.get("source") in {"compact", "resume", "clear"}:
         store.forget_packet(payload.get("session_id"))  # context was lost; show pending evidence again
     association = store.resolve_session(payload.get("session_id"))
+    if payload.get("source") in {"startup", "resume"}:
+        # A process start fixes which agent directories the Host watches (see `register-role`).
+        store.note_session_agents_dir(payload.get("session_id"), association[0] if association
+                                      else store.project_root(Path(payload.get("cwd") or ".")))
     if association is not None:
         root, task_id = association
         try:
@@ -515,6 +586,7 @@ def session_start(payload: dict) -> dict | None:
                 mode = record.get("contract", {}).get("execution_mode", "UNKNOWN")
                 pending = len(store.unresolved(ctx["lifecycle"]))
                 revision = ctx["state"]["revision"]
+                context = store.task_context_text(ctx["state"])
         except (ValueError, OSError) as exc:
             text += f"\n\nThis session's associated task {task_id} could not be read ({exc}); managed assurance is UNKNOWN."
         else:
@@ -522,6 +594,8 @@ def session_start(payload: dict) -> dict | None:
                      f"(mode {mode}, revision {revision}, {pending} unresolved child dispatch(es)). Continue it or abandon it "
                      "explicitly. If the skill guidance is no longer in context (for example after compaction), load the "
                      "`thaliris` skill again before routing.")
+            if context:
+                text += "\n\n" + context
     return _context("SessionStart", text)
 
 

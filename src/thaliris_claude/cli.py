@@ -54,6 +54,10 @@ def _parser() -> argparse.ArgumentParser:
         command = add(name, help_text)
         command.add_argument("--base-revision", type=int, required=True)
         _payload_args(command)
+    command = add("task-update", "update the dynamic task context: records (facts, decisions, progress, open items), "
+                                 "Active Work, Pending Results, milestone")
+    command.add_argument("--base-revision", type=int, required=True)
+    _payload_args(command)
     command = add("observe", "record one local observation with adapter provenance")
     command.add_argument("--handoff-id", help="Controller import of a historical child result")
     _payload_args(command)
@@ -81,8 +85,10 @@ def _parser() -> argparse.ArgumentParser:
     add("render-agents", "regenerate agents/*.md and the skill role table").add_argument("--check", action="store_true")
     add("version", "print the adapter version")
     add("roles", "list built-in and Controller-registered roles")
-    command = add("register-role", "register or update a project role as a native thaliris-<name> agent")
+    command = add("register-role", "register a project role as a native thaliris-<name> agent, or update a registered one")
     _payload_args(command)
+    command = add("unregister-role", "remove a registered project role (running children keep their dispatch-time binding)")
+    command.add_argument("name")
     return parser
 
 
@@ -165,10 +171,15 @@ def _status(root: Path, task_id: str, offset: int = 0) -> dict:
     lifecycle = store.read_lifecycle(root, task_id)
     result["Claude Dispatches"] = [
         {key: item.get(key) for key in ("handoff_id", "role", "native_status", "binding", "background", "disposed", "parent",
-                                        "requested_model", "observed_model", "observed_tools")}
+                                        "requested_model", "requested_effort", "observed_model", "observed_tools")}
         | {"agent": store.native_hash(item["agent_id"]) if item.get("agent_id") else None,
-           "parent": item["parent"] if item["parent"] == "controller" else store.native_hash(item["parent"])}
+           "parent": item["parent"] if item["parent"] == "controller" else store.native_hash(item["parent"]),
+           "role_binding": _binding_summary(item.get("role_binding"))}
         for item in lifecycle["dispatches"][-16:]]
+    state = core._load_state(root)
+    records, total = store.current_records(state)
+    result["Current Records"] = records
+    result["Current Record Count"] = total
     result["Claude Dispatch Count"] = len(lifecycle["dispatches"])
     target = store.authority(root, task_id)
     record = target.read()
@@ -177,6 +188,68 @@ def _status(root: Path, task_id: str, offset: int = 0) -> dict:
         "execution_constraint": record["contract"].get("execution_constraint"),
         "sha256": core_authority.digest(target.path())}
     return result
+
+
+def _binding_summary(snapshot: object) -> dict | None:
+    """The dispatch-time role binding, as hooks enforce it for that child (None: entry predates snapshots)."""
+    if not isinstance(snapshot, dict):
+        return None
+    return {"source": snapshot.get("source"), "writes": snapshot.get("writes"), "delegates": snapshot.get("delegates"),
+            "default_model": snapshot.get("default_model"), "default_effort": snapshot.get("default_effort"),
+            "agent_file_sha256": (snapshot.get("agent_file_sha256") or "")[:16] or None}
+
+
+def _role_view(key: str, record: dict) -> dict:
+    view = {"role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key, "default_model": record.get("model"),
+            "default_effort": record.get("effort"), "writes": record.get("writes", True),
+            "delegates": ["investigator"] if record.get("scanner") else [], "description": record.get("description"),
+            "agent_file": record.get("agent_file")}
+    view.update({field: record[field] for field in ("tools", "disallowedTools", "color", "maxTurns", "skills", "memory",
+                                                    "background", "isolation") if record.get(field) not in (None, [], False)})
+    return view
+
+
+def _activation(session: str, root: Path, created_dir: bool) -> str:
+    """When the Host can dispatch a role file written now.
+
+    The Host documents that agent directories existing at session start are
+    watched, so new files work on the next delegation. A headless probe on Claude
+    Code 2.1.302 (Windows) did not pick up a new file mid-session even then, so
+    same-session use is only possible, never promised. A new session always works.
+    """
+    at_start = None if created_dir else store.agents_dir_at_session_start(session, root)
+    if created_dir or at_start is False:
+        return ("next session: .claude/agents/ did not exist when this Claude Code session started, so this session "
+                "does not watch it")
+    if at_start:
+        return ("next session; possibly the next delegation in this session: .claude/agents/ existed when this session "
+                "started, which the Host documents as enough, but a headless probe (Claude Code 2.1.302) did not pick up "
+                "a new agent file mid-session. If the Agent tool reports the type as not found, dispatch it from a new session.")
+    return ("next session; this session UNKNOWN (whether .claude/agents/ existed when it started was not recorded). "
+            "If the Agent tool reports the type as not found, dispatch it from a new session.")
+
+
+def _register_role(args) -> dict:
+    session = _controller(args)
+    root, task_id = _task(args)
+    spec = _payload(args)
+    key = spec.pop("name", None)
+    if not isinstance(key, str) or not roles._NAME.fullmatch(key) or roles.role_for_agent_type(f"thaliris:{key}"):
+        raise ValueError("ROLE_NAME_INVALID: use 2-40 lowercase letters, digits or '-', not a built-in role name")
+    replace = spec.pop("replace", False)
+    if not isinstance(replace, bool):
+        raise ValueError("ROLE_FIELD_INVALID: replace is true or false")
+    with store.transaction(root, task_id) as ctx:  # an authorized Controller act, under the task lock
+        previous = store.registered_role(root, key)
+        # An update merges onto the registered record (null resets a field); `replace` starts from scratch.
+        base = {} if replace or previous is None else {field: previous[field] for field in roles.CUSTOM_FIELDS if field in previous}
+        record = roles.validate_custom_record(base | spec)
+        created_dir = store.ensure_agents_dir(root)
+        entry = store.register_role(ctx, key, record, roles.render_custom_agent(key, record))
+    return {"ok": True, "role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key,
+            "action": "updated" if previous is not None else "registered", "agent_file": entry["agent_file"],
+            "agent_file_sha256": entry["sha256"], "activation": _activation(session, root, created_dir),
+            "running_children": "keep the role binding recorded at their dispatch; this change applies to future dispatches"}
 
 
 def _render(check: bool) -> dict:
@@ -207,36 +280,20 @@ def run(args) -> dict:
         builtin = [{"role": role, "subagent_type": roles.get_binding(role).subagent_type, "default_model": roles.get_binding(role).model,
                     "writes": roles.repo_write_allowed(role), "delegates": sorted(roles.get_binding(role).allowed_delegation_targets)}
                    for role in roles.child_roles()]
-        custom = [{"role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key, "default_model": record.get("model"),
-                   "writes": record.get("writes", True), "delegates": ["investigator"] if record.get("scanner") else [],
-                   "description": record.get("description")} for key, record in sorted(store.custom_role_records(root).items())]
+        custom = [_role_view(key, record) for key, record in sorted(store.custom_role_records(root).items())]
         return {"ok": True, "builtin": builtin, "registered": custom,
-                "note": "Models are the Controller's choice per dispatch; defaults apply only when it sets none."}
+                "note": "Models and effort are the Controller's choice per dispatch; defaults apply only when it sets none."}
     if name == "register-role":
+        return _register_role(args)
+    if name == "unregister-role":
         _controller(args)
         root, task_id = _task(args)
-        spec = _payload(args)
-        key = spec.get("name")
-        if not isinstance(key, str) or not roles._NAME.fullmatch(key) or roles.role_for_agent_type(f"thaliris:{key}"):
-            raise ValueError("ROLE_NAME_INVALID: use 2-40 lowercase letters, digits or '-', not a built-in role name")
-        if set(spec) - {"name", "description", "instructions", "model", "writes", "scanner", "tools"}:
-            raise ValueError("ROLE_FIELDS_INVALID: name, description, instructions, model, writes, scanner, tools")
-        if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip() or len(spec["instructions"]) > 16384:
-            raise ValueError("ROLE_INSTRUCTIONS_REQUIRED")
-        if not isinstance(spec.get("description"), str) or not spec["description"].strip():
-            raise ValueError("ROLE_DESCRIPTION_REQUIRED: say when the Controller should use this role")
-        if spec.get("model") is not None and spec["model"] not in store.MODEL_ALIASES:
-            raise ValueError(f"ROLE_MODEL_INVALID: one of {', '.join(store.MODEL_ALIASES)} or omitted")
-        tools = spec.get("tools")
-        if tools is not None and (not isinstance(tools, list) or not all(isinstance(item, str) and item.isidentifier() for item in tools)):
-            raise ValueError("ROLE_TOOLS_INVALID: a list of tool names")
-        record = {"description": spec["description"].strip(), "instructions": spec["instructions"], "model": spec.get("model"),
-                  "writes": bool(spec.get("writes", True)), "scanner": bool(spec.get("scanner", False)), "tools": tools}
-        with store.transaction(root, task_id) as ctx:  # an authorized Controller act, under the task lock
-            entry = store.register_role(ctx, key, record, roles.render_custom_agent(key, record))
-        return {"ok": True, "role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key,
-                "agent_file": entry["agent_file"],
-                "activation": "available from the next Claude Code session; the current session cannot dispatch it yet"}
+        if not roles._NAME.fullmatch(args.name):
+            raise ValueError("ROLE_NAME_INVALID")
+        with store.transaction(root, task_id) as ctx:
+            removed = store.unregister_role(ctx, args.name)
+        return {"ok": True, "role": roles.custom_role_id(args.name), **removed,
+                "running_children": "keep the role binding recorded at their dispatch; new dispatches of this type are generic agents"}
     if name == "render-agents":
         return _render(args.check)
     if name == "guidance":
@@ -249,8 +306,9 @@ def run(args) -> dict:
         _controller(args)
         root = _project(args)
         initialized = None if store.is_managed_project(root) else core.init(root)
+        agents_dir_created = store.ensure_agents_dir(root)  # so roles registered later land in a watched directory
         association = store.resolve_session(args.native_session)
-        return {"ok": True, "root": str(root), "initialized": initialized is not None,
+        return {"ok": True, "root": str(root), "initialized": initialized is not None, "agents_dir_created": agents_dir_created,
                 "navigation": [".agent-memory/INDEX.md", ".milestones/INDEX.md"],
                 "associated_task": association[1] if association else None, "runner": hooks.runner_command()}
     if name == "task-start":
@@ -262,16 +320,19 @@ def run(args) -> dict:
             # The contract is a file path, never inline JSON (H059).
             raise ValueError("CONTRACT_FILE_PATH_REQUIRED: write the contract JSON to a file and pass its path")
         contract = json.loads(Path(args.contract).read_text(encoding="utf-8"))
-        return store.start_task(root, args.goal, contract, session)
+        result = store.start_task(root, args.goal, contract, session)
+        result["agents_dir_created"] = store.ensure_agents_dir(root)
+        return result
     if name == "attach":
         session = _controller(args)
         if not args.task_id:
             raise ValueError("attach requires --task-id")
         root = _project(args)
-        with store.transaction(root, args.task_id):
+        with store.transaction(root, args.task_id) as ctx:
             pass  # The anchored authority must be ACTIVE and intact.
         store.write_session(session, root, args.task_id, args.reason)
-        return {"ok": True, "task_id": args.task_id, "root": str(root)}
+        # A new session lost the conversation: hand back what the Controller recorded.
+        return {"ok": True, "task_id": args.task_id, "root": str(root), "Task Context": store.task_context_text(ctx["state"])}
     if name in {"status", "get"}:
         root, task_id = _read_task(args)
         if name == "status":
@@ -317,6 +378,25 @@ def run(args) -> dict:
         store.authority(root, task_id).checkpoint()
         return result
     _controller(args)
+    if name == "task-update":
+        payload = _payload(args)
+        for record in payload.get("records") or []:
+            if isinstance(record, dict) and {"producer", "revision"} & set(record):
+                raise ValueError("TASK_UPDATE_PROVENANCE: the runner supplies record producer and revision")
+        with store.transaction(root, task_id):
+            pass  # The anchored authority must be ACTIVE and intact.
+        core.select_task(root, task_id)
+        temporary = _payload_file(root, payload)
+        try:
+            result = core.task_update(root, "controller", args.base_revision, str(temporary))
+        finally:
+            temporary.unlink(missing_ok=True)
+        store.authority(root, task_id).checkpoint()
+        state = core._load_state(root)
+        records, total = store.current_records(state)
+        return {**result, "Task Context": {"milestone": state["current_milestone"], "Active Work": state["active_work"],
+                                           "Pending Results": state["pending_results"], "Current Records": records,
+                                           "Current Record Count": total}}
     if name in {"register", "judge"}:
         payload = _payload(args)
         with store.transaction(root, task_id) as ctx:
