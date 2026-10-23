@@ -93,7 +93,7 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
 | Curator | `thaliris:curator` | `sonnet` | yes | — |
 | Reasoning specialist | `thaliris:reasoning-specialist` | `inherit` | yes | — |
 | Implementer | `thaliris:implementer` | `sonnet` | yes | investigator |
-| Focused implementer | `thaliris:focused-implementer` | `inherit` | yes | investigator |
+| Focused implementer | `thaliris:focused-implementer` | `sonnet` or `opus`, by difficulty | yes | investigator |
 | Reviewer | `thaliris:reviewer` | `inherit` | no | investigator |
 <!-- thaliris-roles:end -->
 
@@ -111,11 +111,38 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
 - **Reasoning Specialist** challenges your framing when that could change
   direction. **Curator** reconciles durable knowledge you select.
 
-The default model comes from each agent's frontmatter; leave `model` unset unless
-the user asked for a specific one. A frozen `claude-model:` constraint overrides
-every Thaliris spawn and refuses conflicting choices. Model choice never changes
-a role's responsibilities or permissions. Always use the exact `thaliris:*`
-`subagent_type` for Thaliris work, including preparatory discovery; generic agents
+**Choosing models is yours.** The table shows defaults, which apply only when you
+set no `model`. Unless the user chose `role-defaults` (your session context says
+which), set `model` on each Agent call as the work requires; the adapter never
+overrides or refuses your choice. For a Focused Implementer, `opus` suits coupled
+work that crosses modules or contracts, involves concurrency, lifecycle or timing,
+has an unclear causal model, or follows a failed attempt or a decision-basis
+finding; `sonnet` suits local coupling with a clear causal model. The one thing
+that binds you is a frozen `claude-model:` constraint the user wrote into the
+task's contract. Model choice never changes a role's responsibilities or
+permissions.
+
+**Registering a role.** When no built-in role fits a recurring shape of work, define
+one: `<runner> register-role --input <file>` with
+`{"name": "security-auditor", "description": "when to use it", "instructions": "what it owns and returns", "model": "opus", "writes": false, "scanner": true}`
+(`model`, `writes`, `scanner` and `tools` are optional). It becomes the native project
+agent `thaliris-security-auditor`, carrying the same child contract (selective
+handoff, evidence, honest UNKNOWN, final report), and the hooks manage it like a
+built-in role. `writes: false` makes it non-writing; `scanner: true` lets it use a
+Scanner. Claude Code loads the new agent only in a new session (the current one reports
+it as not found); `<runner> roles` lists what is registered.
+
+**The Controller seat.** You should be the most capable model available (Opus).
+Never run the Controller on a small or low-capability model: it has to keep the
+whole goal coherent over many steps, plan from the end state, trace wrong turns
+back to their root, notice drift, foresee downstream effects and replan when the
+plan breaks. If your session runs on a small model, tell the user before admitting
+a managed task. That is advice to the user, not a gate: if they want the
+Controller to do everything itself (controller-direct or single-agent), that is
+their choice.
+
+Always use the exact `thaliris:*` (or registered `thaliris-<name>`) `subagent_type`
+for Thaliris work, including preparatory discovery; generic agents
 (`general-purpose`, `Explore`, `fork`) are ordinary native tools and carry no
 Thaliris role, lineage or evidence.
 

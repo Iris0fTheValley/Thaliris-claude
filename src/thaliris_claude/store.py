@@ -129,6 +129,53 @@ def packet_is_new(session_id: str | None, packet: str) -> bool:
     return True
 
 
+ROLES_NAME = "claude-roles.json"
+
+
+def _roles_path(root: Path) -> Path:
+    return core._safe_without_final_symlink(root, f".context/{ROLES_NAME}")
+
+
+def custom_role_records(root: Path) -> dict[str, dict]:
+    """Controller-registered roles whose agent file still matches its recorded digest.
+
+    A missing or edited agent file is not a Thaliris role (UNKNOWN), so a child
+    cannot mint a managed role by writing an agent file of its own.
+    """
+    try:
+        registry = json.loads(_roles_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    verified = {}
+    for name, record in (registry.get("roles") or {}).items() if isinstance(registry, dict) else ():
+        try:
+            agent = core._safe_without_final_symlink(root, record["agent_file"])
+            if hashlib.sha256(agent.read_bytes()).hexdigest() == record["sha256"]:
+                verified[name] = record
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return verified
+
+
+def register_role(ctx: dict, name: str, record: dict, agent_text: str) -> dict:
+    """Write the native agent file and its registry entry under the task lock."""
+    root = ctx["root"]
+    relative = f".claude/agents/thaliris-{name}.md"
+    agent = core._safe_without_final_symlink(root, relative)
+    payload = agent_text.encode("utf-8")
+    core._atomic_write(agent, payload)
+    path = _roles_path(root)
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        registry = {"version": 1, "roles": {}}
+    entry = {**record, "agent_file": relative, "sha256": hashlib.sha256(payload).hexdigest(),
+             "registered_at": now(), "registered_in_task": ctx["task_id"]}
+    registry.setdefault("roles", {})[name] = entry
+    core._atomic_write(path, (json.dumps(registry, sort_keys=True, indent=2) + "\n").encode())
+    return entry
+
+
 def lifecycle_path(root: Path, task_id: str) -> Path:
     return core._safe_without_final_symlink(root, f".context/tasks/{task_id}/{LIFECYCLE_NAME}")
 

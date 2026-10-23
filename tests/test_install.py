@@ -45,6 +45,8 @@ def test_user_config_offers_exactly_the_core_modes():
     from thaliris.authority import MODES
     option = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["userConfig"]["default_execution_mode"]
     assert tuple(option["options"]) == MODES and option["default"] in MODES
+    selection = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["userConfig"]["model_selection"]
+    assert selection["default"] == "controller" and set(selection["options"]) == {"controller", "role-defaults"}
 
 
 def test_hooks_use_the_sh_entry_convention():
@@ -170,6 +172,7 @@ def test_sh_filter_never_skips_a_call_the_guards_would_decide(task):
         ({"tool_name": "Write", "tool_input": {"file_path": ledger, "content": "{}"}}, "deny"),
         ({"tool_name": "Write", "tool_input": {"file_path": ledger.upper(), "content": "{}"}}, "deny"),
         ({"tool_name": "Bash", "tool_input": {"command": "echo {} > claude-lifecycle.json"}}, "deny"),
+        ({"tool_name": "Bash", "tool_input": {"command": "echo {} > claude-roles.json"}}, "deny"),
         ({"tool_name": "Write", "tool_input": {"file_path": str(task["root"] / ".claude" / "settings.json"), "content": "{}"}, "agent_id": "g", "agent_type": "Explore"}, "deny"),
         ({"tool_name": "Bash", "tool_input": {"command": f"{hooks.runner_command()} status"}}, "allow"),
     ]

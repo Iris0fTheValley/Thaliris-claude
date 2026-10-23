@@ -80,6 +80,9 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("--reason", required=True)
     add("render-agents", "regenerate agents/*.md and the skill role table").add_argument("--check", action="store_true")
     add("version", "print the adapter version")
+    add("roles", "list built-in and Controller-registered roles")
+    command = add("register-role", "register or update a project role as a native thaliris-<name> agent")
+    _payload_args(command)
     return parser
 
 
@@ -198,6 +201,42 @@ def run(args) -> dict:
         from importlib import metadata
         return {"ok": True, "version": __version__, "plugin_root": hooks.plugin_root().as_posix(),
                 "python": platform.python_version(), "core_version": metadata.version("thaliris")}
+    if name == "roles":
+        association = store.resolve_session(args.native_session)
+        root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())
+        builtin = [{"role": role, "subagent_type": roles.get_binding(role).subagent_type, "default_model": roles.get_binding(role).model,
+                    "writes": roles.repo_write_allowed(role), "delegates": sorted(roles.get_binding(role).allowed_delegation_targets)}
+                   for role in roles.child_roles()]
+        custom = [{"role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key, "default_model": record.get("model"),
+                   "writes": record.get("writes", True), "delegates": ["investigator"] if record.get("scanner") else [],
+                   "description": record.get("description")} for key, record in sorted(store.custom_role_records(root).items())]
+        return {"ok": True, "builtin": builtin, "registered": custom,
+                "note": "Models are the Controller's choice per dispatch; defaults apply only when it sets none."}
+    if name == "register-role":
+        _controller(args)
+        root, task_id = _task(args)
+        spec = _payload(args)
+        key = spec.get("name")
+        if not isinstance(key, str) or not roles._NAME.fullmatch(key) or roles.role_for_agent_type(f"thaliris:{key}"):
+            raise ValueError("ROLE_NAME_INVALID: use 2-40 lowercase letters, digits or '-', not a built-in role name")
+        if set(spec) - {"name", "description", "instructions", "model", "writes", "scanner", "tools"}:
+            raise ValueError("ROLE_FIELDS_INVALID: name, description, instructions, model, writes, scanner, tools")
+        if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip() or len(spec["instructions"]) > 16384:
+            raise ValueError("ROLE_INSTRUCTIONS_REQUIRED")
+        if not isinstance(spec.get("description"), str) or not spec["description"].strip():
+            raise ValueError("ROLE_DESCRIPTION_REQUIRED: say when the Controller should use this role")
+        if spec.get("model") is not None and spec["model"] not in store.MODEL_ALIASES:
+            raise ValueError(f"ROLE_MODEL_INVALID: one of {', '.join(store.MODEL_ALIASES)} or omitted")
+        tools = spec.get("tools")
+        if tools is not None and (not isinstance(tools, list) or not all(isinstance(item, str) and item.isidentifier() for item in tools)):
+            raise ValueError("ROLE_TOOLS_INVALID: a list of tool names")
+        record = {"description": spec["description"].strip(), "instructions": spec["instructions"], "model": spec.get("model"),
+                  "writes": bool(spec.get("writes", True)), "scanner": bool(spec.get("scanner", False)), "tools": tools}
+        with store.transaction(root, task_id) as ctx:  # an authorized Controller act, under the task lock
+            entry = store.register_role(ctx, key, record, roles.render_custom_agent(key, record))
+        return {"ok": True, "role": roles.custom_role_id(key), "subagent_type": roles.CUSTOM_PREFIX + key,
+                "agent_file": entry["agent_file"],
+                "activation": "available from the next Claude Code session; the current session cannot dispatch it yet"}
     if name == "render-agents":
         return _render(args.check)
     if name == "guidance":

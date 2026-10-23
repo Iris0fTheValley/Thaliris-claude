@@ -85,13 +85,14 @@ claude plugin marketplace add Iris0fTheValley/Thaliris-claude
 claude plugin install thaliris@thaliris --config default_execution_mode=delegated
 ```
 
-在交互式 Claude Code 中用 `/plugin install thaliris@thaliris` 时，启用时会询问两个选项（之后可用
+在交互式 Claude Code 中用 `/plugin install thaliris@thaliris` 时，启用时会询问三个选项（之后可用
 `/plugin configure thaliris@thaliris` 修改）：
 
 | 选项 | 默认 | 作用 |
 | --- | --- | --- |
 | `default_execution_mode` | `delegated` | 受管任务的常驻执行模式。选 `delegated` 即用户对 `thaliris:*` 子代理的常驻请求（见下文 Pro 计划限制） |
 | `auto_approve_runner` | 开 | Hook 只批准“单条直接调用本插件 Runner”的命令，避免受管流程每步停下来问权限；plan 模式下只批准只读子命令；串接其他命令一律拒绝 |
+| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型（设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
 
 无需其他步骤：
 
@@ -139,10 +140,12 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
 
 ## Runner 子命令
 
+`register-role` 让 Controller 为反复出现的工作形态注册新角色：写入项目原生 agent `.claude/agents/thaliris-<name>.md`（带与内置角色相同的子代理契约），并在受保护的 `.context/claude-roles.json` 记录其摘要。Hook 只把摘要一致的注册角色当作 Thaliris 角色管理（只读、委派、证据绑定同内置角色）；文件被改动即失效为普通代理。实测（2.1.302）：注册后当前会话找不到该 agent，新会话即可派发。
+
 | 谁 | 子命令 |
 | --- | --- |
-| 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` |
-| Controller | `bootstrap` `task-start` `attach` `detach` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` |
+| 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` `roles` |
+| Controller | `bootstrap` `task-start` `attach` `detach` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` |
 | 子代理 | `observe`（Controller 用 `--handoff-id` 导入历史结果） |
 | Controller / Curator | `promote` `document-maintain` |
 

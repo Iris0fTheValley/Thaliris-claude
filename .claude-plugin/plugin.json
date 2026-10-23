@@ -1,6 +1,6 @@
 {
   "name": "thaliris",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Thaliris context orchestration for Claude Code: a Controller skill, fresh role subagents, and hooks that bind native agent identity and evidence continuity to the shared Thaliris Core (vendored; needs only Python 3.11+).",
   "author": {
     "name": "Thaliris contributors"
@@ -29,6 +29,16 @@
       "title": "Run the Thaliris runner without permission prompts",
       "description": "When on, Thaliris' hook approves its own runner command (only a single direct invocation of this plugin's CLI, never anything chained to it), so managed tasks do not stop to ask. In plan mode only read-only runner commands are approved. Other commands keep your normal permission rules.",
       "default": true
+    },
+    "model_selection": {
+      "type": "string",
+      "title": "Who chooses each role's model",
+      "description": "controller: the Controller chooses the model of every Thaliris role per dispatch as the work requires (e.g. sonnet or opus for a Focused Implementer by difficulty); choosing this is your request that it set the model. role-defaults: each role uses its default model unless you ask for another.",
+      "options": [
+        "controller",
+        "role-defaults"
+      ],
+      "default": "controller"
     }
   }
 }

@@ -5,7 +5,7 @@
 # Bash/Edit/Write calls are most of a session's tool calls, and the plugin is
 # user-scoped, so this entry first decides without Python whether the adapter
 # could have anything to say. `--filter` passes a call on only when its payload
-# mentions Thaliris, `.context`, settings or the lifecycle file; every decision
+# mentions Thaliris, `.context`, settings, the lifecycle file or the role registry; every decision
 # the Python guards can make for such a call needs one of those (a Thaliris
 # child's agent_type contains "thaliris"). UserPromptSubmit runs every turn and
 # is skipped while no session has a Thaliris task. With a cached Python >= 3.11
@@ -28,7 +28,7 @@ fi
 payload=$(cat)
 if [ "$2" = "--filter" ]; then
   case $payload in
-    *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*) ;;
+    *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*|*[Cc][Ll][Aa][Uu][Dd][Ee]-[Rr][Oo][Ll][Ee][Ss]*) ;;
     *) exit 0 ;;
   esac
 fi

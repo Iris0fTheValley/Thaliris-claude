@@ -75,6 +75,37 @@ The mechanical layer handles identity, sources, versions, continuity and bounded
 
 There is one shared Core. Core does not run models, schedule Agents or authenticate callers; native execution belongs to each Adapter.
 
+## Role capabilities and recommended models
+
+> **Never use a small or low-capability model as the Controller.** Savings should come from giving narrow work to cheaper child roles, not from downgrading the Controller. A Controller's mistakes are not corrected by its children; they are amplified. In practice, weak Controllers skipped the managed flow, fell back to single-agent work after an isolation refusal, or declared completion while review counterevidence was still unresolved.
+
+The Controller needs all of these capabilities; each one matters:
+
+| Capability | The question the Controller must answer |
+| --- | --- |
+| Global Coherence | After dozens or hundreds of steps, does it still remember why the work is being done? |
+| Strategic Planning | Can it work backwards from the end goal, identify dependencies and allocate resources, rather than only looking at the next step? |
+| Retrospective Reasoning | Can it trace a root error in earlier decisions instead of repeatedly patching symptoms? |
+| Metacognitive Monitoring | Can it notice that it is drifting, duplicating work or stuck on an impossible task? |
+| Prospective Reasoning | Can it predict how a current decision affects later stages and avoid future structural problems? |
+| Adaptive Replanning | When the plan fails or conditions change, can it reorganize the overall work instead of mechanically continuing the old plan? |
+
+Capabilities each role needs, and recommended models:
+
+| Role | Capabilities needed | Claude (Claude Code) |
+| --- | --- | --- |
+| Controller | All six above; integrates the original objective, acceptance criteria and evidence to decide product acceptance | Opus |
+| Investigator | Gathers facts and sources broadly and accurately within the selected scope, stating covered and uncovered scope | Sonnet |
+| Implementer | Implements, verifies and repairs ordinary defects within an accepted direction until deterministic convergence | Sonnet |
+| Focused Implementer | Sustained reasoning over coupled invariants, absorbing runtime feedback until semantic convergence | Sonnet or Opus, chosen by the Controller per task difficulty |
+| Reviewer | Independently challenges a converged candidate and seeks cross-boundary counterevidence without adopting the author's framing | Opus |
+| Reasoning Specialist | Challenges the problem framing, causal model and decision basis | Opus |
+| Curator | Maintains selected durable knowledge and INDEX entries precisely from supplied material | Sonnet |
+
+Recommendations are a starting point, not a quality guarantee. Role identity and execution model are independent; the model that actually ran is what the Host observed, not what a configuration file says.
+
+These are recommendations only. Choosing each role's model is the Controller's job, made freely within any constraint the user wrote into the task; the Controller can also register new project roles with `register-role`. A user may also have the Controller do all the work itself: whether and how much to delegate is the user's decision.
+
 ## Empirical observations
 
 **What this benchmark measures:** We chose a difficult single-turn refactor: desktop and WebUI share Live2D behavior, with model selection, voice/action queues and exit lifecycle involved. The benchmark does not rank candidates by how many bugs remain. It compares how original requirements guide investigation, plan convergence, implementation and verification, especially whether checks cover real consumer paths and whether counterevidence changes the plan. A/B are single-agent runs; C/D provide collaborative comparisons.
@@ -159,12 +190,13 @@ Removing Thaliris should not make the underlying development process incorrect.
 
 Thaliris-claude is a Claude Code plugin that connects the shared semantics to Claude Code's native subagents, Skills, Hooks and plugin configuration. It vendors a copy of Thaliris Core locked to a fixed commit (standard library only); Core provides task records, evidence and the authority API. The adapter handles session-to-task association, native identity and handoff binding, role-boundary guards and evidence re-presentation; it does not build another Agent Runtime.
 
-The main thread is the Controller: following the thaliris skill, it admits tasks, chooses roles, writes selective Handoffs and decides acceptance. Roles are `thaliris:*` subagents with the default models below; explicit selections are kept, and a task's `claude-model:<alias>` constraint freezes the model of every subagent:
+The main thread is the Controller: following the thaliris skill, it admits tasks, chooses roles, writes selective Handoffs and decides acceptance. Roles are `thaliris:*` subagents, and the Controller can register new project roles (`thaliris-<name>`) with `register-role`. The default models below apply only when the Controller sets none; explicit selections are kept, and a task's `claude-model:<alias>` constraint freezes the model of every subagent:
 
 | Role | Default model |
 | --- | --- |
 | Investigator, Implementer, Curator | sonnet |
-| Reasoning Specialist, Focused Implementer, Reviewer | inherit (same as the Controller) |
+| Focused Implementer | sonnet or opus, chosen by the Controller per task difficulty |
+| Reasoning Specialist, Reviewer | inherit (same as the Controller, which should be Opus) |
 
 Claude subagents do not inherit the parent conversation, and a fork or generic agent cannot stand in for a Thaliris role. Native identity is bound only from exact Host records (the Agent result's agentId and the subagent metadata the Host writes), never by guessing "the only pending reservation"; missing or conflicting identity stays UNKNOWN. A subagent stopping, Agent completed, Core DONE and product acceptance are separate facts; when a background subagent finishes, unresolved evidence is re-presented at the start of the Controller's next turn. The Reviewer's readonly boundary is enforced by both its tool allowlist and a PreToolUse guard. See the [adapter notes](docs/claude-adapter.md) (Chinese).
 
@@ -177,6 +209,6 @@ claude plugin marketplace add Iris0fTheValley/Thaliris-claude
 claude plugin install thaliris@thaliris
 ~~~
 
-Enabling the plugin asks for two options, which `/plugin configure thaliris@thaliris` can change later: `default_execution_mode` (delegated, controller-direct or single-agent; delegated is your standing request for `thaliris:*` subagents) and `auto_approve_runner` (approves only single direct invocations of this plugin's runner). The first session finds and caches a Python runtime. The global Controller guidance is injected by the plugin's SessionStart hook rather than written into your CLAUDE.md, and uninstalling the plugin removes it. A project is initialized by the Controller running `bootstrap` at its first managed task; it never runs `git init`.
+Enabling the plugin asks for three options, which `/plugin configure thaliris@thaliris` can change later: `default_execution_mode` (delegated, controller-direct or single-agent; delegated is your standing request for `thaliris:*` subagents) `model_selection` (controller: the Controller picks each role's model as needed; role-defaults: each role's default model) and `auto_approve_runner` (approves only single direct invocations of this plugin's runner). The first session finds and caches a Python runtime. The global Controller guidance is injected by the plugin's SessionStart hook rather than written into your CLAUDE.md, and uninstalling the plugin removes it. A project is initialized by the Controller running `bootstrap` at its first managed task; it never runs `git init`.
 
 Update with `claude plugin update thaliris@thaliris`; it applies to new sessions, and your options and `~/.thaliris` data carry over between versions. Installing, updating or changing user-level configuration is Host maintenance and needs explicit user authorization; changed files on disk do not prove that a running session loaded them. Further constraints, live Host probe results and the history cross-check are in the [adapter notes](docs/claude-adapter.md).

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 
 PLUGIN_NAMESPACE = "thaliris"
 
@@ -428,13 +429,46 @@ def role_choices() -> tuple[str, ...]:
     return tuple(ROLE_REGISTRY)
 
 
+# Roles the Controller registered for one project (see `register-role`). They are
+# native project agents named `thaliris-<name>`; the hook loads the verified
+# registry for the project it is handling before resolving any agent type.
+CUSTOM_PREFIX = "thaliris-"
+_custom: dict[str, RoleRegistration] = {}
+_NAME = re.compile(r"[a-z][a-z0-9-]{1,39}")
+
+
+def custom_role_id(name: str) -> str:
+    return f"custom:{name}"
+
+
+def custom_registration(name: str, record: dict) -> RoleRegistration:
+    delegates = frozenset({"investigator"}) if record.get("scanner") else frozenset()
+    return RoleRegistration(
+        RoleSpec(custom_role_id(name), "", record.get("description", name)),
+        ClaudeExecutionBinding(agent_name=CUSTOM_PREFIX + name, description=record.get("description", ""),
+                               model=record.get("model"), repo_write_allowed=bool(record.get("writes", True)),
+                               allowed_delegation_targets=delegates))
+
+
+def load_custom_roles(records: dict[str, dict]) -> None:
+    """Replace the overlay with the verified registry of the project being handled."""
+    _custom.clear()
+    for name, record in records.items():
+        if _NAME.fullmatch(name):
+            _custom[custom_role_id(name)] = custom_registration(name, record)
+
+
+def _registration(role: str) -> RoleRegistration | None:
+    return ROLE_REGISTRY.get(role) or _custom.get(role)
+
+
 def get_role(role: str) -> RoleSpec | None:
-    registration = ROLE_REGISTRY.get(role)
+    registration = _registration(role)
     return registration.spec if registration else None
 
 
 def get_binding(role: str) -> ClaudeExecutionBinding | None:
-    registration = ROLE_REGISTRY.get(role)
+    registration = _registration(role)
     return registration.binding if registration else None
 
 
@@ -443,13 +477,35 @@ def child_roles() -> tuple[str, ...]:
 
 
 def role_for_agent_type(agent_type: object) -> str | None:
-    """Resolve an exact namespaced Claude agent type; bare names are generic agents."""
+    """Resolve a Thaliris agent type: plugin roles are `thaliris:<role>`, Controller-registered
+    roles are project agents `thaliris-<name>`. Anything else is a generic agent."""
     if not isinstance(agent_type, str):
         return None
     for role in child_roles():
         if ROLE_REGISTRY[role].binding.subagent_type == agent_type:
             return role
+    for role, registration in _custom.items():
+        if registration.binding.agent_name == agent_type:
+            return role
     return None
+
+
+def render_custom_agent(name: str, record: dict) -> str:
+    """A registered role gets the same child contract as the built-in roles."""
+    registration = custom_registration(name, record)
+    binding = registration.binding
+    lines = ["---", f"name: {binding.agent_name}", f"description: {json.dumps(binding.description)}"]
+    if binding.model:
+        lines.append(f"model: {binding.model}")
+    if record.get("tools"):
+        lines.append(f"tools: {', '.join(record['tools'])}")
+    disallowed = ([] if binding.repo_write_allowed else list(_WRITE_TOOLS)) + ([] if binding.allowed_delegation_targets else ["Agent"])
+    if disallowed:
+        lines.append(f"disallowedTools: {', '.join(disallowed)}")
+    lines += ["---", "", "<!-- Registered by the Thaliris Controller with `register-role`; re-register to change it. -->", "",
+              f"# Thaliris role: {name}", "", record["instructions"].strip(), ""]
+    parts = [_SHARED] + ([_SCANNER] if binding.allowed_delegation_targets else []) + [_NOTIFICATION]
+    return "\n".join(lines) + "\n".join(part.rstrip() + "\n" for part in parts)
 
 
 def repo_write_allowed(role: str) -> bool:
@@ -488,6 +544,7 @@ def render_role_table() -> str:
     rows = ["| Role | `subagent_type` | Default model | Repo writes | May delegate to |", "| --- | --- | --- | --- | --- |"]
     for role in child_roles():
         binding = ROLE_REGISTRY[role].binding
-        rows.append(f"| {ROLE_REGISTRY[role].spec.purpose} | `{binding.subagent_type}` | `{binding.model or 'inherit'}` | "
+        model = "`sonnet` or `opus`, by difficulty" if role == "focused-implementer" else f"`{binding.model or 'inherit'}`"
+        rows.append(f"| {ROLE_REGISTRY[role].spec.purpose} | `{binding.subagent_type}` | {model} | "
                     f"{'yes' if binding.repo_write_allowed else 'no'} | {', '.join(sorted(binding.allowed_delegation_targets)) or '—'} |")
     return "\n".join(rows)

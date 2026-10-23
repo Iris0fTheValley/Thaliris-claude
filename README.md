@@ -75,6 +75,37 @@ Controller 明确处置：已满足 / 未知 / 需修复 / 已不再相关
 
 只有一套共享 Core。Core 不运行模型、不调度 Agent、不认证调用者；原生执行由各 Adapter 负责。
 
+## 角色能力与推荐模型
+
+> **绝对不要用小模型或低能力模型做控制层（Controller）。** 省钱应当来自把窄任务交给更便宜的子角色，而不是降级 Controller。Controller 的失误不会被子代理纠正，只会被放大：实测中，弱 Controller 会跳过受管流程、在隔离拒绝后退回单代理，或在审查反证仍未处置时就判定完成。
+
+Controller 必须同时具备以下能力，每一项都很重要：
+
+| 能力 | Controller 要回答的问题 |
+| --- | --- |
+| Global Coherence 全局一致性 | 做了几十上百步以后，是否还记得为什么要做这件事？ |
+| Strategic Planning 战略统筹 | 能不能从最终目标反推路径、识别依赖、分配资源，而不是只看下一步？ |
+| Retrospective Reasoning 回溯推理 | 能不能从历史决策中定位根本错误，而不是反复修补表象？ |
+| Metacognitive Monitoring 元认知监控 | 能不能发现自己正在跑偏、重复劳动，或者陷入不可能完成的任务？ |
+| Prospective Reasoning 前瞻推理 | 能不能预测当前决定对后续阶段的影响，主动避免未来的结构性问题？ |
+| Adaptive Replanning 动态重规划 | 当原计划失效、条件变化时，能否重新组织全局工作，而不是机械延续旧计划？ |
+
+各角色需要的能力与推荐模型：
+
+| 角色 | 需要的能力 | Claude（Claude Code） |
+| --- | --- | --- |
+| Controller | 上述六项；整合原始目标、验收标准与证据，判定产品验收 | Opus |
+| Investigator | 在选定范围内广泛、准确地收集事实与来源，说明已覆盖与未覆盖范围 | Sonnet |
+| Implementer | 在已确定的方向内实现、验证并修复普通缺陷，直到确定性收敛 | Sonnet |
+| Focused Implementer | 对耦合的不变量持续推理，吸收运行反馈直到语义收敛 | Sonnet 或 Opus，由 Controller 按任务难度选择 |
+| Reviewer | 独立挑战已收敛的候选，跨边界寻找反证，不被作者的框架带偏 | Opus |
+| Reasoning Specialist | 质疑问题框架、因果模型和决策依据 | Opus |
+| Curator | 依据选定材料精确整理长期知识与 INDEX | Sonnet |
+
+推荐值是起点，不是质量保证。角色身份与执行模型相互独立；实际运行的模型以 Host 的观测为准，而不是配置文件。
+
+这些只是推荐。为每个角色选择模型是 Controller 的职责，在用户写入任务的约束之内可以自由选择；Controller 也可以用 `register-role` 注册新的项目角色。用户也可以让 Controller 独自完成全部工作：是否委派、委派多少，由用户决定。
+
 ## 实测观察
 
 **这项基准测什么：** 我们有意挑了一个很难的单轮重构任务：桌面与 WebUI 共享 Live2D 行为，涉及模型选择、语音/动作队列和退出生命周期。比较的不是候选还剩几个 bug，而是原始需求能否持续约束调查、方案收敛、实现和验证，尤其是检查是否覆盖真实消费者路径、反证是否推动方案修正。A/B 是单代理样本，C/D 提供协作执行对照。
@@ -159,12 +190,13 @@ thaliris-core --root . --task-id "$TASK_ID" task-status
 
 Thaliris-claude 是一个 Claude Code 插件，把共享语义接入 Claude Code 原生的子代理、Skill、Hooks 与插件配置。它内置一份按固定提交锁定的 Thaliris Core（只用标准库），由 Core 提供任务记录、证据和 authority API；适配层负责会话与任务关联、原生身份与 handoff 绑定、角色边界守卫和证据重新呈现，不另建 Agent Runtime。
 
-主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理，默认模型如下；显式选择保留，任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
+主线程即 Controller，按 thaliris skill 准入任务、选择角色、写选择性 Handoff 并判定验收。角色是 `thaliris:*` 子代理，Controller 也可以用 `register-role` 注册新的项目角色（`thaliris-<name>`）。默认模型如下，只在 Controller 未指定时使用；显式选择保留，任务的 `claude-model:<alias>` 约束会冻结所有子代理的模型：
 
 | 角色 | 默认模型 |
 | --- | --- |
 | Investigator、Implementer、Curator | sonnet |
-| Reasoning Specialist、Focused Implementer、Reviewer | inherit（与 Controller 相同） |
+| Focused Implementer | sonnet 或 opus，由 Controller 按任务难度选择 |
+| Reasoning Specialist、Reviewer | inherit（与 Controller 相同，应为 Opus） |
 
 Claude 子代理本身就不继承父级对话；Thaliris 角色不能由 fork 或通用代理充当。原生身份只按 Host 的精确记录绑定（Agent 结果的 agentId、Host 写入的子代理元数据），不按“唯一待定预约”猜测，缺失或矛盾时保留 UNKNOWN。子代理停止、Agent completed、Core DONE 与产品验收彼此独立；后台子代理完成时，未处置的证据会在 Controller 下一回合开头重新呈现。Reviewer 只读由工具白名单和 PreToolUse 守卫共同保证。详见[适配层说明](docs/claude-adapter.md)。
 
@@ -177,6 +209,6 @@ claude plugin marketplace add Iris0fTheValley/Thaliris-claude
 claude plugin install thaliris@thaliris
 ~~~
 
-启用时会询问两个选项，之后可用 `/plugin configure thaliris@thaliris` 修改：`default_execution_mode`（delegated、controller-direct 或 single-agent；选 delegated 即对 `thaliris:*` 子代理的常驻请求）和 `auto_approve_runner`（只批准本插件 Runner 的单条直接调用）。首次会话自动寻找并缓存 Python 运行时。全局 Controller 提示由插件的 SessionStart 注入，不改写用户的 CLAUDE.md，卸载插件即移除。项目在第一个受管任务时由 Controller 运行 `bootstrap` 初始化，不执行 `git init`。
+启用时会询问三个选项，之后可用 `/plugin configure thaliris@thaliris` 修改：`default_execution_mode`（delegated、controller-direct 或 single-agent；选 delegated 即对 `thaliris:*` 子代理的常驻请求）、`model_selection`（controller 时由 Controller 为每个角色按需选择模型；role-defaults 时使用各角色默认模型）和 `auto_approve_runner`（只批准本插件 Runner 的单条直接调用）。首次会话自动寻找并缓存 Python 运行时。全局 Controller 提示由插件的 SessionStart 注入，不改写用户的 CLAUDE.md，卸载插件即移除。项目在第一个受管任务时由 Controller 运行 `bootstrap` 初始化，不执行 `git init`。
 
 更新用 `claude plugin update thaliris@thaliris`，在新会话生效；用户选项和 `~/.thaliris` 数据跨版本保留。安装、更新或修改用户级配置属于 Host 维护，需要用户明确授权；磁盘上的文件变化不代表正在运行的会话已经加载。更多约束、真实 Host 探针结果和历史问题对照见[适配层说明](docs/claude-adapter.md)。

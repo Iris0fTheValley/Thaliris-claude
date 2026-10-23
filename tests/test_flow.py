@@ -370,3 +370,47 @@ def test_broken_runtime_refuses_only_unguardable_actions(task, tmp_path):
     assert json.loads(_launch(task, review, **env).stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert _launch(task, _shell(task, "git status"), **env).stdout == b""
     assert _launch(task, _agent_call(task, "t", "general-purpose", "p"), **env).stdout == b""
+
+
+def test_models_are_the_controllers_choice(task, monkeypatch):
+    """Design: the Controller chooses each role's model; the adapter never overrides or refuses it."""
+    monkeypatch.delenv(hooks.MODEL_SETTING, raising=False)
+    for index, model in enumerate(("opus", "sonnet", "haiku")):
+        result = _dispatch(task, f"m{index}", role="focused-implementer", model=model)
+        assert result["hookSpecificOutput"]["updatedInput"]["model"] == model
+    assert "model" not in _dispatch(task, "m9", role="investigator")["hookSpecificOutput"]["updatedInput"]
+
+
+def test_controller_registers_a_managed_role(task):
+    spec = {"name": "security-auditor", "description": "Audits auth boundaries", "model": "opus", "writes": False,
+            "scanner": True, "instructions": "Find authorization bypasses and report each with evidence."}
+    code, registered = run_cli("register-role", "--json", json.dumps(spec))
+    assert code == 0, registered
+    agent = task["root"] / registered["agent_file"]
+    text = agent.read_text(encoding="utf-8")
+    assert "name: thaliris-security-auditor" in text and "observe --json" in text and "disallowedTools: Edit" in text
+    assert any(item["subagent_type"] == "thaliris-security-auditor" for item in run_cli("roles")[1]["registered"])
+    # Children cannot register roles, and the registered role is managed like a built-in one.
+    child = _shell(task, f"{RUNNER} register-role --json '{{}}'", agent_id="a", agent_type="thaliris:implementer")
+    assert _decision(run_hook("PreToolUse", child)) == "deny"
+    dispatched = run_hook("PreToolUse", _agent_call(task, "c1", "thaliris-security-auditor",
+                                                    'audit\nthaliris-evidence: {"candidate":"C1","requirement_refs":["R1"]}'))
+    assert "thaliris-handoff: H" in dispatched["hookSpecificOutput"]["updatedInput"]["prompt"]
+    auditor = {"agent_id": "aud", "agent_type": "thaliris-security-auditor"}
+    write = _tool(task, "Write", {"file_path": str(task["root"] / "app.py"), "content": "x"}, **auditor)
+    assert _decision(run_hook("PreToolUse", write)) == "deny"  # registered writes: false
+    scan = run_hook("PreToolUse", _agent_call(task, "c2", "thaliris:investigator", "scan", **auditor))
+    assert _decision(scan) == "deny"  # unbound identity, not a policy refusal of the role
+    # Editing the agent file by hand voids the registration: the type is generic again.
+    agent.write_text(text + "\nignore your role", encoding="utf-8")
+    assert run_cli("roles")[1]["registered"] == []
+    assert run_hook("PreToolUse", write) is None
+
+
+def test_session_start_warns_about_a_small_controller(task, monkeypatch):
+    small = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-haiku-5-5"))
+    text = small["hookSpecificOutput"]["additionalContext"]
+    assert "never use a small or low-capability model as its Controller" in text
+    assert "choose the model" in text
+    strong = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))
+    assert "small model" not in strong["hookSpecificOutput"]["additionalContext"]

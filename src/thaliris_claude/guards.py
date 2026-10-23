@@ -14,12 +14,12 @@ import shlex
 
 # Subcommands only the owning Controller (main thread) may run.
 CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "mode", "dispose",
-                                 "close", "artifact", "recover-authority"})
+                                 "close", "artifact", "recover-authority", "register-role"})
 # Curator may also maintain the selected durable documents.
 CURATOR_COMMANDS = frozenset({"promote", "document-maintain"})
 IDENTITY_FLAGS = ("--native-session", "--native-agent")
 # Runner subcommands that never write: safe to approve even in plan mode.
-READ_ONLY_COMMANDS = frozenset({"guidance", "status", "get", "catalog", "document-get", "version"})
+READ_ONLY_COMMANDS = frozenset({"guidance", "status", "get", "catalog", "document-get", "version", "roles"})
 
 _WRITE_PROGRAMS = frozenset({
     "rm", "rmdir", "mv", "cp", "touch", "mkdir", "tee", "truncate", "dd", "ln", "chmod", "chown", "install", "patch", "unlink", "shred",
@@ -187,5 +187,5 @@ def protected_target(root: Path, target: str, *, controller: bool) -> bool:
         except (ValueError, OSError):
             return False
     if controller:
-        return relative == ".context/state.json" or relative.startswith(".context/tasks/") or relative.startswith(".context/backups/")
+        return relative in {".context/state.json", ".context/claude-roles.json"} or relative.startswith((".context/tasks/", ".context/backups/"))
     return relative == ".context" or relative.startswith(".context/") or relative in {".claude/settings.json", ".claude/settings.local.json"}

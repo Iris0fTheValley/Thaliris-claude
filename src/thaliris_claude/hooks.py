@@ -155,6 +155,7 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
                 if requested not in (None, alias):
                     raise Refusal(f"The task's frozen execution constraint selects model `{alias}`; per-spawn overrides are refused.")
                 updated["model"] = alias
+            # Otherwise the model is the Controller's choice; the adapter never overrides or refuses it.
             entry = store.reserve(ctx, role=target_role, subagent_type=tool_input["subagent_type"],
                                   tool_use_id=str(payload.get("tool_use_id") or ""), parent=parent, prompt=prompt,
                                   model=updated.get("model"), background=bool(tool_input.get("run_in_background")),
@@ -244,7 +245,7 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
     if store.resolve_session(payload.get("session_id")) is not None:
         if guards.direct_core_call(command) and not any(name in command for name in _READ_ONLY_CORE):
             return _deny("In a managed task, mutate the ledger through the Thaliris runner so authority stays anchored.")
-        ledger = (".context/tasks", ".context/state.json", store.LIFECYCLE_NAME)
+        ledger = (".context/tasks", ".context/state.json", store.LIFECYCLE_NAME, store.ROLES_NAME)
         if guards.obvious_write(command) and any(name in command.replace("\\", "/") for name in ledger):
             return _deny("Hand edits to the task ledger or lifecycle break authority anchoring; use the runner.")
     return None
@@ -446,6 +447,33 @@ subagents own the local working sets you hand them.
   read them explicitly when a managed task needs them."""
 
 MODE_SETTING = "CLAUDE_PLUGIN_OPTION_DEFAULT_EXECUTION_MODE"
+MODEL_SETTING = "CLAUDE_PLUGIN_OPTION_MODEL_SELECTION"
+
+
+def _model_preference() -> str:
+    """The Agent tool says to set `model` only when the user asks; this option is that request.
+
+    Choosing models per role is the Controller's job by design. The adapter
+    never overrides or refuses its choice (only a task's frozen constraint,
+    which the user wrote, does).
+    """
+    if os.environ.get(MODEL_SETTING, "controller") == "role-defaults":
+        return ("\n- Model selection (plugin option `model_selection`): the user prefers each role's default model; "
+                "set `model` only when they ask for one.")
+    return ("\n- Model selection (plugin option `model_selection` = controller): the user asks you to choose the model "
+            "of every Thaliris role per dispatch, so set `model` on Agent calls as the work requires; this is the user "
+            "explicitly asking you to set it. For a Focused Implementer, `opus` suits coupled work that crosses modules or "
+            "contracts, involves concurrency, lifecycle or timing, has an unclear causal model, or follows a failed "
+            "attempt or a decision-basis finding; `sonnet` suits local coupling with a clear causal model.")
+
+
+def _controller_model_warning(model: object) -> str:
+    """The Controller seat needs the six global capabilities; small models do not hold them (H151/H152)."""
+    if isinstance(model, str) and "haiku" in model.casefold():
+        return (f"\n- This session runs on `{model}`, a small model. Thaliris must never use a small or low-capability "
+                "model as its Controller: before admitting any managed task, tell the user and recommend switching the "
+                "main session to Opus.")
+    return ""
 
 
 def _mode_preference() -> str:
@@ -472,7 +500,8 @@ def _mode_preference() -> str:
 
 
 def session_start(payload: dict) -> dict | None:
-    text = GLOBAL_GUIDANCE.format(runner=runner_command()) + _mode_preference()
+    text = (GLOBAL_GUIDANCE.format(runner=runner_command()) + _mode_preference() + _model_preference()
+            + _controller_model_warning(payload.get("model")))
     # Name the code actually loaded: a fixed checkout is not proof of what a Host runs (H096).
     text += f"\n- Loaded adapter: thaliris-claude {__version__} from `{plugin_root().as_posix()}`."
     if payload.get("source") in {"compact", "resume", "clear"}:
@@ -526,6 +555,13 @@ HANDLERS = {
 }
 
 
+def _load_project_roles(payload: dict) -> None:
+    """Make the project's Controller-registered roles resolvable for this event."""
+    association = store.resolve_session(payload.get("session_id"))
+    root = association[0] if association else store.project_root(Path(payload.get("cwd") or "."))
+    roles.load_custom_roles(store.custom_role_records(root) if store.is_managed_project(root) else {})
+
+
 def _fail_closed(event: str, payload: dict) -> bool:
     """A crashed hook must not silently admit a managed Thaliris dispatch."""
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
@@ -543,6 +579,7 @@ def main(event: str) -> int:
         return 0
     started, error = time.perf_counter(), None
     try:
+        _load_project_roles(payload)
         result = HANDLERS[event](payload)
     except Exception as exc:  # Hooks degrade to transparent, except managed dispatch.
         error = f"{type(exc).__name__}: {exc}"
