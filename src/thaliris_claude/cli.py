@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sys
 
-from thaliris import authority as core_authority, core, identity
+from thaliris import authority as core_authority, core, identity, identity_basis
 
 from . import __version__, hooks, inputs, roles, store
 
@@ -80,6 +80,21 @@ def _parser() -> argparse.ArgumentParser:
         command = add(name, help_text)
         command.add_argument("--base-revision", type=int, required=True)
         _payload_args(command)
+    command = add("identity-note", "record, retract or list verbatim user statements about the project's long-term direction (Controller; no task needed)")
+    command.add_argument("--quote", help="the user's verbatim words")
+    command.add_argument("--kind", choices=("purpose", "direction", "constraint", "non-goal", "decision", "rejection", "material", "other"))
+    command.add_argument("--context", help="one-line Controller framing (stored as Controller-authored)")
+    command.add_argument("--ref", action="append", help="repeatable reference, e.g. path:docs/vision.md")
+    command.add_argument("--retract", metavar="N-0001", help="retract a wrongly recorded note (needs --reason)")
+    command.add_argument("--reason")
+    command.add_argument("--list", dest="list_notes", action="store_true", help="list notes (pending flagged)")
+    command.add_argument("--include-retracted", action="store_true")
+    command = add("identity-suggest", "turn the close-time identity offer on, off or back to default at a scope, on the user's words (Controller)")
+    group = command.add_mutually_exclusive_group(required=True)
+    group.add_argument("--on", dest="setting", action="store_const", const="on")
+    group.add_argument("--off", dest="setting", action="store_const", const="off")
+    group.add_argument("--clear", dest="setting", action="store_const", const="clear")
+    command.add_argument("--scope", required=True, choices=("session", "workspace", "project", "global"))
     command = add("task-update", "update the dynamic task context: records (facts, decisions, progress, open items), "
                                  "Active Work, Pending Results, milestone")
     command.add_argument("--base-revision", type=int, required=True)
@@ -433,12 +448,37 @@ def run(args) -> dict:
         association = store.resolve_session(args.native_session)
         root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())
         if name == "identity-status":
-            return identity.identity_status(root)
+            return identity.identity_status(root, session_key=store.native_id(args.native_session))
         if name == "identity-get":
             return identity.identity_get(root, version=args.version, items=args.item, amendment=args.amendment, challenge=args.challenge)
         if name == "identity-trace":
             return identity.identity_trace(root, args.ref, args.direction, args.depth)
         return core.catalog(root, args.path) if name == "catalog" else core.document_get(root, args.paths)
+    if name in {"identity-note", "identity-suggest"}:
+        # Controller-only, but no ACTIVE task: a user's explicit words are recorded whenever they are said.
+        session = _controller(args)
+        association = store.resolve_session(session)
+        root = association[0] if association and args.root is None else store.project_root(args.root or Path.cwd())
+        if name == "identity-suggest":
+            return identity_basis.identity_suggest(root, "claude:controller", args.scope, args.setting, session_key=session)
+        if args.list_notes:
+            if args.quote is not None or args.retract is not None:
+                raise ValueError("FLAG_FORM_CONFLICT: --list cannot be combined with --quote or --retract")
+            return identity_basis.identity_note_list(root, include_retracted=args.include_retracted)
+        if args.retract is not None:
+            if args.quote is not None or not args.reason:
+                raise ValueError("FLAG_FORM_INCOMPLETE: `identity-note --retract N-0001` needs --reason and no --quote")
+            return identity_basis.identity_note(root, "claude:controller", {"retract": args.retract, "reason": args.reason})
+        if not args.quote:
+            raise ValueError("FLAG_FORM_INCOMPLETE: `identity-note` needs --quote (or --retract/--list)")
+        payload = {"quote": args.quote}
+        if args.kind:
+            payload["kind"] = args.kind
+        if args.context is not None:
+            payload["context"] = args.context
+        if args.ref:
+            payload["refs"] = list(args.ref)
+        return identity_basis.identity_note(root, "claude:controller", payload)
     root, task_id = _task(args)
     if name == "observe":
         with store.transaction(root, task_id) as ctx:
@@ -537,8 +577,15 @@ def run(args) -> dict:
             ctx["state"]["status"] = "DONE"
             ctx["state"]["revision"] += 1
             ctx["state_changed"] = True
-            return {**_write_response(ctx["state"], ["status"]),
-                    "note": "DONE records mechanical closure; it is not product acceptance."}
+            result = {**_write_response(ctx["state"], ["status"]),
+                      "note": "DONE records mechanical closure; it is not product acceptance."}
+        try:  # after the close committed; any failure just leaves the field out
+            offer = identity_basis.identity_offer(root, store.native_id(args.native_session))
+        except Exception:
+            offer = None
+        if offer:
+            result["identity_offer"] = offer
+        return result
     if name == "detach":
         store.clear_session(args.native_session)
         return {"ok": True, "task_id": task_id, "status": "ACTIVE", "note": "Session association removed; authority and ledger are unchanged."}

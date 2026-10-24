@@ -239,6 +239,13 @@ Core 0.5.0 的 Project Identity 平面（`src/thaliris/identity.py`，存于仓�
 - **投递**：SessionStart 对所有来源（startup/resume/compact/clear），无论是否关联任务，仅在身份存在时追加 Core `identity_summary` 的一行
   （不存在则什么都不加）；`attach` 在存在时于 `Project Identity` 键下返回同一行。`GLOBAL_GUIDANCE` 的导航项提示按需用 `identity-status` /
   `identity-get` 读取。身份文本从不注入子代理（SubagentStart 不变）；Controller 只在 handoff 中摘录真正约束该子代理工作的条目。
+- **自然形成（0.4.2，Core 0.5.2 `identity_basis`）**：`identity-note`（`--quote ... [--kind purpose|direction|constraint|non-goal|decision|rejection|material|other]
+  [--context ...] [--ref ...]`；`--retract N-0001 --reason ...`；`--list [--include-retracted]`）记录用户明确陈述的原话（存于 `THALIRIS_HOME`
+  或 `~/.thaliris`，仓库外，不新增被跟踪文件）；`identity-suggest --on|--off|--clear --scope session|workspace|project|global` 设置收尾提议偏好。
+  二者归入 `CONTROLLER_COMMANDS`（子代理被 PreToolUse 与 Runner 拒绝），**不需要** ACTIVE 任务（只需 Controller 身份）。会话键即 Hook 追加的
+  `--native-session`，传给 Core 作 `session_key`（session 范围偏好与 `identity-status` 的 `suggestions`）。`identity-status` 另含 `basis` 与
+  `suggestions`。`close` 成功提交后调用 `identity_offer`，有则在结果中加 `identity_offer` 字段（同一批笔记只出现一次；偏好关闭、身份 INVALID/
+  UNRECORDED_CHANGE 或失败时字段缺省）。SessionStart/bootstrap 不输出任何提议。
 - **指导**：`SKILL.md` 第 10 节“Project identity”（准入第 2 步一句话指向它）。
 
 ### 输出编码（Windows）

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "thaliris-claude"
-version = "0.4.1"
+version = "0.4.2"
 description = "Claude Code Host adapter for the shared Thaliris Core"
 dependencies = ["thaliris>=0.5.0,<0.6"]
 requires-python = ">=3.11"

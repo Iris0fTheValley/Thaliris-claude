@@ -16,7 +16,9 @@ import shlex
 CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "mode", "dispose",
                                  "close", "artifact", "recover-authority", "register-role", "unregister-role", "task-update",
                                  # Project identity mutations: the Controller's act on the human owner's decision.
-                                 "identity-amend", "identity-challenge", "identity-relate"})
+                                 "identity-amend", "identity-challenge", "identity-relate",
+                                 # Natural formation: verbatim basis notes and the offer preference.
+                                 "identity-note", "identity-suggest"})
 # Curator may also maintain the selected durable documents.
 CURATOR_COMMANDS = frozenset({"promote", "document-maintain"})
 IDENTITY_FLAGS = ("--native-session", "--native-agent")
