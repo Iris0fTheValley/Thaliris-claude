@@ -109,7 +109,7 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
   内置 Core 与锁一致、首次 Hook 自动发现系统 Python 3.11），进行中的会话仍用旧版本文件。Windows 上若把
   `CLAUDE_CONFIG_DIR` 放在很深的目录，Git 克隆 marketplace 可能超出 260 字符路径上限；默认的 `~/.claude` 不受影响。
   用户选项与 `~/.thaliris` 数据跨版本保留；
-  lifecycle 文件带版本号，读到不认识的版本时报错而不是误读。内置 Core 随插件版本一起更新，
+  lifecycle 文件带版本号，读到不认识的版本时报错而不是误读（此时 child 写与消息 fail closed，见“升级与会话连续性”）。内置 Core 随插件版本一起更新，
   `scripts/vendor_core.py --check --source <Core 仓库>` 校验内置字节与固定提交一致。
 
 开发时临时加载（不改用户配置）：
@@ -262,6 +262,27 @@ Core 0.5.0 的 Project Identity 平面（`src/thaliris/identity.py`，存于仓�
 Host 的有效 effort（环境变量 `CLAUDE_CODE_EFFORT_LEVEL` 优先于两者）不在 Host 记录中，保持 UNKNOWN。内置角色不设默认
 effort。effort 不改变职责或权限。
 
+### 升级与会话连续性（0.4.3）
+
+目标：合法的升级、Host 维护、会话恢复和执行中的合法操作，不使既有会话、原 Controller 或原 Task 失效；局部故障不扩大成全局停摆；
+原有拒绝（身份、turn、授权、终态）不放宽，UNKNOWN 不当作完成或安全。
+
+| 情形 | 行为 | 测试 |
+| --- | --- | --- |
+| 会话关联的任务状态不可读（schema 版本不兼容、JSON 损坏等；状态文件缺失或任务已 DONE 仍是“无任务”） | `store.inspect_session` 区分“无任务”与“任务存在但不可读”：SessionStart 报告任务 ID、code 与 recovery；`status` 等 Runner 命令给出真实诊断（`STATE_SCHEMA_INCOMPATIBLE` 带 Core 的 `from_version`/`to_version`/`recovery_action`），不再是 `NO_ACTIVE_TASK_FOR_SESSION`；受管 `thaliris:*` 派发 fail closed（拒绝、不预约、不静默非受管）；通用代理与 Controller 自己的读写不受影响。不可读期间 child 的 SubagentStart/Stop 不记录（状态 UNKNOWN） | `test_incompatible_state_schema_is_reported_and_dispatch_fails_closed`、`test_damaged_state_json_is_unreadable_not_absent`、`test_missing_or_closed_state_is_still_no_task` |
+| 无任务的普通路径 | 只读会话关联文件即决定；不读状态、lifecycle，不起子进程；读文件与子进程次数与 0.4.2 逐项相同（对 0.4.2 做了计数对照） | `test_no_task_path_reads_no_task_state_and_starts_no_process` |
+| 已结束（`completed`/`stopped`）或已处置的 child 再次 SubagentStart（如 `SendMessage` 恢复） | 状态不复位为 `running`，只记事件 `resumed-after-terminal` / `started-after-dispose`（连续重复不重复记录）；仍无 `observe`；给该 child 的 SubagentStart 上下文说明不再有授权。新工作给新 child | `test_second_start_does_not_reactivate_a_finished_child`、`test_completed_tool_result_is_terminal_too`、`test_start_after_dispose_keeps_the_fence` |
+| 写权限与终态一致 | 终态 child 的 Write/Edit 与明显写入的 Shell 命令像已处置一样被围栏（“已交付最终报告；新工作需新派发”）；运行中（含 `launched` 的后台 child）不受影响，Controller 主线程不受 child 状态影响 | `test_running_child_writes_until_it_finishes_then_is_fenced`、`test_background_launch_acknowledgement_does_not_fence_a_running_child` |
+| lifecycle 不可读（`CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED`、`CLAUDE_LIFECYCLE_INVALID`） | Thaliris 类型 child 的写与所有 `SendMessage` fail closed，拒绝文案带 code 与 recovery；受管派发照旧拒绝；Controller 主线程、通用子代理、只读角色不受影响；child 的 Runner 调用仍带身份到达 Runner，Runner 报告真实 code，而不是 `NATIVE_IDENTITY_UNKNOWN` | `test_unreadable_lifecycle_keeps_a_disposed_child_fenced`、`test_unreadable_lifecycle_does_not_stop_readonly_roles_or_the_controller` |
+| lifecycle 条目缺必填键或字段不可读 | 读取时即报带 code 的 `CLAUDE_LIFECYCLE_INVALID`（含 recovery），不再是裸 `KeyError`；SessionStart 报告而不崩溃。必填键是 0.1 起就有的八个键，`role_binding`/`requested_effort` 等后加字段仍是可选 | `test_damaged_lifecycle_entry_is_coded_and_session_start_survives`、`test_version_01_lifecycle_entries_read_and_dispatch` |
+| 局部 child 冲突 | 已处置、已结束、身份冲突的 child 不阻塞 Controller 的下一次派发，也不使整任务拒绝 | `test_local_child_conflicts_do_not_widen_into_a_task_wide_refusal` |
+
+旧会话继续使用其已加载的版本：Hook 由 `hooks.json` 经 `${CLAUDE_PLUGIN_ROOT}` 指向该版本目录，Runner 路径与提示词中给模型的路径同属一版；
+`guards.runner_misses` 对“另一已安装版本的 Runner 路径”给出准确拒绝与应使用的命令。`/reload-plugins` 或新会话后使用新路径。
+Host 限制：若 Host 清理了旧版本缓存目录，仍加载它的会话里 `sh` 找不到 Hook 脚本（通常退出码 127，Host 视为非阻塞错误），
+插件无法自行处理，此时守卫不在运行，managed 保证为 UNKNOWN；这不是任务损坏，重载插件或新开会话后用 `attach --task-id` 接回原 Task
+（Task 与 Authority 保留）。处置步骤见 `skills/thaliris/recovery.md`。
+
 ### 已派发角色的身份连续性
 
 PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、`subagent_type`、来源（builtin/registered）、
@@ -300,7 +321,8 @@ PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、
   SubagentStop → 主线程新回合 UserPromptSubmit（`<task-notification>`）。
 - 前台嵌套 Scanner：PreToolUse → SubagentStart → SubagentStop → PostToolUse `completed`。
 - `SendMessage` 恢复：同一 `agent_id` 再次 SubagentStart → SubagentStop；lifecycle 记为
-  `launched → running → stopped → running → stopped`。
+  `launched → running → stopped → running → stopped`（0.4.3 起，已结束的 child 再次 SubagentStart 不再复位为 `running`，
+  只记 `resumed-after-terminal` 事件）。
 
 探针带来的修正：
 

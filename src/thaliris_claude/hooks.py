@@ -169,8 +169,12 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
                      "Return the uncovered need to your parent in your final report.")
     if tool_input.get("isolation") == "remote":
         return _deny("Thaliris roles run locally so their identity can be observed; omit `isolation: remote`.")
-    association = store.resolve_session(payload.get("session_id"))
+    association, problem = store.inspect_session(payload.get("session_id"))
     if association is None:
+        if problem is not None:
+            # The task exists but cannot be read: that is not "no task". Never fall through to ordinary routing.
+            return _deny(f"Thaliris managed dispatch refused: {store.problem_text(problem)} No reservation was made, and the "
+                         "dispatch was not treated as unmanaged.")
         return None  # No managed task: ordinary native routing, no reservation.
     effort = tool_input.get("effort")
     if effort is not None and effort not in roles.EFFORT_LEVELS:
@@ -243,16 +247,48 @@ def _approve_runner(payload: dict, subcommand: str | None) -> bool:
     return True
 
 
-def _child_fenced(payload: dict) -> bool:
-    association = store.resolve_session(payload.get("session_id"))
+def _thaliris_typed(agent_type: object) -> bool:
+    """A Thaliris agent type, even when its registration can no longer be verified."""
+    return isinstance(agent_type, str) and (roles.role_for_agent_type(agent_type) is not None
+                                            or agent_type.startswith((f"{roles.PLUGIN_NAMESPACE}:", roles.CUSTOM_PREFIX)))
+
+
+def _error_code(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) else type(exc).__name__
+
+
+def _lifecycle_unreadable(exc: BaseException) -> str:
+    return (f"This session's task lifecycle cannot be read ({_error_code(exc)}), so the child's handoff status is UNKNOWN. "
+            "Recovery: the Controller runs `status` for the diagnosis; the user decides whether to run the adapter version that "
+            "wrote it or start an independent new task (`guidance --section recovery`).")
+
+
+def _child_fence(payload: dict) -> str | None:
+    """Why a child's write is refused because its handoff no longer grants one, or None when it is not fenced.
+
+    A disposed handoff and a finished one (the child returned its final report) grant no writes: new work needs a fresh
+    dispatch, and a child resumed after its final report is not that. When the lifecycle cannot be read, a Thaliris child's
+    handoff status is UNKNOWN, so its write fails closed; a generic subagent has no handoff to consult.
+    """
+    target = store.child_task(payload.get("session_id"))
     agent_id = store.native_id(payload.get("agent_id"))
-    if association is None or agent_id is None:
-        return False
+    if target is None or agent_id is None:
+        return None
     try:
-        entry = store.dispatch_for_agent(store.read_lifecycle(*association), agent_id)
-    except (ValueError, OSError):
-        return False
-    return bool(entry and entry["disposed"])
+        entry = store.dispatch_for_agent(store.read_lifecycle(*target), agent_id)
+    except (ValueError, OSError) as exc:
+        if _thaliris_typed(payload.get("agent_type")):
+            return _lifecycle_unreadable(exc) + " Writes are refused until it is readable."
+        return None
+    if entry is None:
+        return None
+    if entry["disposed"]:
+        return "Your handoff was disposed by the Controller; further writes are fenced."
+    if entry["native_status"] in store.TERMINAL_STATUSES:
+        return ("This Thaliris child already returned its final report; its handoff grants no further writes. New work needs a "
+                "fresh dispatch from the Controller (the earlier result can be selected evidence).")
+    return None
 
 
 _INDIRECT_CAUSES = {
@@ -323,10 +359,13 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         association = store.resolve_session(session) if is_child else None
         if association is not None:
             # By a child's first runner call the Host has written its exact record.
-            with store.transaction(*association, observe_only=True) as ctx:
-                entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
-                if entry is not None and entry["native_status"] == "reserved":
-                    store.set_status(ctx, entry, "running")  # the Host record is written after SubagentStart
+            try:
+                with store.transaction(*association, observe_only=True) as ctx:
+                    entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
+                    if entry is not None and entry["native_status"] == "reserved":
+                        store.set_status(ctx, entry, "running")  # the Host record is written after SubagentStart
+            except (ValueError, OSError):
+                pass  # an unreadable lifecycle: the runner reports its real diagnosis (with a code) instead of NATIVE_IDENTITY_UNKNOWN
         suffix = f" --native-session {session}" + (f" --native-agent {agent_id}" if is_child else "")
         output = {"hookEventName": "PreToolUse", "updatedInput": {**tool_input, "command": command.rstrip() + suffix}}
         if _approve_runner(payload, subcommand):
@@ -341,8 +380,9 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
             return _deny(f"The {caller_role} role is non-writing; this command looks like a write. Report what should change instead.")
         if writes and guards.mentions_protected(command):
             return _deny("Children cannot change Controller or security state (.context/, .project-identity/, Thaliris authority, Claude settings).")
-        if writes and _child_fenced(payload):
-            return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
+        fence = _child_fence(payload) if writes else None
+        if fence:
+            return _deny(fence)
         return None
     if store.resolve_session(payload.get("session_id")) is not None:
         if guards.direct_core_call(command, powershell) and not any(name in command for name in _READ_ONLY_CORE):
@@ -358,13 +398,14 @@ def _file(payload: dict, tool_input: dict) -> dict | None:
     if not isinstance(target, str):
         return None
     caller = _caller(payload)
-    association = store.resolve_session(payload.get("session_id"))
+    association = store.child_task(payload.get("session_id"))
     root = association[0] if association else store.project_root(Path(payload.get("cwd") or "."))
     if caller["child"]:
         if caller["writes"] is False:
             return _deny(f"The {caller['role']} role is non-writing. Report the change you would make instead.")
-        if _child_fenced(payload):
-            return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
+        fence = _child_fence(payload)
+        if fence:
+            return _deny(fence)
         if store.is_managed_project(root) and guards.protected_target(root, target, controller=False):
             return _deny("Children cannot change Controller or security state (.context/, .project-identity/, Claude settings).")
         return None
@@ -379,11 +420,15 @@ def _message(payload: dict, tool_input: dict) -> dict | None:
     An active child may receive supplemental evidence; a child that returned its
     final report, or was disposed, is not reused for new work (H092/H145).
     """
-    association = store.resolve_session(payload.get("session_id"))
+    association = store.child_task(payload.get("session_id"))
     target = store.native_id(tool_input.get("to"))
     if association is None or target is None:
         return None
-    entry = store.dispatch_for_agent(store.read_lifecycle(*association), target)
+    try:
+        entry = store.dispatch_for_agent(store.read_lifecycle(*association), target)
+    except (ValueError, OSError) as exc:
+        # The addressee may be a finished or disposed Thaliris child; without the lifecycle that is UNKNOWN, so fail closed.
+        return _deny(_lifecycle_unreadable(exc) + " Messages are refused until it is readable.")
     if entry is not None and entry["disposed"]:
         return _deny("That Thaliris handoff was disposed; a late message cannot reactivate it. Start a fresh child for new work.")
     if entry is not None and entry["native_status"] in store.TERMINAL_STATUSES:
@@ -515,16 +560,22 @@ def subagent_start(payload: dict) -> dict | None:
     if agent_id is None or not _managed_child_type(payload, association):
         return None
     lines = [f"Thaliris runner for this session: `{runner_command()}` (run it as one direct command)."]
-    entry = None
+    entry, closed = None, None
     if association is not None:
         with store.transaction(*association, observe_only=True) as ctx:
             # Exact Host record only. "The only pending reservation of this role" is a
             # guess and once misattributed evidence to the wrong handoff (H144).
             entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
             if entry is not None:
-                store.set_status(ctx, entry, "running")
+                closed = ("was disposed by the Controller" if entry["disposed"]
+                          else "already returned its final report" if entry["native_status"] in store.TERMINAL_STATUSES else None)
+                store.set_status(ctx, entry, "running")  # a finished or disposed handoff keeps its status (event only)
                 record = store.handoff(ctx["state"], entry["handoff_id"])
-                if record is not None:
+                if closed:
+                    lines.append(f"Your Thaliris handoff {entry['handoff_id'] or '(no evidence association)'} {closed}. It grants "
+                                 "no `observe` and no writes to a resumed or restarted agent; new work needs a fresh dispatch "
+                                 "from the Controller. Answer your parent in text only.")
+                elif record is not None:
                     lines.append(f"Your Thaliris handoff is {record['id']} (candidate {record['candidate']}, "
                                  f"requirement refs {record['requirement_refs'] or 'none — unassigned Scanner evidence'}). "
                                  f"Record decision-changing local facts with `{runner_command()} observe --text \"<what you found>\" "
@@ -532,7 +583,7 @@ def subagent_start(payload: dict) -> dict | None:
     if entry is None:
         lines.append("Your evidence association is confirmed from the Host's own record when you first run the runner. "
                      "If `observe` refuses, keep decision-changing observations, with their sources, in your final report.")
-    elif entry.get("handoff_id") is None:
+    elif entry.get("handoff_id") is None and not closed:
         lines.append("This dispatch carries no evidence association. Keep decision-changing observations, with their sources, in your final report.")
     return _context("SubagentStart", "\n".join(lines))
 
@@ -657,15 +708,19 @@ def session_start(payload: dict) -> dict | None:
     text += f"\n- Loaded adapter: thaliris-claude {__version__} from `{plugin_root().as_posix()}`."
     if payload.get("source") in {"compact", "resume", "clear"}:
         store.forget_packet(payload.get("session_id"))  # context was lost; show pending evidence again
-    association = store.resolve_session(payload.get("session_id"))
-    summary = store.identity_summary(association[0] if association
-                                     else store.project_root(Path(payload.get("cwd") or ".")))
+    association, problem = store.inspect_session(payload.get("session_id"))
+    anchor = association or ((problem["root"], problem["task_id"]) if problem else None)
+    summary = store.identity_summary(anchor[0] if anchor else store.project_root(Path(payload.get("cwd") or ".")))
     if summary:  # navigation only; nothing at all when the project has no identity
         text += f"\n- {summary}"
     if payload.get("source") in {"startup", "resume"}:
         # A process start fixes which agent directories the Host watches (see `register-role`).
-        store.note_session_agents_dir(payload.get("session_id"), association[0] if association
+        store.note_session_agents_dir(payload.get("session_id"), anchor[0] if anchor
                                       else store.project_root(Path(payload.get("cwd") or ".")))
+    if problem is not None:
+        # The session's task exists but cannot be read: say so instead of presenting a session with no task.
+        text += (f"\n\nThis session is associated with a Thaliris {store.problem_text(problem)} Managed Thaliris dispatches are "
+                 "refused for this session until it is readable; your own reads and writes are unaffected.")
     if association is not None:
         root, task_id = association
         try:
@@ -675,8 +730,11 @@ def session_start(payload: dict) -> dict | None:
                 pending = len(store.unresolved(ctx["lifecycle"]))
                 revision = ctx["state"]["revision"]
                 context = store.task_context_text(ctx["state"])
-        except (ValueError, OSError) as exc:
-            text += f"\n\nThis session's associated task {task_id} could not be read ({exc}); managed assurance is UNKNOWN."
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            text += (f"\n\nThis session's associated task {task_id} could not be read ({_error_code(exc)}: {str(exc)[:200]}); "
+                     "managed assurance is UNKNOWN, not safe. Child writes and messages are refused while the lifecycle is "
+                     "unreadable; your own work is unaffected. Read `status` for the diagnosis and `guidance --section recovery`; "
+                     "the user decides whether to repair it or start an independent new task.")
         else:
             text += (f"\n\nThis session is associated with ACTIVE Thaliris task `{task_id}` in `{root}` "
                      f"(mode {mode}, revision {revision}, {pending} unresolved child dispatch(es)). Continue it or abandon it "
