@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import io
 import json
 from pathlib import Path
@@ -73,6 +74,32 @@ def run_hook(event: str, payload: dict) -> dict | None:
 def task(home, repo, tmp_path, monkeypatch):
     """An ACTIVE delegated task associated with SESSION, plus requirement R1."""
     monkeypatch.chdir(repo)
+    with _memoized_git_root():
+        return _start_task(repo, tmp_path)
+
+
+@contextmanager
+def _memoized_git_root():
+    """Only while the fixture builds the task: the repository layout cannot change meanwhile, and Core asks
+    ``git rev-parse`` for the same directory about eight times (each a process spawn). Tests themselves run unpatched."""
+    from thaliris import core
+
+    original, seen = core._git_root, {}
+
+    def cached(root):
+        key = Path(root)
+        if key not in seen:
+            seen[key] = original(root)
+        return seen[key]
+
+    core._git_root = cached
+    try:
+        yield
+    finally:
+        core._git_root = original
+
+
+def _start_task(repo, tmp_path):
     contract = tmp_path / "contract.json"
     contract.write_text(json.dumps({"human_instruction": "Fix the greeting", "boundary": "app.py only",
                                     "invariants": "keep output ASCII", "acceptance": "prints hello"}), encoding="utf-8")

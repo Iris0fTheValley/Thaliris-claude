@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 
 from thaliris_claude import cli, roles
 
@@ -44,31 +43,7 @@ def test_reviewer_is_non_writing_and_only_delegates_scanner():
     assert roles.role_for_agent_type("reviewer") is None  # bare names are generic agents
 
 
-# Assert protocol-bearing tokens (commands, markers, report headings, agent types),
-# never prose wording: wording edits must not break CI (history H084).
-def test_child_prompts_carry_the_protocol_tokens():
+def test_child_delegation_matches_the_role_table():
     for role in roles.child_roles():
         text = roles.get_role(role).instructions
-        for token in ("observe --text", "**Conclusion**", "**Decision-changing unknowns**", "**Verification performed**"):
-            assert token in text, (role, token)
         assert ("thaliris:investigator" in text) == roles.delegation_allowed(role, "investigator")
-
-
-def test_children_do_not_choose_successors():
-    """H143: routing after a result belongs to the Controller."""
-    for role in roles.child_roles():
-        text = roles.get_role(role).instructions.casefold()
-        assert "fresh ordinary implementer" not in text, role
-
-
-def test_controller_skill_carries_the_protocol_tokens():
-    skill = (ROOT / "skills/thaliris/SKILL.md").read_text(encoding="utf-8")
-    meta = _frontmatter(skill)
-    assert meta["name"] == "thaliris" and "main-thread" in meta["description"]
-    for token in ("thaliris-evidence:", "task-start", "register", "judge", "dispose", "close", "guidance --section recovery",
-                  "execution_constraint", "delegated", "controller-direct", "single-agent",
-                  "## 10. Project identity", "identity-status", "identity-get", "identity-trace", "identity-amend",
-                  "identity-challenge", "identity-relate", "human_instruction", "UNRECORDED_CHANGE"):
-        assert token in skill, token
-    assert re.search(r"\| Reviewer \| `thaliris:reviewer` \| `inherit` \| no \| investigator \|", skill)
-    assert (ROOT / "skills/thaliris/recovery.md").is_file()

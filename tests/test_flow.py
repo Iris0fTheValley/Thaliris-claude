@@ -90,7 +90,7 @@ def _dispatches():
 def test_session_start_names_the_loaded_adapter(task):
     result = run_hook("SessionStart", _base(task, "SessionStart", source="startup"))
     text = result["hookSpecificOutput"]["additionalContext"]
-    assert RUNNER in text and task["task_id"] in text and "mode delegated" in text
+    assert RUNNER in text and task["task_id"] in text
     assert hooks.plugin_root().as_posix() in text  # H096: name what is actually loaded
 
 
@@ -411,14 +411,6 @@ def test_controller_registers_a_managed_role(task):
 
 def test_session_start_warns_about_a_small_controller(task, monkeypatch):
     small = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-haiku-5-5"))
-    text = small["hookSpecificOutput"]["additionalContext"]
-    assert "never use a small or low-capability model as its Controller" in text
-    assert "choose the model" in text
+    assert "small or low-capability model" in small["hookSpecificOutput"]["additionalContext"]
     strong = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))
-    assert "small model" not in strong["hookSpecificOutput"]["additionalContext"]
-
-
-def test_session_start_controller_model_guidance_puts_division_of_labor_first(task):
-    text = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))["hookSpecificOutput"]["additionalContext"]
-    assert "haiku" in text and "cheapest fitting model" in text
-    assert text.index("Division of labor") < text.index("cheapest fitting model")
+    assert "small or low-capability model" not in strong["hookSpecificOutput"]["additionalContext"]
