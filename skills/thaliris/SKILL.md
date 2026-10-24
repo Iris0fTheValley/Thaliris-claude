@@ -432,9 +432,27 @@ directions, non-goals; the project chooses the structure). It sits above the res
 Task Authority freezes one task's intent, task memory and milestones keep what was
 learned, evidence says what was observed. Only an explicit, recorded amendment on
 the human owner's decision changes an identity; evidence can only challenge it. Most
-projects have none, and that is normal: nothing is blocked or nagged. Suggest
-establishing one only when the user's direction makes it useful, and only on their
-decision (an existing constitution or vision document can be the v1 text).
+projects have none, and that is normal: nothing is blocked or nagged. The current
+task always comes first.
+
+**Natural formation.** *Note, don't interrupt:* when the user explicitly states the
+project's long-term purpose, direction, constraint or non-goal, or explicitly decides
+or rejects one, record their verbatim words in one call, no task needed:
+`<runner> identity-note --quote '<their words>' --kind purpose|direction|constraint|non-goal|decision|rejection|material
+[--context '<your one-line framing>'] [--ref path:docs/vision.md]` (`--list
+[--include-retracted]`; `--retract N-0001 --reason '...'` for a mistaken or withdrawn
+note). Not: your inferences, tentative "maybe", temporary technical choices,
+summaries, or a child's report of what the user said. Material the user hands over (a
+few sentences, a goal, a document via `--ref`) is noted the same way; if they ask to
+record it as the project identity, that request is the decision for v1. *Offer only*
+when a `close` result carries `identity_offer` (or the user is plainly describing
+what a new project is for): once, briefly, after the work; no answer means no; never
+block. To compose, show the user's quotes and your own organization apart; on their
+yes, record v1 or the amendment with `identity-amend`, quoting their confirmation and
+the cited notes (date, N id) verbatim in `decision.human_instruction`. Never write a
+draft `IDENTITY.md` yourself. *Stop suggesting:* `identity-suggest --off --scope
+session|workspace|project|global` at the scope they named; unstated means session,
+and mention the other scopes in one short line.
 
 Read it on demand, not by default: for directional or architectural work,
 replanning, conflicts across layers, and before turning an implementation limit

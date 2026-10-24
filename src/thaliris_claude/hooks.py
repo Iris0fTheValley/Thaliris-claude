@@ -583,7 +583,8 @@ subagents own the local working sets you hand them.
   for anything the hint does not cover. `status --view full` shows everything.
 - Durable navigation lives in `.agent-memory/INDEX.md` and `.milestones/INDEX.md`;
   read them explicitly when a managed task needs them. A project identity, when one
-  exists, is read on demand with the runner's `identity-status` / `identity-get`."""
+  exists, is read on demand with the runner's `identity-status` / `identity-get`;
+  the user's explicit long-term statements about the project go to `identity-note`."""
 
 MODE_SETTING = "CLAUDE_PLUGIN_OPTION_DEFAULT_EXECUTION_MODE"
 MODEL_SETTING = "CLAUDE_PLUGIN_OPTION_MODEL_SELECTION"
