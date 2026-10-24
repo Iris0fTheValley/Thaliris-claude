@@ -17,6 +17,14 @@ from thaliris_claude import cli, hooks  # noqa: E402
 SESSION = "11111111-2222-3333-4444-555555555555"
 
 
+@pytest.fixture(autouse=True)
+def thaliris_home(tmp_path, monkeypatch):
+    """Keep every test off the real ~/.thaliris Core home."""
+    location = tmp_path / "thaliris-home"
+    monkeypatch.setenv("THALIRIS_HOME", str(location))
+    return location
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     location = tmp_path / "home"
