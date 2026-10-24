@@ -31,8 +31,8 @@ def _hooked(task, command, **who):
 
 @pytest.fixture
 def cache_root(tmp_path, monkeypatch):
-    """The hook runs from an installed plugin cache directory (version 0.4.0)."""
-    root = tmp_path / "plugins" / "cache" / "thaliris" / "thaliris" / "0.4.0"
+    """The hook runs from an installed plugin cache directory (version 0.4.1)."""
+    root = tmp_path / "plugins" / "cache" / "thaliris" / "thaliris" / "0.4.1"
     monkeypatch.setenv("THALIRIS_CLAUDE_PLUGIN_ROOT", str(root))
     return root
 
@@ -87,9 +87,9 @@ def test_dev_checkout_runner_stays_transparent(task, cache_root, tmp_path):
 
 
 def test_runner_misses_classification(tmp_path):
-    root = (tmp_path / "plugins" / "cache" / "thaliris" / "thaliris" / "0.4.0").as_posix()
+    root = (tmp_path / "plugins" / "cache" / "thaliris" / "thaliris" / "0.4.1").as_posix()
     runner = f"{root}/bin/thaliris.py"
-    sibling = root.replace("0.4.0", "0.4.1") + "/bin/thaliris.py"
+    sibling = root.replace("0.4.1", "0.4.0") + "/bin/thaliris.py"
     assert guards.runner_misses(f'python "{sibling}" x', runner) == [{"path": sibling, "kind": "version"}]
     assert guards.runner_misses(f'python "{runner}" x', runner) == []
     assert guards.runner_misses(f"python {runner.replace('/', chr(92))} x", runner)[0]["kind"] == "backslash"
@@ -193,14 +193,19 @@ def test_controller_observe_import_flag_form(task):
     assert code == 0 and next_one["observation_id"] == "X1"
 
 
+def _full():
+    return run_cli("status", "--view", "full")[1]
+
+
 def test_task_update_flag_form(task):
     revision = _revision()
     code, updated = run_cli("task-update", "--base-revision", revision, "--record", "decision:保留解析器，修复调用方",
                             "--record", "D9=fact:app.py 只打印 hi", "--record", "open-item:确认国际化", "--milestone", "m-flags",
                             "--active-work", "写测试", "--active-work", "跑回归", "--pending", "审查结果")
     assert code == 0, updated
-    context = updated["Task Context"]
-    assert context["milestone"] == "m-flags" and context["Active Work"] == ["写测试", "跑回归"]
+    assert updated["appended"] == ["D1", "D9", "OI1"]  # the assigned ids come back in the acknowledgement
+    context = _full()
+    assert context["Task"]["milestone"] == "m-flags" and context["Active Work"] == ["写测试", "跑回归"]
     assert context["Pending Results"] == ["审查结果"]
     by_id = {item["id"]: item for item in context["Current Records"]}
     assert by_id["D1"]["kind"] == "decision" and by_id["D1"]["text"] == "保留解析器，修复调用方"
@@ -208,12 +213,12 @@ def test_task_update_flag_form(task):
     # Only fields given change: a record-only update leaves Active Work as it was; ids stay unique.
     code, more = run_cli("task-update", "--base-revision", _revision(), "--record", "decision:换方案", "--supersedes", "D1")
     assert code == 0, more
-    assert more["Task Context"]["Active Work"] == ["写测试", "跑回归"]
-    assert {item["id"] for item in more["Task Context"]["Current Records"]} == {"D2", "D9", "OI1"}  # D1 is superseded
+    assert more["appended"] == ["D2"] and _full()["Active Work"] == ["写测试", "跑回归"]
+    assert {item["id"] for item in _full()["Current Records"]} == {"D2", "D9", "OI1"}  # D1 is superseded
     code, replaced = run_cli("task-update", "--base-revision", _revision(), "--active-work", "只剩一项", "--clear-pending")
-    assert code == 0 and replaced["Task Context"]["Active Work"] == ["只剩一项"] and replaced["Task Context"]["Pending Results"] == []
+    assert code == 0 and _full()["Active Work"] == ["只剩一项"] and _full()["Pending Results"] == []
     code, cleared = run_cli("task-update", "--base-revision", _revision(), "--clear-active-work")
-    assert code == 0 and cleared["Task Context"]["Active Work"] == []
+    assert code == 0 and _full()["Active Work"] == []
 
 
 def test_task_update_flag_form_refusals(task):
@@ -240,7 +245,7 @@ def test_task_update_supersedes_by_explicit_new_id(task):
     code, done = run_cli("task-update", "--base-revision", _revision(), "--record", "D2=decision:b", "--record", "fact:c",
                          "--supersedes", "D2=D1")
     assert code == 0, done
-    ids = {item["id"] for item in done["Task Context"]["Current Records"]}
+    ids = {item["id"] for item in _full()["Current Records"]}
     assert ids == {"D2", "F1"}
 
 
@@ -251,6 +256,7 @@ def test_task_start_flag_form(home, repo, monkeypatch):
     code, started = run_cli("task-start", "修复问候语", *flags, "--execution-constraint", "claude-model:sonnet")
     assert code == 0, started
     authority = run_cli("status")[1]["Authority"]
+    assert authority["execution_constraint"] == "claude-model:sonnet"
     assert authority["execution_mode"] == "controller-direct" and authority["execution_constraint"] == "claude-model:sonnet"
 
 
@@ -280,7 +286,8 @@ def test_flags_survive_a_legacy_console_code_page(task, tmp_path):
                           "--record", "decision:选择方案甲", "--native-session", SESSION], capture_output=True, env=environment,
                          cwd=task["root"], check=False)
     assert out.returncode == 0, out.stderr
-    assert "选择方案甲" in json.loads(out.stdout.decode("utf-8"))["Task Context"]["Current Records"][0]["text"]
+    assert json.loads(out.stdout.decode("utf-8"))["appended"] == ["D1"]
+    assert "选择方案甲" in _full()["Current Records"][0]["text"]
 
 
 # ------------------------------------------------------------ tolerant --input
@@ -318,9 +325,9 @@ def test_undecodable_input_names_the_expected_encodings(task, tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_bytes('{"requirements":[{"id":"R9","workchain_ref":"国际化"}]}'.encode("gbk"))
     code, refused = run_cli("register", "--base-revision", _revision(), "--input", str(bad))
-    assert code == 2 and "INPUT_ENCODING" in refused["error"] and "UTF-16 with BOM" in refused["error"]
+    assert code == 2 and refused["code"] == "INPUT_DECODING_ERROR" and "UTF-16 with BOM" in refused["error"]
     bad.write_bytes(codecs.BOM_UTF32_LE + b"{}\x00\x00\x00")
-    assert "INPUT_ENCODING" in run_cli("register", "--base-revision", _revision(), "--input", str(bad))[1]["error"]
+    assert run_cli("register", "--base-revision", _revision(), "--input", str(bad))[1]["code"] == "INPUT_DECODING_ERROR"
 
 
 # ------------------------------------------------------------ revision visibility

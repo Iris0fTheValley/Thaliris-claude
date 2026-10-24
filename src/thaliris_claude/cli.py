@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 from thaliris import authority as core_authority, core, identity
@@ -47,7 +48,10 @@ def _parser() -> argparse.ArgumentParser:
     inputs.add_flags(command, "task-start")
     command = add("attach", "associate this session with an existing ACTIVE task")
     command.add_argument("--reason", required=True)
-    add("status", "bounded routing and evidence status").add_argument("--evidence-offset", type=int, default=0)
+    command = add("status", "bounded routing and evidence status (compact by default; --view full for every section)")
+    command.add_argument("--view", choices=("compact", "full"), default="compact")
+    command.add_argument("--evidence-offset", type=int, default=0, help="page open evidence from this offset")
+    command.add_argument("--since-revision", type=int, help="also list what may have changed after this task revision (bounded hint)")
     add("get", "retrieve one task object by id").add_argument("id")
     add("catalog", "list durable navigation").add_argument("path", nargs="?")
     add("document-get", "read 1-8 selected durable documents").add_argument("paths", nargs="+")
@@ -204,9 +208,47 @@ def _project(args) -> Path:
     return root
 
 
-def _status(root: Path, task_id: str, offset: int = 0) -> dict:
+COMPACT_RECORD_CHARS = 200
+
+
+def _authority_summary(root: Path, task_id: str, *, full: bool) -> dict | None:
+    target = store.authority(root, task_id)
+    record = target.read()
+    if record is None:
+        return None
+    summary = {"status": record["status"], "execution_mode": record["contract"]["execution_mode"],
+               "sha256": core_authority.digest(target.path())}
+    constraint = record["contract"].get("execution_constraint")
+    if full or constraint is not None:  # a frozen constraint stays visible in the compact view
+        summary["execution_constraint"] = constraint
+    return summary
+
+
+def _status(root: Path, task_id: str, offset: int = 0, *, view: str = "compact", since_revision: int | None = None) -> dict:
+    if view == "full":
+        return _status_full(root, task_id, offset, since_revision)
     core.select_task(root, task_id)
-    result = core.task_status(root, offset)
+    state = core._load_state(root)
+    result = core.task_status_packet(state, offset, view="compact", since_revision=since_revision)
+    dispatches = store.read_lifecycle(root, task_id)["dispatches"]
+    by_status: dict[str, int] = {}
+    for item in dispatches:
+        by_status[item["native_status"]] = by_status.get(item["native_status"], 0) + 1
+    result["Dispatches"] = {
+        "total": len(dispatches), "by_native_status": by_status,
+        "open": [{key: item.get(key) for key in ("handoff_id", "role", "native_status", "requested_model", "background")}
+                 | ({"disposed": True} if item["disposed"] else {})
+                 for item in dispatches if item["native_status"] not in store.TERMINAL_STATUSES]}
+    records, total = store.current_records(state, text_chars=COMPACT_RECORD_CHARS)
+    result["Records"] = {"total": total, "items": [{"id": item["id"], "kind": item["kind"], "text": item["text"]
+                                                    + ("…" if item["truncated"] else "")} for item in records]}
+    result["Authority"] = _authority_summary(root, task_id, full=False)
+    return result
+
+
+def _status_full(root: Path, task_id: str, offset: int = 0, since_revision: int | None = None) -> dict:
+    core.select_task(root, task_id)
+    result = core.task_status(root, offset, view="full", since_revision=since_revision)
     lifecycle = store.read_lifecycle(root, task_id)
     result["Claude Dispatches"] = [
         {key: item.get(key) for key in ("handoff_id", "role", "native_status", "binding", "background", "disposed", "parent",
@@ -220,12 +262,7 @@ def _status(root: Path, task_id: str, offset: int = 0) -> dict:
     result["Current Records"] = records
     result["Current Record Count"] = total
     result["Claude Dispatch Count"] = len(lifecycle["dispatches"])
-    target = store.authority(root, task_id)
-    record = target.read()
-    result["Authority"] = None if record is None else {
-        "status": record["status"], "execution_mode": record["contract"]["execution_mode"],
-        "execution_constraint": record["contract"].get("execution_constraint"),
-        "sha256": core_authority.digest(target.path())}
+    result["Authority"] = _authority_summary(root, task_id, full=True)
     return result
 
 
@@ -389,7 +426,7 @@ def run(args) -> dict:
     if name in {"status", "get"}:
         root, task_id = _read_task(args)
         if name == "status":
-            return _status(root, task_id, args.evidence_offset)
+            return _status(root, task_id, args.evidence_offset, view=args.view, since_revision=args.since_revision)
         core.select_task(root, task_id)
         return core.task_get(root, args.id)
     if name in {"catalog", "document-get"} | _IDENTITY_READS:
@@ -416,63 +453,51 @@ def run(args) -> dict:
                     raise ValueError("Controller imports name the exact --handoff-id")
                 payload = _payload(args, ctx["state"], prefix=args.handoff_id + ".", qualified=True)
                 result = store.observe(ctx, payload, agent_id=None, handoff_id=args.handoff_id)
-        return {"ok": True, **result}
+        return {"ok": True, **_write_response(ctx["state"], ["evidence_continuity"], appended=result.pop("appended"),
+                                              child=args.native_agent is not None), **result}
     if name in {"promote", "document-maintain"}:
         actor = "controller"
-        if args.native_agent is not None:
-            with store.transaction(root, task_id) as ctx:
+        with store.critical(root, task_id) as ctx:  # authority check, Core write and re-anchor in one lock span
+            if args.native_agent is not None:
                 entry = _child_entry(ctx, args)
                 if entry["role"] != "curator":
                     raise ValueError("CURATOR_OR_CONTROLLER_ONLY")
                 actor = f"handoff:{entry['handoff_id']}" if entry["handoff_id"] else "curator"
-        else:
-            with store.transaction(root, task_id):
-                pass
-        core.select_task(root, task_id)
-        function = core.task_promote if name == "promote" else core.document_maintain
-        temporary = _payload_file(root, _payload(args))
-        try:
-            result = function(root, actor, args.base_revision, str(temporary))
-        finally:
-            temporary.unlink(missing_ok=True)
-        store.authority(root, task_id).checkpoint()
-        return result
+            core.select_task(root, task_id)
+            function = core.task_promote if name == "promote" else core.document_maintain
+            temporary = _payload_file(root, _payload(args))
+            try:
+                return function(root, actor, args.base_revision, str(temporary))
+            finally:
+                temporary.unlink(missing_ok=True)
     _controller(args)
     if name in _IDENTITY_MUTATIONS:
         # Identity mutations never bump the task revision and are not memory promotion; the Controller's act, on the
         # human owner's decision carried in the payload. Core records the actor and task provenance.
-        with store.transaction(root, task_id):
-            pass  # The anchored authority must be ACTIVE and intact.
-        core.select_task(root, task_id)
-        source = _payload(args)  # tolerant decoding; Core receives the parsed object
-        result = getattr(identity, name.replace("-", "_"))(root, "claude:controller", args.base_revision, source)
-        store.authority(root, task_id).checkpoint()
-        return result
+        with store.critical(root, task_id):  # the anchored authority must be ACTIVE and intact
+            core.select_task(root, task_id)
+            source = _payload(args)  # tolerant decoding; Core receives the parsed object
+            return getattr(identity, name.replace("-", "_"))(root, "claude:controller", args.base_revision, source)
     if name == "task-update":
-        with store.transaction(root, task_id) as ctx:  # the anchored authority must be ACTIVE and intact
+        with store.critical(root, task_id) as ctx:  # the anchored authority must be ACTIVE and intact
             payload = _payload(args, ctx["state"])
-        for record in payload.get("records") or []:
-            if isinstance(record, dict) and {"producer", "revision"} & set(record):
-                raise ValueError("TASK_UPDATE_PROVENANCE: the runner supplies record producer and revision")
-        core.select_task(root, task_id)
-        temporary = _payload_file(root, payload)
-        try:
-            result = core.task_update(root, "controller", args.base_revision, str(temporary))
-        finally:
-            temporary.unlink(missing_ok=True)
-        store.authority(root, task_id).checkpoint()
-        state = core._load_state(root)
-        records, total = store.current_records(state)
-        return {**result, "Task Context": {"milestone": state["current_milestone"], "Active Work": state["active_work"],
-                                           "Pending Results": state["pending_results"], "Current Records": records,
-                                           "Current Record Count": total}}
+            for record in payload.get("records") or []:
+                if isinstance(record, dict) and {"producer", "revision"} & set(record):
+                    raise ValueError("TASK_UPDATE_PROVENANCE: the runner supplies record producer and revision")
+            core.select_task(root, task_id)
+            before = {item["id"] for item in ctx["state"]["records"]}
+            temporary = _payload_file(root, payload)
+            try:
+                result = core.task_update(root, "controller", args.base_revision, str(temporary))
+            finally:
+                temporary.unlink(missing_ok=True)
+            state = core._load_state(root)
+            return _write_response(state, result["changed"], appended=[item["id"] for item in state["records"] if item["id"] not in before])
     if name in {"register", "judge"}:
         with store.transaction(root, task_id) as ctx:
             payload = _payload(args, ctx["state"])
-            store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
-            revision = ctx["state"]["revision"]
-        status = _status(root, task_id)
-        return {"ok": True, "task_id": task_id, "revision": revision, "Evidence Continuity": status["Evidence Continuity"]}
+            appended = store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
+            return _write_response(ctx["state"], ["evidence_continuity"], appended=appended)
     if name == "dispose":
         with store.transaction(root, task_id) as ctx:
             matches = [item for item in ctx["lifecycle"]["dispatches"]
@@ -487,18 +512,17 @@ def run(args) -> dict:
         return {"ok": True, "handoff_id": entry["handoff_id"], "native_status": entry["native_status"], "native_termination": "UNKNOWN"
                 if entry["native_status"] in store.UNRESOLVED_STATUSES else entry["native_status"]}
     if name == "mode":
-        unresolved = store.unresolved(store.read_lifecycle(root, task_id))
-        if unresolved:
-            raise ValueError(f"UNRESOLVED_CHILD_DISPATCHES: {len(unresolved)} pending/running; wait for them or `dispose` them first")
-        return store.authority(root, task_id).switch_mode(args.expected_authority_sha256, args.base_revision, args.mode, args.human_instruction)
+        with store.critical(root, task_id, checkpoint=False) as ctx:  # Core's switch re-anchors the authority itself
+            unresolved = store.unresolved(ctx["lifecycle"])
+            if unresolved:
+                raise ValueError(f"UNRESOLVED_CHILD_DISPATCHES: {len(unresolved)} pending/running; wait for them or `dispose` them first")
+            return ctx["store"].switch_mode(args.expected_authority_sha256, args.base_revision, args.mode, args.human_instruction)
     if name == "artifact":
-        with store.transaction(root, task_id):
-            pass
-        core.select_task(root, task_id)
-        result = core.task_artifact(root, args.base_revision, args.id, args.path, args.summary,
-                                    producer="controller", registered_by="claude:controller", evidence_refs=args.source_ref)
-        store.authority(root, task_id).checkpoint()
-        return result
+        with store.critical(root, task_id):
+            core.select_task(root, task_id)
+            result = core.task_artifact(root, args.base_revision, args.id, args.path, args.summary,
+                                        producer="controller", registered_by="claude:controller", evidence_refs=args.source_ref)
+            return _write_response(core._load_state(root), result["changed"])
     if name == "close":
         with store.transaction(root, task_id) as ctx:
             unresolved = store.unresolved(ctx["lifecycle"])
@@ -506,14 +530,12 @@ def run(args) -> dict:
                 raise ValueError("CHILD_EXECUTION_UNRESOLVED: " + ", ".join(
                     f"{item['role']}:{item['handoff_id'] or item['tool_use_id']}={item['native_status']}" for item in unresolved)
                     + ". Wait for terminal evidence or `dispose` the dependency.")
-            if ctx["state"]["revision"] != args.base_revision:
-                raise ValueError("task revision conflict")
+            core.check_revision(ctx["state"], args.base_revision)
             ctx["state"]["status"] = "DONE"
             ctx["state"]["revision"] += 1
             ctx["state_changed"] = True
-        return {"ok": True, "task_id": task_id, "status": "DONE", "revision": args.base_revision + 1,
-                "note": "DONE records mechanical closure; it is not product acceptance.",
-                "Evidence Continuity": _status(root, task_id)["Evidence Continuity"]}
+            return {**_write_response(ctx["state"], ["status"]),
+                    "note": "DONE records mechanical closure; it is not product acceptance."}
     if name == "detach":
         store.clear_session(args.native_session)
         return {"ok": True, "task_id": task_id, "status": "ACTIVE", "note": "Session association removed; authority and ledger are unchanged."}
@@ -534,6 +556,17 @@ def run(args) -> dict:
             archive_paths={store.LIFECYCLE_NAME: lifecycle_path} if lifecycle_path.is_file() else {})
         return {**result, "native_termination": "UNKNOWN"}
     raise ValueError(f"unsupported command: {name}")
+
+
+def _write_response(state: dict, changed: list[str], *, appended: list[str] | None = None, child: bool = False) -> dict:
+    """Core's compact write acknowledgement: ack, new revision and the open-evidence summary (totals plus bounded items).
+
+    A child's write carries only the totals: the item list is the Controller's to re-present.
+    """
+    response = core.task_write_response(state, changed, appended=appended)
+    if child:
+        response["evidence"] = {key: value for key, value in response["evidence"].items() if key.endswith("_total")}
+    return response
 
 
 def _payload_file(root: Path, payload: dict) -> Path:
@@ -560,6 +593,19 @@ def _emit(text: str) -> None:
     buffer.flush()
 
 
+_ADAPTER_CODE = re.compile(r"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)(?:: |$)")
+
+
+def _error(exc: BaseException) -> dict:
+    """Core's structured envelope (code, recovery, details) for a ThalirisError; an adapter `CODE: message` gets its code too."""
+    envelope = core.error_envelope(exc)
+    if "code" not in envelope:
+        match = _ADAPTER_CODE.match(str(exc))
+        if match:
+            envelope["code"] = match.group(1)
+    return envelope
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["hook"]:
@@ -573,8 +619,9 @@ def main(argv: list[str] | None = None) -> int:
     except core.TaskStateSchemaIncompatible as exc:
         result, code = {"ok": False, **exc.diagnostic}, 3
     except (ValueError, OSError, RuntimeError, KeyError) as exc:
-        result, code = {"ok": False, "error": str(exc)}, 2
+        result, code = _error(exc), 2
     else:
         code = 0 if result.get("ok", True) else 3
-    _emit(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    # Compact JSON (Controllers pay for every byte they read); keys are sorted, text stays UTF-8 and readable.
+    _emit(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     return code

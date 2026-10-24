@@ -84,7 +84,7 @@ def _handoff(result):
 
 
 def _dispatches():
-    return run_cli("status")[1]["Claude Dispatches"]
+    return run_cli("status", "--view", "full")[1]["Claude Dispatches"]
 
 
 def test_session_start_names_the_loaded_adapter(task):
@@ -122,9 +122,9 @@ def test_full_dispatch_observe_judge_close(task):
     judgment = {"id": "J1", "candidate": "C1", "requirement_ref": "R1", "observation_refs": [f"{handoff_id}.O1"],
                 "outcome": "repair", "reasoning": "greeting still prints hi"}
     code, judged = run_cli("judge", "--base-revision", str(status["Task"]["revision"]), "--json", json.dumps(judgment))
-    assert code == 0 and judged["Evidence Continuity"]["unresolved_judgments_total"] == 1
+    assert code == 0 and judged["evidence"]["unresolved_judgments_total"] == 1 and judged["appended"] == ["J1"]
     code, closed = run_cli("close", "--base-revision", str(judged["revision"]))
-    assert code == 0 and closed["status"] == "DONE" and closed["Evidence Continuity"]["unresolved_judgments_total"] == 1
+    assert code == 0 and closed["status"] == "DONE" and closed["evidence"]["unresolved_judgments_total"] == 1
     assert store.resolve_session(SESSION) is None
 
 

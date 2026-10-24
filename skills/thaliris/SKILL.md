@@ -16,9 +16,14 @@ adapter's hooks) records identities, revisions, provenance and observations, and
 never decides what anything means.
 
 `<runner>` below is the exact command your session context gives
-(`python ".../bin/thaliris.py"`). Run it as **one direct command**: no pipes,
-`&&`, redirection, variables or `$(...)`. The PreToolUse hook appends your native
-identity; never add `--native-session` or `--native-agent` yourself.
+(`python ".../bin/thaliris.py"`). Run it as **one direct command**: no pipes, `&&`,
+`;`, redirection, variables, `$(...)`, trailing `# comment`, extra line or unquoted
+backslash path (quote the runner path, or use forward slashes). The PreToolUse hook
+appends your native identity; a call it cannot recognise is denied with the reason,
+and you never add `--native-session` or `--native-agent` yourself. Pass text as
+quoted flags (Chinese is fine); never write a temporary JSON file for a call that
+has a flag form. Output is compact JSON; a failure is `{"ok":false,"error","code",
+"recovery","details"}`, so act on `code`, `recovery` and `details`.
 
 ## 1. Admission
 
@@ -38,26 +43,22 @@ Implementer with a short handoff. Unless the user opts out:
    eight per call). If your session context shows a project identity line, run
    `<runner> identity-status` and read only the items this task touches
    (section 10); no line means the project has none, which is normal.
-3. Write the **authority contract** to a UTF-8 JSON file (a separate tool call):
-
-   ```json
-   {"human_instruction": "<the user's actual instruction, quoted faithfully>",
-    "boundary": "<what is in and out of scope>",
-    "invariants": "<hard constraints that must hold>",
-    "acceptance": "<how we will know the request is met>",
-    "execution_mode": "delegated"}
-   ```
-
-   All fields are non-empty strings. Always write `execution_mode` explicitly:
+3. Admit the task with the **authority contract** as flags, all non-empty:
+   `<runner> task-start "<goal>" --human-instruction "<the user's actual instruction,
+   quoted faithfully>" --boundary "<what is in and out of scope>" --invariants
+   "<hard constraints that must hold>" --acceptance "<how we will know the request
+   is met>" --execution-mode delegated`. Always give `--execution-mode` explicitly:
    the mode the user stated for this task; otherwise the standing mode they chose
    in the plugin configuration (shown in your session context); otherwise ask them
    once if your Agent tool says to spawn agents only when the user asks, and
-   `delegated` if it does not. Optionally `"execution_constraint": "claude-model:<sonnet|opus|haiku|fable>"`
-   when the user wants every Thaliris child pinned to one model.
-4. `<runner> task-start "<goal>" --contract <absolute path>`. Keep the returned
-   Task ID. One session holds at most one ACTIVE task; another workspace's old
-   ACTIVE record never becomes yours. To continue a task from a new session (for
-   example after `/clear`), `<runner> attach --task-id <id> --reason "<why>"`.
+   `delegated` if it does not. Optionally `--execution-constraint
+   claude-model:<sonnet|opus|haiku|fable>` when the user wants every Thaliris child
+   pinned to one model. (`--contract <absolute path>` to a UTF-8 JSON file with the
+   same keys, `human_instruction` ... `execution_mode` and optional
+   `execution_constraint`, is the alternative; never mix the two.)
+4. Keep the returned Task ID. One session holds at most one ACTIVE task; another
+   workspace's old ACTIVE record never becomes yours. To continue a task from a new
+   session (for example after `/clear`), `<runner> attach --task-id <id> --reason "<why>"`.
 
 ## 2. Authority and execution modes
 
@@ -219,7 +220,7 @@ repetition; output-language requirements still govern.
 serves (once, before dispatch):
 
 ```
-<runner> register --base-revision <n> --json '{"requirements":[{"id":"R1","workchain_ref":"login-redirect"}]}'
+<runner> register --base-revision <n> --requirement R1=login-redirect --requirement R2=session-expiry
 ```
 
 Then put one marker line in the handoff prompt:
@@ -274,18 +275,25 @@ without re-confirming the same completion.
 ## 6. Evidence continuity
 
 Children record already-discovered facts that change their local conclusion,
-acceptance or a critical UNKNOWN with `observe`; the adapter attaches handoff,
-candidate and requirement refs. This adds no search duty for them and no
-global-importance judgment.
+acceptance or a critical UNKNOWN with `observe --text "..." --source "path:line"`
+(`--source` is required and repeatable; ids are assigned); the adapter attaches
+handoff, candidate and requirement refs. This adds no search duty for them and no
+global-importance judgment. Sibling children may both call theirs `O1`: Core stores
+the adapter's handoff-qualified id, `H1a2b3c4d.O1`.
 
 You keep critical observations visible until you have **explicitly** reassessed
 each related user requirement for the current candidate:
 
 ```
-<runner> judge --base-revision <n> --json '{"id":"J1","candidate":"C1","requirement_ref":"R1","observation_refs":["H1a2b3c4d.O1"],"outcome":"repair","reasoning":"..."}'
+<runner> judge --base-revision <n> --requirement R1 --candidate C1 --outcome repair --observations O1,O2 --reasoning "..."
 ```
 
-`outcome` is `satisfied`, `unknown`, `repair` or `no-current-impact`. Reading,
+`outcome` is `satisfied`, `unknown`, `repair` or `no-current-impact`. In the flag
+form a bare `O1` resolves to the one qualified id it is a suffix of (`H1a2b3c4d.O1`;
+ambiguous means qualify it); `--json` takes the qualified ids as the packet shows
+them. Judgment ids are assigned (`J<n>`; `--id` overrides). Several judgments are
+one atomic call and one revision: repeat `--judgment "R1|satisfied|O1|reasoning"`
+with one `--candidate`, or pass `--json '{"judgments":[...]}'` (1-64). Reading,
 retrieving, acknowledging or forwarding evidence is not a disposition. An
 `unknown` or `repair` judgment stays visible as unresolved until a later judgment
 addresses it through `judgment_refs` (or cites its complete observation basis);
@@ -298,11 +306,27 @@ While unincorporated observations or unresolved judgments remain, the hooks
 re-present a bounded "Thaliris evidence for task …" packet when a child's result
 reaches you. That happens on the Agent result itself, and at the start of any turn
 (including `<task-notification>` turns) where the packet has changed or your
-context was compacted. An unchanged packet is not repeated. Before a broad
-completion or requirement decision, run `<runner> status` if the latest packet is
-not in front of you. To import a
-historical child result, `observe --handoff-id <id>`; this neither reactivates the
-child nor establishes current truth.
+context was compacted. An unchanged packet is not repeated (a background launch
+acknowledgement says "Evidence unchanged" instead); a child's final report always
+carries it. The packet and every dispatch acknowledgement state "task revision now
+N": that is your next `--base-revision`. Before a broad completion or requirement
+decision, run `<runner> status` if the latest packet is not in front of you. To
+import a historical child result, `observe --handoff-id <id> --text "..." --source
+"..."` with ids qualified by that handoff; this neither reactivates the child nor
+establishes current truth.
+
+**Writes and revisions.** `register`, `judge`, `observe`, `task-update`, `artifact`
+and `close` answer with a compact acknowledgement: `revision`, `changed`,
+`appended` (assigned ids) and `evidence` (open-evidence totals plus bounded items,
+paged by `next_offset`); no status call is needed after a write. Writes are strict
+compare-and-set on `--base-revision`. On `TASK_REVISION_CONFLICT` read
+`details.current_revision` and `details.changes_since` (a bounded, non-exact hint
+of what moved, with the open evidence), decide whether your write still applies,
+and retry once with `--base-revision <current_revision>`; do not re-read `status`.
+`status` is compact (header, counts, open evidence, authority mode and hash, open
+dispatches, the 12 latest current records at 200 characters); `status --view full`
+returns every section, `--since-revision N` adds the same change hint and
+`--evidence-offset N` pages open evidence.
 
 **Your task context.** Keep the task's global semantic state in the ledger, not
 only in your conversation, so a long task, a compaction or a later session does
@@ -311,17 +335,17 @@ way you would need to recover — a confirmed fact, a decision and its reason, a
 completed or started Workstream, an open item, a milestone:
 
 ```
-<runner> task-update --base-revision <n> --input <file>
-{"records": [{"id": "D3", "kind": "decision", "text": "keep the parser; fix the caller (src/a.py:40)", "source_refs": []}],
- "active_work": ["implementer: caller fix"], "pending_results": ["review of the caller fix"],
- "current_milestone": "M2 caller fixed"}
+<runner> task-update --base-revision <n> --record "decision:keep the parser; fix the caller (src/a.py:40)" --active-work "implementer: caller fix" --pending "review of the caller fix" --milestone "M2 caller fixed"
 ```
 
-Every key is optional. `records` are appended (`kind` is your label: `fact`,
-`decision`, `progress`, `open-item`, ...); correct one by appending a new record
-with `"supersedes": ["D1"]` rather than rewriting history. `active_work` and
-`pending_results` replace the current lists (at most 64 short entries; put long
-content in a record or Artifact); `current_milestone` is at most 128 characters.
+Every flag is optional. `--record [ID=]KIND:TEXT` appends a record (`kind` is your
+label: `fact`, `decision`, `progress`, `open-item`, ...; the id is assigned when
+omitted and returned in `appended`); correct one by appending a new record with
+`--supersedes D1` (several records: `--supersedes D3=D1`) rather than rewriting
+history. `--active-work` and `--pending` (repeatable) REPLACE the current lists
+(at most 64 short entries; put long content in a record or Artifact);
+`--clear-active-work` / `--clear-pending` empty them; `--milestone` is at most 128
+characters. `--json` takes the full payload for anything the flags cannot say.
 `status` shows these and the most recent current records; after compaction or
 resume the session start re-presents them, and `attach` returns them in a new
 session (for example after `/clear`). They are

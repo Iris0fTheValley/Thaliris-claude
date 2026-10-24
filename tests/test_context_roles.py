@@ -34,15 +34,19 @@ def test_task_update_survives_compaction(task):
         "active_work": ["implementer changing app.py"], "pending_results": ["review of the greeting change"],
         "current_milestone": "M1 greeting"})
     assert code == 0, updated
-    context = updated["Task Context"]
-    assert context["milestone"] == "M1 greeting" and context["Active Work"] == ["implementer changing app.py"]
-    assert [item["id"] for item in context["Current Records"]] == ["F1", "D1"]
+    assert updated["appended"] == ["F1", "D1"] and updated["revision"] == _revision()
+    assert set(updated["changed"]) == {"records", "active_work", "pending_results", "current_milestone"}
+    context = run_cli("status")[1]
+    assert context["Task"]["milestone"] == "M1 greeting" and context["Active Work"] == ["implementer changing app.py"]
+    assert [item["id"] for item in context["Records"]["items"]] == ["F1", "D1"]
     # A correction supersedes; the superseded record leaves the current view but stays retrievable.
     code, corrected = _update({"records": [{"id": "D2", "kind": "decision", "text": "print hello via a constant",
                                             "supersedes": ["D1"]}], "active_work": []})
     assert code == 0, corrected
     status = run_cli("status")[1]
-    assert [item["id"] for item in status["Current Records"]] == ["F1", "D2"] and status["Current Record Count"] == 2
+    assert [item["id"] for item in status["Records"]["items"]] == ["F1", "D2"] and status["Records"]["total"] == 2
+    full = run_cli("status", "--view", "full")[1]
+    assert [item["id"] for item in full["Current Records"]] == ["F1", "D2"] and full["Current Record Count"] == 2
     assert status["Active Work"] == [] and status["Pending Results"] == ["review of the greeting change"]
     assert run_cli("get", "D1")[1]["object"]["text"] == "keep print, change the literal"
     assert run_cli("get", "D2")[1]["object"]["producer"] == "controller"
@@ -62,7 +66,7 @@ def test_task_update_conflicts_and_refusals(task):
     revision = _revision()
     assert _update({"active_work": ["a"]}, revision)[0] == 0
     code, conflict = _update({"active_work": ["b"]}, revision)
-    assert code == 2 and "revision conflict" in conflict["error"]
+    assert code == 2 and conflict["code"] == "TASK_REVISION_CONFLICT" and conflict["details"]["current_revision"] == revision + 1
     code, forged = _update({"records": [{"id": "X", "kind": "fact", "text": "t", "producer": "handoff:H1"}]})
     assert code == 2 and "TASK_UPDATE_PROVENANCE" in forged["error"]
     assert _update({"current_milestone": "m" * 200})[0] == 2

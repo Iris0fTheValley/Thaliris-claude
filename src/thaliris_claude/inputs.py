@@ -7,32 +7,22 @@ grants authority, supplies provenance or relaxes a refusal.
 from __future__ import annotations
 
 import argparse
-import codecs
 from pathlib import Path
 import re
 
-from thaliris import authority as core_authority
+from thaliris import authority as core_authority, core
 
-_BOMS_32 = (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
 _LABEL = re.compile(r"[A-Za-z0-9_.:-]+")
 _SIMPLE = re.compile(r"[A-Za-z0-9_.-]+")
-_ENCODINGS = "UTF-8, UTF-8 with BOM or UTF-16 with BOM"
+_OUTCOMES = ("satisfied", "unknown", "repair", "no-current-impact")
 _KIND_PREFIX = {"decision": "D", "fact": "F", "progress": "P", "open-item": "OI"}
 
 
 # ------------------------------------------------------------------ file input
 
 def decode_text(raw: bytes, label: str) -> str:
-    """Decode a payload or contract file: UTF-8, UTF-8 with BOM or UTF-16 with BOM."""
-    try:
-        if raw.startswith(_BOMS_32):
-            raise UnicodeError("UTF-32")
-        if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-            return raw.decode("utf-16")
-        return raw.decode("utf-8-sig")
-    except UnicodeError as exc:
-        raise ValueError(f"INPUT_ENCODING: {label} is not {_ENCODINGS} ({exc}). "
-                         "Save it as UTF-8 (Windows PowerShell `>` writes UTF-16, which is accepted only with its BOM).") from None
+    """Decode a payload or contract file: UTF-8, UTF-8 with BOM or UTF-16 with BOM (Core's decoder and error)."""
+    return core.decode_input_bytes(raw, label)
 
 
 def read_text(path: str | Path) -> str:
@@ -43,7 +33,7 @@ def read_text(path: str | Path) -> str:
 
 # command -> flag destinations that select the flag form (argparse dest names)
 FLAGS: dict[str, tuple[str, ...]] = {
-    "judge": ("requirement", "candidate", "outcome", "observations", "reasoning", "judgment_refs", "judgment_id"),
+    "judge": ("requirement", "candidate", "outcome", "observations", "reasoning", "judgment_refs", "judgment_id", "judgment"),
     "register": ("requirement",),
     "observe": ("text", "source", "observation_id", "requirement_refs"),
     "task-update": ("record", "supersedes", "milestone", "active_work", "pending", "clear_active_work", "clear_pending"),
@@ -56,11 +46,13 @@ def add_flags(command: argparse.ArgumentParser, name: str) -> None:
     if name == "judge":
         add("--requirement", help="flag form: the requirement id this judgment is about")
         add("--candidate", help="flag form: the candidate id")
-        add("--outcome", choices=("satisfied", "unknown", "repair", "no-current-impact"), help="flag form")
+        add("--outcome", choices=_OUTCOMES, help="flag form")
         add("--observations", help="flag form: comma-separated observation ids (a unique suffix such as O1 is accepted)")
         add("--reasoning", help="flag form: why the outcome follows from those observations")
         add("--judgment-refs", dest="judgment_refs", help="flag form: comma-separated earlier judgment ids this one addresses")
         add("--id", dest="judgment_id", help="flag form: judgment id (default: the next free J<n>)")
+        add("--judgment", action="append", metavar="REQ|OUTCOME|OBS[,OBS]|REASONING",
+            help="flag form, batch (repeatable, atomic, one revision; needs --candidate; instead of the single-judgment flags)")
     elif name == "register":
         add("--requirement", action="append", metavar="ID=WORKCHAIN_REF", help="flag form (repeatable): register one requirement")
     elif name == "observe":
@@ -125,16 +117,37 @@ def _label(value: str, what: str) -> str:
     return value
 
 
-def _judge(args, state: dict) -> dict:
-    _need(args, "judge", (("requirement", "--requirement"), ("candidate", "--candidate"), ("outcome", "--outcome"),
-                          ("observations", "--observations"), ("reasoning", "--reasoning")))
-    known = [str(item["id"]) for item in (state.get("evidence_continuity") or {}).get("observations", [])]
+def _resolve_refs(names: list[str], known: list[str]) -> list[str]:
+    """A bare observation id such as O1 resolves to the one handoff-qualified id (`H1a2b3c4d.O1`) it is a suffix of."""
     refs = []
-    for ref in _names(args.observations):
+    for ref in names:
         matches = [item for item in known if item.endswith("." + ref)]
         refs.append(ref if ref in known or len(matches) != 1 else matches[0])
+    return refs
+
+
+def _judge(args, state: dict) -> dict:
+    known = [str(item["id"]) for item in (state.get("evidence_continuity") or {}).get("observations", [])]
+    if args.judgment:
+        single = [flag for dest, flag in (("requirement", "--requirement"), ("outcome", "--outcome"), ("observations", "--observations"),
+                                          ("reasoning", "--reasoning"), ("judgment_id", "--id"), ("judgment_refs", "--judgment-refs"))
+                  if getattr(args, dest, None)]
+        if single:
+            raise ValueError(f"CONFLICTING_FLAGS: --judgment (batch) cannot be combined with {', '.join(single)}")
+        _need(args, "judge", (("candidate", "--candidate"),))
+        ids, judgments = used_ids(state), []
+        for spec in args.judgment:
+            parts = [part.strip() for part in spec.split("|", 3)]
+            if len(parts) != 4 or not all(parts) or parts[1] not in _OUTCOMES:
+                raise ValueError("INVALID_JUDGMENT: use REQ|OUTCOME|OBS[,OBS]|REASONING with OUTCOME one of " + ", ".join(_OUTCOMES))
+            judgments.append({"id": next_free(ids, "", "J"), "candidate": args.candidate, "requirement_ref": parts[0],
+                              "observation_refs": _resolve_refs(_names(parts[2]), known), "outcome": parts[1], "reasoning": parts[3]})
+        return {"judgments": judgments}
+    _need(args, "judge", (("requirement", "--requirement"), ("candidate", "--candidate"), ("outcome", "--outcome"),
+                          ("observations", "--observations"), ("reasoning", "--reasoning")))
     payload = {"id": _label(args.judgment_id, "judgment id") if args.judgment_id else next_free(used_ids(state), "", "J"),
-               "candidate": args.candidate, "requirement_ref": args.requirement, "observation_refs": refs,
+               "candidate": args.candidate, "requirement_ref": args.requirement,
+               "observation_refs": _resolve_refs(_names(args.observations), known),
                "outcome": args.outcome, "reasoning": args.reasoning}
     if args.judgment_refs:
         payload["judgment_refs"] = _names(args.judgment_refs)

@@ -345,6 +345,38 @@ def transaction(root: Path, task_id: str, *, observe_only: bool = False):
             write_lifecycle(root, task_id, ctx["lifecycle"])
 
 
+@contextmanager
+def critical(root: Path, task_id: str, *, checkpoint: bool = True):
+    """One lock span for an authorized Core mutation: authority check, the Core call and the re-anchor.
+
+    Core's mutators take the task lock themselves and the file lock is not reentrant, so a
+    transaction around them used to release it first. Here Core's lock is a no-op for this
+    root while this process already holds it, so nothing runs between the authority check,
+    Core's write and the checkpoint (an interleaved hook saw the new state bytes against the
+    old anchor, and state changed between check and write would have been anchored by the
+    checkpoint). Core's own checks (revision CAS, validation) run unchanged. The checkpoint
+    runs only on success.
+    """
+    with transaction(root, task_id) as ctx:
+        target, original = root.resolve(), core._lock
+
+        @contextmanager
+        def held(path):
+            if Path(path).resolve() == target:
+                yield
+            else:
+                with original(path):
+                    yield
+
+        core._lock = held
+        try:
+            yield ctx
+            if checkpoint:
+                ctx["store"].checkpoint()
+        finally:
+            core._lock = original
+
+
 def resolve_session(session_id: str | None) -> tuple[Path, str] | None:
     """Return the associated (root, task_id) when its Core task is still ACTIVE."""
     association = read_session(session_id)
@@ -577,14 +609,30 @@ def namespaced_observation(entry: dict, payload: dict) -> dict:
     return result
 
 
+OBSERVATION_FIELDS = {"id", "text", "source_refs", "sources", "observed_state", "handoff_id", "candidate", "requirement_refs"}
+
+
+def observation_items(payload: dict) -> tuple[list[dict], bool]:
+    """One observation object, or a batch `{"observations": [...]}` (1-64, one revision); and whether it was a batch."""
+    if isinstance(payload, dict) and set(payload) == {"observations"}:
+        items = payload["observations"]
+        if not isinstance(items, list) or not 1 <= len(items) <= core.CONTINUITY_BATCH_MAX:
+            raise core.ThalirisError("CONTINUITY_INVALID", "invalid observations batch",
+                                     details={"collection": "observations",
+                                              "expected": f"a list of 1 to {core.CONTINUITY_BATCH_MAX} objects"})
+        return items, True
+    return [payload], False
+
+
 def observe(ctx: dict, payload: dict, *, agent_id: str | None, handoff_id: str | None) -> dict:
-    """Append one observation with adapter-supplied provenance.
+    """Append one observation, or an atomic batch, with adapter-supplied provenance.
 
     A child is identified by its bound native agent; the Controller imports a
     historical child result by exact handoff id and is marked as submitter.
     """
     state, lifecycle = ctx["state"], ctx["lifecycle"]
-    if not isinstance(payload, dict) or set(payload) - {"id", "text", "source_refs", "sources", "observed_state", "handoff_id", "candidate", "requirement_refs"}:
+    items, batch = observation_items(payload)
+    if not all(isinstance(item, dict) and not set(item) - OBSERVATION_FIELDS for item in items):
         raise ValueError("INVALID_OBSERVATION_FIELDS")
     if agent_id is not None:
         entry = dispatch_for_agent(lifecycle, agent_id)
@@ -598,29 +646,34 @@ def observe(ctx: dict, payload: dict, *, agent_id: str | None, handoff_id: str |
         record = handoff(state, entry["handoff_id"])
         if record is None:
             raise ValueError("OBSERVATION_ASSOCIATION_UNAVAILABLE: this handoff carries no evidence association; report it in your final report")
-        payload = namespaced_observation(entry, payload)
+        items = [namespaced_observation(entry, item) for item in items]
         extra = {"native_actor": native_hash(agent_id)}
     else:
         record = handoff(state, handoff_id)
         if record is None:
             raise ValueError("HANDOFF_NOT_FOUND")
         extra = {"submitted_by": "controller"}
-    for field, expected in (("handoff_id", record["id"]), ("candidate", record["candidate"]), ("requirement_refs", record["requirement_refs"])):
-        if field in payload and payload[field] != expected:
-            raise ValueError(f"OBSERVATION_PROVENANCE_CONFLICT: {field}")
-    payload = {**payload, "handoff_id": record["id"], "candidate": record["candidate"],
-               "requirement_refs": record["requirement_refs"], **extra}
-    core._append_continuity_state(state, record["producer"], payload, "observations")
+    stamped = []
+    for item in items:
+        for field, expected in (("handoff_id", record["id"]), ("candidate", record["candidate"]), ("requirement_refs", record["requirement_refs"])):
+            if field in item and item[field] != expected:
+                raise ValueError(f"OBSERVATION_PROVENANCE_CONFLICT: {field}")
+        stamped.append({**item, "handoff_id": record["id"], "candidate": record["candidate"],
+                        "requirement_refs": record["requirement_refs"], **extra})
+    appended = core.append_observations(state, [(record["producer"], item) for item in stamped])
     ctx["state_changed"] = True
-    return {"observation_id": payload["id"], "handoff_id": record["id"], "candidate": record["candidate"]}
+    result = {"handoff_id": record["id"], "candidate": record["candidate"], "appended": appended}
+    if not batch:
+        result["observation_id"] = appended[0]
+    return result
 
 
-def append_controller(ctx: dict, base_revision: int, payload: dict, kind: str) -> None:
-    """Controller register/judge under the same lock and revision CAS."""
-    if ctx["state"]["revision"] != base_revision:
-        raise ValueError("task revision conflict")
-    core._append_continuity_state(ctx["state"], "controller", payload, kind)
+def append_controller(ctx: dict, base_revision: int, payload: dict, kind: str) -> list[str]:
+    """Controller register/judge under the same lock and Core's revision CAS (a conflict carries its details)."""
+    core.check_revision(ctx["state"], base_revision)
+    appended = core._append_continuity_state(ctx["state"], "controller", payload, kind)
     ctx["state_changed"] = True
+    return appended
 
 
 def current_records(state: dict, limit: int = 12, text_chars: int = 600) -> tuple[list[dict], int]:

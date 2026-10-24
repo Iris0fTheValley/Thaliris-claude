@@ -67,12 +67,15 @@ fact you have already found changes your local conclusion, your local acceptance
 or a critical UNKNOWN, record it so it stays visible to the Controller:
 
 ```
-<thaliris runner> observe --json '{"id":"O1","text":"what you found","source_refs":["S1"],"sources":[{"id":"S1","kind":"local","locator":"path/to/file.py:42","summary":"exact supporting fact"}]}'
+<thaliris runner> observe --text "what you found" --source "path/to/file.py:42"
 ```
 
-Your session context gives the exact runner command. Run it as one direct command
-(no pipes, `&&`, variables or wrapper scripts); the adapter attaches your handoff,
-candidate and identity, so never pass those yourself. If the runner refuses
+`--source` is required (repeat it for several): where the fact can be checked, such as
+`path:line`, a URL or the command you ran. Ids are assigned for you; a batch is
+`observe --json '{"observations":[...]}'`. Your session context gives the exact runner
+command. Run it as one direct command (no pipes, `&&`, `;`, comments, line breaks,
+variables or wrapper scripts); the adapter attaches your handoff, candidate and
+identity, so never pass those yourself. If the runner refuses
 because no association is available, keep the observation and its sources in your
 final report for the Controller to associate. Old observations are history, not
 automatically current truth.

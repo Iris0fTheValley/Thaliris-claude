@@ -49,7 +49,7 @@ def test_reviewer_is_non_writing_and_only_delegates_scanner():
 def test_child_prompts_carry_the_protocol_tokens():
     for role in roles.child_roles():
         text = roles.get_role(role).instructions
-        for token in ("observe --json", "**Conclusion**", "**Decision-changing unknowns**", "**Verification performed**"):
+        for token in ("observe --text", "**Conclusion**", "**Decision-changing unknowns**", "**Verification performed**"):
             assert token in text, (role, token)
         assert ("thaliris:investigator" in text) == roles.delegation_allowed(role, "investigator")
 

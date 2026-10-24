@@ -21,7 +21,7 @@ Thaliris-claude/
 ├── hooks/hooks.json               SessionStart / UserPromptSubmit / PreToolUse / PostToolUse(+Failure) / SubagentStart / SubagentStop
 ├── bin/thaliris-hook             Hook 入口（sh，与官方插件同一约定；命中缓存时只启动一个解释器）
 ├── bin/thaliris.py                Runner 启动器（兼容旧 Python，自动发现并缓存 ≥3.11 运行时）
-├── vendor/                        固定提交的 Thaliris Core 与 core.lock.json
+├── vendor/                        固定提交的 Thaliris Core（e29c837，Core 0.5.1）与 core.lock.json
 ├── scripts/vendor_core.py         内置/校验 Core
 └── src/thaliris_claude/
     ├── roles.py    RoleSpec + ClaudeExecutionBinding；角色提示词唯一权威来源
@@ -141,16 +141,49 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
 
 ## Runner 子命令
 
+### 输入形式、输出与错误（0.4.1）
+
+- **参数形式**：`task-start`（`--human-instruction --boundary --invariants --acceptance --execution-mode [--execution-constraint]`，
+  与 `--contract <文件>` 二选一）、`register`（`--requirement ID=REF`，可重复）、`judge`（`--requirement --candidate --outcome
+  --observations --reasoning [--id] [--judgment-refs]`；批量用重复的 `--judgment "REQ|OUTCOME|OBS[,OBS]|REASONING"` 配一个
+  `--candidate`，原子、一次 revision）、`observe`（`--text` 与必填的 `--source LOCATOR`，可重复；`--id` 可选）、`task-update`
+  （`--record [ID=]KIND:TEXT`、`--supersedes`、`--milestone`、`--active-work`、`--pending`、`--clear-*`）。参数形式与 `--json` /
+  `--input`（UTF-8、UTF-8 BOM、UTF-16 BOM，由 Core `decode_input_bytes` 解码）走同一条校验路径，不可混用；`--json` 也接受 Core 的批量形式
+  `{"judgments":[...]}`、`{"observations":[...]}`（1–64 个，原子，一次 revision）。
+- **一条直接命令**：Hook 只识别单条直接调用；管道、`&&`、`;`、重定向、尾随 `#` 注释、多余换行、未加引号的反斜杠路径都会使身份无法追加，
+  此时 Hook 以原因和正确命令拒绝，Runner 则报告 `NATIVE_IDENTITY_UNKNOWN`。
+- **观察引用**：子代理自选的 id（如 `O1`）由适配层加 handoff 前缀存入 Core（`H1a2b3c4d.O1`），因此并行兄弟都叫 `O1` 也不会冲突；参数形式的
+  `judge --observations O1` 把裸 id 解析为唯一匹配的限定 id，歧义则要求写全；`--json` 必须使用限定 id。
+- **输出**：紧凑 JSON（无缩进，UTF-8）。写入类子命令（`task-update`、`register`、`judge`、`observe`、`artifact`、`close`）返回 Core 的紧凑确认：
+  `ok task_id revision status changed [appended] evidence`，其中 `evidence` 是开放证据的总数加有界条目（`next_offset` 翻页，Core
+  `evidence_summary`），不再回显完整 Task Context / Evidence Continuity；`appended` 带回自动分配的记录 / 判断 / 观察 id。子代理的 `observe`
+  只拿到 `evidence` 的总数（条目由 Controller 呈现）。`status` 默认为紧凑视图：Core 紧凑包（任务头、计数、开放证据）加 Authority
+  （mode、status、sha256，另有冻结的 `execution_constraint` 时一并显示）、`Dispatches`（按 `native_status` 计数，加每个未终止派发一条紧凑条目）、
+  `Records`（总数与最近 12 条、每条 ≤200 字符）；`status --view full` 与此前的完整输出一致；`--evidence-offset` 翻页，`--since-revision N`
+  追加 Core 的变化提示（`Changes Since`）。
+- **错误**：Runner 对 Core 的 `ThalirisError` 输出 Core 的 `error_envelope`（`ok:false, error, code, recovery, details`）；适配层的
+  `CODE: 说明` 错误也带 `code` 字段（`error` 文本不变）。revision 不符一律是 `TASK_REVISION_CONFLICT`（适配层原有的两处自造冲突已改用
+  `core.check_revision`），`details` 含 `current_revision` 与 `changes_since`（有界、非精确的变化提示和开放证据）。恢复流程：读
+  `details.current_revision` 与 `changes_since`，确认写入仍适用后用新 revision 重试一次，不必再读 `status`。严格 CAS 不变，不做自动 rebase。
+- **一次锁内完成**：此前 `task-update`（以及 `promote`、`document-maintain`、`artifact`、身份变更）先在一把锁内检查 Authority，释放后 Core 再在第二把锁内
+  写状态，写完才（锁外）重新锚定 Authority。并行派发时，另一个 Hook 可能在“状态已写、锚点未更新”的窗口里读到
+  `TASK_AUTHORITY_STATE_CHANGED`；检查与写入之间状态被改，也会被随后的重新锚定一并认可。现在由 `store.critical()` 在同一次持锁期间完成
+  Authority 检查、Core 写入与重新锚定（Core 的锁对同一根目录变为无操作，Core 自己的校验与 CAS 不变）；`mode` 的“无未决派发”检查也移入同一把锁
+  （`test_authority_checkpoint_happens_inside_the_lock`）。
+- **证据包去重**：证据包摘要与 `UserPromptSubmit` 共用不含 revision 的摘要。后台启动确认（`async_launched`）若摘要未变，只给一行
+  “Evidence unchanged: N unincorporated, M unresolved, task revision now R.”；子代理最终报告（前台完成）总是带完整包
+  （`test_parallel_background_launches_present_the_packet_once`）。
+
 ### 动态 Task Context（`task-update`）
 
-Controller 用 `task-update --base-revision <n> --json|--input` 维护任务的全局语义状态，直接映射 Core
+Controller 用 `task-update --base-revision <n>`（参数形式，或 `--json`）维护任务的全局语义状态，直接映射 Core
 `task_update`（actor 为 `controller`，revision CAS，写后重新锚定 Authority）：`records` 追加事实、决策、进展、
 未决事项（`kind` 自定；更正用 `supersedes` 追加新记录而不改写历史；`producer`/`revision` 由 Runner 提供，
 载荷自带即拒绝），`active_work` / `pending_results` 整体替换（Core 限 64 条、每条 ≤4096 字符及总字节上限），
 `current_milestone` ≤128 字符，`evidence_refs` 追加来源。子代理调用在 PreToolUse 与 Runner 两层均被拒绝。
 
-读出：`status` 除 Core 的 Active Work / Pending Results / milestone 外，增加最近 12 条未被取代的记录
-（`Current Records`，文本截断）与总数；SessionStart（startup/resume/compact/clear 且会话已关联任务）注入有界摘要
+读出：`status`（紧凑）给出 Active Work / Pending Results / milestone 以及最近 12 条未被取代的记录（`Records`，每条 ≤200 字符）与总数；
+`status --view full` 的 `Current Records` / `Current Record Count` 保持原样（文本 ≤600 字符）；SessionStart（startup/resume/compact/clear 且会话已关联任务）注入有界摘要
 （≤6000 字符：里程碑、Active Work、Pending Results、最近记录）；新会话 `attach` 返回同一摘要。摘要是
 Controller 记录的历史，不是新的验证。
 
@@ -286,7 +319,7 @@ PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、
 | H138、H139 | 在含多个子仓的父目录 `bootstrap` 会把父目录当受管项目、造假 marker | 非仓库目录下发现嵌套仓库即 `AMBIGUOUS_PROJECT_ROOT`，要求 `--root`；Hook 依赖显式会话关联而非 cwd（`test_nested_repository_root_is_never_guessed`） |
 | H094、H098 | 锚定用户的 `.claude/settings.json`：合法编辑被判篡改，恢复会回滚用户字节 | 只锚定 `.context/config.json`；child 写设置仍被拒（`test_user_settings_edit_does_not_trip_authority`） |
 | H055、H057、H097 | 运行时损坏时 Hook 崩溃，受管派发静默放行，或反过来锁死一切 | 启动器捕获失败：普通工作透明；仅拒绝受管派发与 Reviewer 写（`test_broken_runtime_refuses_only_unguardable_actions`） |
-| H132、证据噪声 | 每回合重复注入同一证据包，或压缩后看不到 | 只在变化/压缩/恢复后注入；Agent 结果送达时总是呈现；`close` 输出附带证据包（`test_evidence_reaches_notification_turns_without_repeating`） |
+| H132、证据噪声 | 每回合重复注入同一证据包，或压缩后看不到 | 只在变化/压缩/恢复后注入；子代理最终报告送达时总是呈现，后台启动确认摘要未变则只给一行；写入与 `close` 的输出附带紧凑证据摘要（`test_evidence_reaches_notification_turns_without_repeating`、`test_parallel_background_launches_present_the_packet_once`） |
 | H027、H111 | 只记录请求的模型，把配置当运行事实 | 记录 `requested_model`/`requested_effort` 与 Host 观测的 `observed_model`/`observed_tools`（`test_actual_tool_set_is_collected_after_the_child_stops`、`test_effort_is_validated_and_recorded`）；有效 effort 无 Host 记录，保持 UNKNOWN |
 | H059 | `--contract` 被传入 JSON 文本时报错难懂 | 明确 `CONTRACT_FILE_PATH_REQUIRED` |
 | H084 | 测试断言提示词措辞，改文案就炸 CI | 测试只断言协议性标记（命令、marker、报告标题、agent 类型）与生成同步 |

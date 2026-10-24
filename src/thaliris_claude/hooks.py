@@ -98,25 +98,39 @@ def _dispatched_binding(payload: dict, agent_id: str | None, agent_type: object)
         return None
 
 
-def evidence_packet(root: Path, task_id: str) -> str | None:
+def evidence_state(root: Path, task_id: str) -> dict | None:
+    """Open evidence for the Controller: the packet text and a digest of its content.
+
+    The digest leaves out the task revision (every dispatch bumps it), so "nothing new to judge" keeps the same
+    digest however many dispatches were reserved in between. UserPromptSubmit and PostToolUse compare the same digest.
+    """
     core.select_task(root, task_id)
-    status = core.task_status(root)
-    continuity = status["Evidence Continuity"]
-    if not (continuity["unincorporated_total"] or continuity["unresolved_judgments_total"]):
+    status = core.task_status(root, view="compact")
+    evidence = status["Evidence"]
+    if not (evidence["unincorporated_total"] or evidence["unresolved_judgments_total"]):
         return None
-    lines = [f"Thaliris evidence for task {task_id} (task revision now {status['Task']['revision']}): "
-             f"{continuity['unincorporated_total']} observation(s) not yet incorporated into a requirement judgment, "
-             f"{continuity['unresolved_judgments_total']} unresolved repair/unknown judgment(s)."]
-    for item in continuity["unincorporated"]:
+    counts = (f"{evidence['unincorporated_total']} observation(s) not yet incorporated into a requirement judgment, "
+              f"{evidence['unresolved_judgments_total']} unresolved repair/unknown judgment(s)")
+    lines = []
+    for item in evidence["unincorporated"]:
         lines.append(f"- observation {item['observation_id']} → requirement {item['requirement_ref'] or '(unassigned)'} "
                      f"(candidate {item['candidate']}, handoff {item['handoff_id']})")
-    for item in continuity["unresolved_judgments"]:
+    for item in evidence["unresolved_judgments"]:
         lines.append(f"- judgment {item['id']}: {item['outcome']} for {item['requirement_ref']} (candidate {item['candidate']})")
-    if continuity["next_offset"] is not None:
-        lines.append(f"- … more with `status --evidence-offset {continuity['next_offset']}`")
+    if evidence["next_offset"] is not None:
+        lines.append(f"- … more with `status --evidence-offset {evidence['next_offset']}`")
     lines.append("Before you call a requirement satisfied or close the task, reassess each item for the current candidate "
                  "(satisfied / unknown / repair / no-current-impact) with `judge`. Reading or forwarding it is not a disposition.")
-    return "\n".join(lines)
+    revision = status["Task"]["revision"]
+    body = "\n".join(lines)
+    return {"revision": revision, "counts": counts, "unincorporated": evidence["unincorporated_total"],
+            "unresolved": evidence["unresolved_judgments_total"], "digest": counts + "\n" + body,
+            "text": f"Thaliris evidence for task {task_id} (task revision now {revision}): {counts}.\n" + body}
+
+
+def evidence_packet(root: Path, task_id: str) -> str | None:
+    evidence = evidence_state(root, task_id)
+    return evidence["text"] if evidence else None
 
 
 # ---------------------------------------------------------------- PreToolUse
@@ -443,10 +457,17 @@ def post_tool_use(payload: dict) -> dict | None:
         if summary["handoff_id"] is None:
             lines.append("This dispatch has no evidence association, so its observations could not persist. "
                          "If they matter, import them with `observe --handoff-id` after `register`ing a handoff.")
-    packet = evidence_packet(root, task_id)
-    if packet:
-        store.packet_is_new(payload.get("session_id"), packet)  # result delivery always shows it; remember it
-        lines.append(packet)
+    evidence = evidence_state(root, task_id)
+    if evidence:
+        # A child's final report is where the Controller judges: always show the packet (and remember it). A background
+        # launch acknowledgement carries no result, and several parallel launches would repeat the same packet: show
+        # it only when it differs from the one this Controller last saw (UserPromptSubmit shares the digest).
+        is_new = store.packet_is_new(payload.get("session_id"), evidence["digest"])
+        if is_new or status != "async_launched":
+            lines.append(evidence["text"])
+        else:
+            lines.append(f"Evidence unchanged: {evidence['unincorporated']} unincorporated, {evidence['unresolved']} unresolved, "
+                         f"task revision now {evidence['revision']}.")
     return _context("PostToolUse", "\n".join(lines)) if lines else None
 
 
@@ -499,7 +520,8 @@ def subagent_start(payload: dict) -> dict | None:
                 if record is not None:
                     lines.append(f"Your Thaliris handoff is {record['id']} (candidate {record['candidate']}, "
                                  f"requirement refs {record['requirement_refs'] or 'none — unassigned Scanner evidence'}). "
-                                 f"Record decision-changing local facts with `{runner_command()} observe --json '<observation JSON>'`.")
+                                 f"Record decision-changing local facts with `{runner_command()} observe --text \"<what you found>\" "
+                                 "--source \"<path:line, URL or command>\"` (one direct command; --source is required and may repeat).")
     if entry is None:
         lines.append("Your evidence association is confirmed from the Host's own record when you first run the runner. "
                      "If `observe` refuses, keep decision-changing observations, with their sources, in your final report.")
@@ -540,7 +562,14 @@ subagents own the local working sets you hand them.
 - Readonly and isolation boundaries hold in every mode; a damaged management layer
   grants nothing extra. Live Host maintenance needs separate human authority.
 - Runner: `{runner}` (in PowerShell, prefix it with `& `). Run it as one direct
-  command; the hooks add your identity.
+  command (no pipes, `&&`, `;`, trailing comment, extra line or unquoted backslash
+  path); the hooks add your identity. Pass text as quoted flags (`task-start`,
+  `register`, `judge`, `observe`, `task-update` have flag forms; no temporary JSON
+  file). Output is compact JSON; failures carry `code`, `recovery` and `details`.
+- Writes are compare-and-set on the task revision: use the `revision` a write or
+  "task revision now N" reports as the next `--base-revision`; on
+  TASK_REVISION_CONFLICT read `details.current_revision` and `details.changes_since`,
+  then retry once. `status` is compact; `status --view full` shows everything.
 - Durable navigation lives in `.agent-memory/INDEX.md` and `.milestones/INDEX.md`;
   read them explicitly when a managed task needs them. A project identity, when one
   exists, is read on demand with the runner's `identity-status` / `identity-get`."""
@@ -663,10 +692,10 @@ def user_prompt_submit(payload: dict) -> dict | None:
             for entry in ctx["lifecycle"]["dispatches"]:
                 if entry.get("agent_id") and entry["native_status"] in store.TERMINAL_STATUSES and not entry.get("observed_tools"):
                     store.record_host_facts(ctx, entry, payload.get("transcript_path"))
-    packet = evidence_packet(*association) if association else None
-    if not packet or not store.packet_is_new(payload.get("session_id"), packet):
+    evidence = evidence_state(*association) if association else None
+    if not evidence or not store.packet_is_new(payload.get("session_id"), evidence["digest"]):
         return None
-    return _context("UserPromptSubmit", packet)
+    return _context("UserPromptSubmit", evidence["text"])
 
 
 HANDLERS = {
