@@ -151,9 +151,13 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
   `--input`（UTF-8、UTF-8 BOM、UTF-16 BOM，由 Core `decode_input_bytes` 解码）走同一条校验路径，不可混用；`--json` 也接受 Core 的批量形式
   `{"judgments":[...]}`、`{"observations":[...]}`（1–64 个，原子，一次 revision）。
 - **一条直接命令**：Hook 只识别单条直接调用；管道、`&&`、`;`、重定向、尾随 `#` 注释、多余换行、未加引号的反斜杠路径都会使身份无法追加，
-  此时 Hook 以原因和正确命令拒绝，Runner 则报告 `NATIVE_IDENTITY_UNKNOWN`。
+  此时 Hook 以原因和正确命令拒绝，Runner 则报告 `NATIVE_IDENTITY_UNKNOWN`。分类按工具区分方言：PowerShell 没有反斜杠转义，POSIX 读法与它不一致的写法
+  一律不算直接命令——引号前的反斜杠、未加引号的 `\;` `\|` 等、会成为引号定界符的弯引号、`--%`——对非 Runner 命令同样按“无法判断，视为写入”处理，
+  所以只读子代理不能借此在第二条 PowerShell 语句里写文件。双引号内的 `$name`、`${...}`、`$?`（PowerShell 另含 `$$`、`$^`）会被 shell 悄悄替换，
+  因此也被拒绝并提示改用单引号；单引号内的 `$` 保持字面。
 - **观察引用**：子代理自选的 id（如 `O1`）由适配层加 handoff 前缀存入 Core（`H1a2b3c4d.O1`），因此并行兄弟都叫 `O1` 也不会冲突；参数形式的
-  `judge --observations O1` 把裸 id 解析为唯一匹配的限定 id，歧义则要求写全；`--json` 必须使用限定 id。
+  `judge --observations O1` 只在“同一 candidate、且观察若限定了 requirement 则包含被判定的 requirement”的观察里找唯一匹配的限定 id，零个或多个
+  匹配都保持裸 id，由 Core 拒绝并给出建议；解析结果以 `observation_refs`（按 judgment id）回显在响应里；`--json` 必须使用限定 id。
 - **输出**：紧凑 JSON（无缩进，UTF-8）。写入类子命令（`task-update`、`register`、`judge`、`observe`、`artifact`、`close`）返回 Core 的紧凑确认：
   `ok task_id revision status changed [appended] evidence`，其中 `evidence` 是开放证据的总数加有界条目（`next_offset` 翻页，Core
   `evidence_summary`），不再回显完整 Task Context / Evidence Continuity；`appended` 带回自动分配的记录 / 判断 / 观察 id。子代理的 `observe`
@@ -163,8 +167,10 @@ python scripts/vendor_core.py --source ../../core/Thaliris --commit <Core 提交
   追加 Core 的变化提示（`Changes Since`）。
 - **错误**：Runner 对 Core 的 `ThalirisError` 输出 Core 的 `error_envelope`（`ok:false, error, code, recovery, details`）；适配层的
   `CODE: 说明` 错误也带 `code` 字段（`error` 文本不变）。revision 不符一律是 `TASK_REVISION_CONFLICT`（适配层原有的两处自造冲突已改用
-  `core.check_revision`），`details` 含 `current_revision` 与 `changes_since`（有界、非精确的变化提示和开放证据）。恢复流程：读
-  `details.current_revision` 与 `changes_since`，确认写入仍适用后用新 revision 重试一次，不必再读 `status`。严格 CAS 不变，不做自动 rebase。
+  `core.check_revision`），`details` 含 `current_revision` 与 `changes_since`（有界、非精确的变化提示和开放证据：`exact:false`；`recent` 是每类最近 k 条，同一
+  revision 里批量写入的条目可能漏掉；被整体替换的字段 Active Work、Pending Results、milestone、status 以及 sources 不被追踪）。恢复流程：查看
+  `changes_since`（含其开放证据摘要），确认写入仍适用后用 `details.current_revision` 重试一次；需要 Active Work、Pending Results 或提示未覆盖的内容时再读
+  `status`（紧凑视图）。严格 CAS 不变，不做自动 rebase。
 - **一次锁内完成**：此前 `task-update`（以及 `promote`、`document-maintain`、`artifact`、身份变更）先在一把锁内检查 Authority，释放后 Core 再在第二把锁内
   写状态，写完才（锁外）重新锚定 Authority。并行派发时，另一个 Hook 可能在“状态已写、锚点未更新”的窗口里读到
   `TASK_AUTHORITY_STATE_CHANGED`；检查与写入之间状态被改，也会被随后的重新锚定一并认可。现在由 `store.critical()` 在同一次持锁期间完成

@@ -497,7 +497,10 @@ def run(args) -> dict:
         with store.transaction(root, task_id) as ctx:
             payload = _payload(args, ctx["state"])
             appended = store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
-            return _write_response(ctx["state"], ["evidence_continuity"], appended=appended)
+            response = _write_response(ctx["state"], ["evidence_continuity"], appended=appended)
+            if name == "judge":  # echo what a bare id resolved to, per judgment
+                response["observation_refs"] = {item["id"]: item["observation_refs"] for item in payload.get("judgments") or [payload]}
+            return response
     if name == "dispose":
         with store.transaction(root, task_id) as ctx:
             matches = [item for item in ctx["lifecycle"]["dispatches"]

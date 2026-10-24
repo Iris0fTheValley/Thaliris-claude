@@ -13,10 +13,11 @@ import pytest
 from thaliris_claude import guards, hooks
 
 from .conftest import SESSION, run_cli, run_hook
-from .test_flow import RUNNER, OBSERVATION, _base, _decision, _dispatch, _handoff, _reason, _result, _shell, _start, _stop
+from .test_flow import RUNNER, OBSERVATION, _base, _decision, _dispatch, _handoff, _reason, _result, _shell, _start, _stop, _tool
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = {"agent_id": "agent-a", "agent_type": "thaliris:investigator"}
+REVIEWER = {"agent_id": "rev", "agent_type": "thaliris:reviewer"}
 
 
 def _revision() -> str:
@@ -343,3 +344,33 @@ def test_dispatch_ack_and_evidence_packet_state_the_task_revision(task):
     assert f"Task revision now {revision}" in context and "--base-revision" in context
     assert f"task revision now {revision}" in context  # the evidence packet header
     assert handoff in context
+
+
+# ------------------------------------------------------------ PowerShell is not POSIX; no silent $ expansion
+
+def _on(task, tool, command, **who):
+    return run_hook("PreToolUse", _tool(task, tool, {"command": command}, **who))
+
+
+def test_powershell_runner_call_cannot_hide_a_second_command(task):
+    runner = hooks.runner_command()
+    repro = runner + r' observe --text "abc\" ; Set-Content stolen.txt x ; \"" --source a.py:1'
+    for who in ({}, CHILD):  # Controller and readonly child alike: no identity injection, no approval
+        denied = _on(task, "PowerShell", repro, **who)
+        assert _decision(denied) == "deny" and "backslash" in _reason(denied), denied
+        assert _decision(_on(task, "PowerShell", runner + r" status a\; Write-Output x", **who)) == "deny"
+    # Without the runner, a readonly child still gets the write refusal (the POSIX reader sees one harmless string).
+    assert _decision(_on(task, "PowerShell", r'Write-Output "a\" ; Set-Content f x ; \"b"', **REVIEWER)) == "deny"
+    # Ordinary quoted text stays direct and approved on PowerShell, and the Bash reading is unchanged.
+    ok = _on(task, "PowerShell", runner + ' observe --text "中文 说明" --source a.py:1')
+    assert ok["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert ok["hookSpecificOutput"]["updatedInput"]["command"].endswith(f"--native-session {SESSION}")
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_dollar_variable_in_double_quoted_prose_is_denied_with_guidance(task, tool):
+    prose = "costs $5 and $HOME"
+    denied = _on(task, tool, f'{hooks.runner_command()} observe --text "{prose}" --source a.py:1')
+    assert _decision(denied) == "deny" and "single quotes" in _reason(denied) and "$name" in _reason(denied)
+    single = _on(task, tool, f"{hooks.runner_command()} observe --text '{prose}' --source a.py:1")
+    assert single["hookSpecificOutput"]["updatedInput"]["command"].endswith(f"--native-session {SESSION}")

@@ -51,23 +51,82 @@ def norm_path(value: str) -> str:
     return text.casefold() if os.name == "nt" else text
 
 
-def dynamic_expansion(command: str) -> bool:
+# PowerShell reads curly quotes as quote delimiters, treats a backslash as an ordinary character (its escape is the
+# backtick) and expands `$name` in double quotes; the POSIX reader below sees none of that. Bash expands `$name` too.
+_PS_SINGLE = frozenset("'\u2018\u2019\u201a\u201b")
+_PS_DOUBLE = frozenset('"\u201c\u201d\u201e\u201f')
+_BASH_VARIABLE = re.compile(r"[A-Za-z_{?0-9]")
+_PS_VARIABLE = re.compile(r"[A-Za-z_{?$^0-9]")
+_PS_META = frozenset(" \t\r\n;&|<>()#$`'\"")
+
+
+def _quote(char: str, powershell: bool) -> str | None:
+    if powershell:
+        return "'" if char in _PS_SINGLE else '"' if char in _PS_DOUBLE else None
+    return char if char in "'\"" else None
+
+
+def _scan(command: str, powershell: bool) -> set[str]:
+    """What the shell evaluates outside single quotes: `expansion` (backticks, `$(`) and `variable` (`$name`, `${`, `$?`
+    ... inside double quotes, which silently rewrites prose)."""
+    found: set[str] = set()
+    single = double = False
+    index = 0
+    pattern = _PS_VARIABLE if powershell else _BASH_VARIABLE
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and not single and not powershell and index + 1 < len(command):
+            index += 2
+            continue
+        kind = _quote(char, powershell)
+        if kind == "'" and not double:
+            single = not single
+        elif kind == '"' and not single:
+            double = not double
+        elif not single and (char == "`" or command.startswith("$(", index)):
+            found.add("expansion")
+        elif double and char == "$" and pattern.match(command, index + 1):
+            found.add("variable")
+        index += 1
+    return found
+
+
+def dynamic_expansion(command: str, powershell: bool = False) -> bool:
     """True when backticks or $( are evaluated (outside single quotes)."""
+    return "expansion" in _scan(command, powershell)
+
+
+def quoted_variable(command: str, powershell: bool = False) -> bool:
+    """True when a double-quoted string holds a `$name`-style variable the shell would expand."""
+    return "variable" in _scan(command, powershell)
+
+
+def dialect_problems(command: str) -> set[str]:
+    """PowerShell syntax that the POSIX reader (`tokens`) would read differently, so its verdict cannot be trusted.
+
+    `escape`: a backslash before a quote or shell character (POSIX escapes it, PowerShell does not, so a quote or
+    operator PowerShell acts on looks like data); `smart_quote`: a curly quote that is a PowerShell delimiter;
+    `stop_parsing`: the `--%` token.
+    """
+    found: set[str] = set()
     single = double = False
     index = 0
     while index < len(command):
         char = command[index]
-        if char == "\\" and not single and index + 1 < len(command):
-            index += 2
-            continue
-        if char == "'" and not double:
+        kind = _quote(char, True)
+        nxt = command[index + 1:index + 2]
+        if char == "\\" and nxt and ((double and nxt == '"') or (not single and not double and nxt in _PS_META)):
+            found.add("escape")
+        if kind is not None and char not in "'\"" and (not single and not double or kind == "'" and single or kind == '"' and double):
+            found.add("smart_quote")
+        if kind == "'" and not double:
             single = not single
-        elif char == '"' and not single:
+        elif kind == '"' and not single:
             double = not double
-        elif not single and (char == "`" or command.startswith("$(", index)):
-            return True
+        elif not single and not double and command.startswith("--%", index) and (index == 0 or command[index - 1].isspace())                 and (index + 3 == len(command) or command[index + 3].isspace()):
+            found.add("stop_parsing")
         index += 1
-    return False
+    return found
 
 
 def tokens(command: str) -> list[str] | None:
@@ -83,7 +142,7 @@ def _is_operator(token: str) -> bool:
     return bool(token) and all(char in "();<>|&" for char in token)
 
 
-def shell_layout(command: str) -> set[str]:
+def shell_layout(command: str, powershell: bool = False) -> set[str]:
     """Shell structure `shlex` hides: an unquoted `#` comment and unquoted line breaks.
 
     `shlex` drops comments and treats a newline as whitespace, so `runner status # note`
@@ -97,16 +156,17 @@ def shell_layout(command: str) -> set[str]:
     index = 0
     while index < len(text):
         char = text[index]
-        if char == "\\" and not single and index + 1 < len(text):
+        if char == "\\" and not single and not powershell and index + 1 < len(text):
             nxt = text[index + 1]
             if nxt == "\r" and text[index + 2:index + 3] == "\n":
                 index += 3  # line continuation
             else:
                 index += 2
             continue
-        if char == "'" and not double:
+        kind = _quote(char, powershell)
+        if kind == "'" and not double:
             single = not single
-        elif char == '"' and not single:
+        elif kind == '"' and not single:
             double = not double
         elif not single and not double:
             if char in "\r\n":
@@ -117,12 +177,13 @@ def shell_layout(command: str) -> set[str]:
     return found
 
 
-def runner_invocation(command: str, runner: str) -> dict | None:
+def runner_invocation(command: str, runner: str, *, powershell: bool = False) -> dict | None:
     """Recognize the Thaliris runner; return its subcommand and whether it is direct.
 
     A direct invocation is optional interpreter tokens, the runner path and
     plain arguments: no operators, redirections, expansions, comments, extra
     lines or wrappers. `problems` names why a recognised invocation is not direct.
+    `powershell` selects PowerShell's quoting rules; anything the POSIX reader would read differently is not direct.
     """
     parts = tokens(command.strip().removeprefix("& ").removeprefix("&"))
     if parts is None:
@@ -136,15 +197,20 @@ def runner_invocation(command: str, runner: str) -> dict | None:
     # Only an interpreter may precede the runner: `python`, `py -3`, or an absolute path to one.
     prefix_ok = all(re.fullmatch(r"-3(\.\d+)?", item) or re.fullmatch(r"(py|python(3(\.\d+)?)?)(\.exe)?",
                     item.replace("\\", "/").rsplit("/", 1)[-1], re.IGNORECASE) for item in parts[:index])
-    problems = sorted(shell_layout(command))
+    problems = sorted(shell_layout(command, powershell))
     if len(indexes) > 1:
         problems.append("repeated")
     if not prefix_ok:
         problems.append("prefix")
     if any(_is_operator(item) for item in parts):
         problems.append("operator")
-    if dynamic_expansion(command):
+    found = _scan(command, powershell)
+    if "expansion" in found:
         problems.append("expansion")
+    if "variable" in found:
+        problems.append("variable")
+    if powershell:
+        problems.extend(sorted(dialect_problems(command)))
     subcommand = next((item for item in rest if not item.startswith("-")), None)
     result = {"direct": not problems, "subcommand": subcommand,
               "forged_identity": any(item.split("=", 1)[0] in IDENTITY_FLAGS for item in rest)}
@@ -209,9 +275,9 @@ def _segments(parts: list[str]) -> list[list[str]]:
     return segments
 
 
-def obvious_write(command: str) -> bool:
+def obvious_write(command: str, powershell: bool = False) -> bool:
     """Best-effort detection of shell commands that write files or Git state."""
-    if dynamic_expansion(command):
+    if dynamic_expansion(command, powershell) or (powershell and dialect_problems(command)):
         return True  # cannot see what runs; a readonly child gets the refusal
     parts = tokens(command)
     if parts is None:
@@ -253,13 +319,16 @@ def mentions_protected(command: str) -> bool:
     return any(marker.replace("\\", "/").casefold() in text for marker in _PROTECTED_MARKERS)
 
 
-def direct_core_call(command: str) -> bool:
+def direct_core_call(command: str, powershell: bool = False) -> bool:
     """Children must go through the runner, never the raw Core CLI or adapter module."""
-    parts = tokens(command) or command.split()
-    for index, item in enumerate(parts):
-        name = Path(item.replace("\\", "/")).name.casefold().removesuffix(".exe")
-        if name == "thaliris-core" or (index and parts[index - 1] == "-m" and item.split(".")[0] in {"thaliris", "thaliris_claude"}):
-            return True
+    readings = [tokens(command) or command.split()]
+    if powershell and dialect_problems(command):
+        readings.append(command.split())  # the POSIX reading cannot be trusted; also look at the plain words
+    for parts in readings:
+        for index, item in enumerate(parts):
+            name = Path(item.replace("\\", "/")).name.casefold().removesuffix(".exe")
+            if name == "thaliris-core" or (index and parts[index - 1] == "-m" and item.split(".")[0] in {"thaliris", "thaliris_claude"}):
+                return True
     return False
 
 

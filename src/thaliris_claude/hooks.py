@@ -260,6 +260,12 @@ _INDIRECT_CAUSES = {
     "newline": "more than one line (a line break outside quotes starts a separate command)",
     "operator": "a pipe, `&&`, `;`, `&` or redirection",
     "expansion": "command substitution or backticks outside single quotes",
+    "variable": "a `$name`, `${...}` or `$?` inside double quotes, which the shell silently replaces (put prose containing `$` "
+                "in single quotes)",
+    "escape": "a backslash before a quote or shell character: PowerShell does not escape with a backslash, so PowerShell would "
+              "read the command differently from the adapter (use single quotes; double a literal apostrophe as `''`)",
+    "smart_quote": "a curly quote, which PowerShell treats as a quote delimiter (use ASCII quotes, or 「」 in the text)",
+    "stop_parsing": "the PowerShell `--%` stop-parsing token",
     "prefix": "a wrapper or other words before the interpreter and runner path",
     "repeated": "the runner path appearing more than once",
     "unparseable": "unbalanced quotes",
@@ -271,8 +277,8 @@ def _indirect_reason(problems: list[str]) -> str:
     cause = "; ".join(found) if found else "something other than a plain interpreter, runner path and arguments"
     return (f"Run the Thaliris runner as one direct command. This one is not direct: it has {cause}. Use exactly "
             f"`{runner_command()} <command> <arguments>` with no pipes, `&&`, redirection, comments, line breaks, variables "
-            "or command substitution. Put prose in a quoted argument, or use the runner's flag forms "
-            "(`--text`, `--reasoning`, ...), instead of writing JSON files.")
+            "or command substitution. Put prose in a single-quoted argument (`$`, backslashes and backticks are literal "
+            "there), or use the runner's flag forms (`--text`, `--reasoning`, ...), instead of writing JSON files.")
 
 
 def _runner_miss_reason(misses: list[dict]) -> str:
@@ -295,7 +301,8 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         return None
     caller = _caller(payload)
     is_child, caller_role, agent_id = caller["child"], caller["role"], caller["agent_id"]
-    invocation = guards.runner_invocation(command, runner_path())
+    powershell = payload.get("tool_name") == "PowerShell"
+    invocation = guards.runner_invocation(command, runner_path(), powershell=powershell)
     if invocation is None:
         misses = guards.runner_misses(command, runner_path())
         if misses:
@@ -327,9 +334,9 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
                           permissionDecisionReason="Thaliris runner, verified as one direct invocation of this plugin's own CLI")
         return {"hookSpecificOutput": output}
     if is_child:
-        if guards.direct_core_call(command):
+        if guards.direct_core_call(command, powershell):
             return _deny("Children use the Thaliris runner, not the raw Core CLI or adapter module.")
-        writes = guards.obvious_write(command)
+        writes = guards.obvious_write(command, powershell)
         if writes and caller["writes"] is False:
             return _deny(f"The {caller_role} role is non-writing; this command looks like a write. Report what should change instead.")
         if writes and guards.mentions_protected(command):
@@ -338,10 +345,10 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
             return _deny("Your handoff was disposed by the Controller; further writes are fenced.")
         return None
     if store.resolve_session(payload.get("session_id")) is not None:
-        if guards.direct_core_call(command) and not any(name in command for name in _READ_ONLY_CORE):
+        if guards.direct_core_call(command, powershell) and not any(name in command for name in _READ_ONLY_CORE):
             return _deny("In a managed task, mutate the ledger through the Thaliris runner so authority stays anchored.")
         ledger = (".context/tasks", ".context/state.json", store.LIFECYCLE_NAME, store.ROLES_NAME)
-        if guards.obvious_write(command) and any(name.casefold() in command.replace("\\", "/").casefold() for name in ledger):
+        if guards.obvious_write(command, powershell) and any(name.casefold() in command.replace("\\", "/").casefold() for name in ledger):
             return _deny("Hand edits to the task ledger or lifecycle break authority anchoring; use the runner.")
     return None
 
@@ -565,11 +572,15 @@ subagents own the local working sets you hand them.
   command (no pipes, `&&`, `;`, trailing comment, extra line or unquoted backslash
   path); the hooks add your identity. Pass text as quoted flags (`task-start`,
   `register`, `judge`, `observe`, `task-update` have flag forms; no temporary JSON
-  file). Output is compact JSON; failures carry `code`, `recovery` and `details`.
+  file); text with `$`, backslashes or curly quotes goes in single quotes (double
+  quotes expand `$name`). Output is compact JSON; failures carry `code`, `recovery`
+  and `details`.
 - Writes are compare-and-set on the task revision: use the `revision` a write or
   "task revision now N" reports as the next `--base-revision`; on
-  TASK_REVISION_CONFLICT read `details.current_revision` and `details.changes_since`,
-  then retry once. `status` is compact; `status --view full` shows everything.
+  TASK_REVISION_CONFLICT review `details.changes_since` (an approximate hint, not a
+  delta: Active Work, Pending Results, milestone and status are untracked); if your
+  write still applies, retry once with `details.current_revision`, and read `status`
+  for anything the hint does not cover. `status --view full` shows everything.
 - Durable navigation lives in `.agent-memory/INDEX.md` and `.milestones/INDEX.md`;
   read them explicitly when a managed task needs them. A project identity, when one
   exists, is read on demand with the runner's `identity-status` / `identity-get`."""

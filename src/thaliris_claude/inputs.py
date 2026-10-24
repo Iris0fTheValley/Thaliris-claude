@@ -47,7 +47,7 @@ def add_flags(command: argparse.ArgumentParser, name: str) -> None:
         add("--requirement", help="flag form: the requirement id this judgment is about")
         add("--candidate", help="flag form: the candidate id")
         add("--outcome", choices=_OUTCOMES, help="flag form")
-        add("--observations", help="flag form: comma-separated observation ids (a unique suffix such as O1 is accepted)")
+        add("--observations", help="flag form: comma-separated observation ids (a bare id such as O1 is accepted when exactly one observation of this candidate, scoped to this requirement, ends in it)")
         add("--reasoning", help="flag form: why the outcome follows from those observations")
         add("--judgment-refs", dest="judgment_refs", help="flag form: comma-separated earlier judgment ids this one addresses")
         add("--id", dest="judgment_id", help="flag form: judgment id (default: the next free J<n>)")
@@ -117,17 +117,24 @@ def _label(value: str, what: str) -> str:
     return value
 
 
-def _resolve_refs(names: list[str], known: list[str]) -> list[str]:
-    """A bare observation id such as O1 resolves to the one handoff-qualified id (`H1a2b3c4d.O1`) it is a suffix of."""
+def _resolve_refs(names: list[str], observations: list[dict], candidate: str | None, requirement: str | None) -> list[str]:
+    """A bare observation id such as O1 resolves to the one handoff-qualified id (`H1a2b3c4d.O1`) it is a suffix of.
+
+    Only observations of the judged candidate that are not scoped to other requirements are eligible; with zero or several
+    eligible matches the bare id is left for Core to refuse, with its suggestions.
+    """
+    known = {str(item["id"]) for item in observations}
     refs = []
     for ref in names:
-        matches = [item for item in known if item.endswith("." + ref)]
+        matches = [str(item["id"]) for item in observations
+                   if str(item["id"]).endswith("." + ref) and item.get("candidate") == candidate
+                   and (not item.get("requirement_refs") or requirement in item["requirement_refs"])]
         refs.append(ref if ref in known or len(matches) != 1 else matches[0])
     return refs
 
 
 def _judge(args, state: dict) -> dict:
-    known = [str(item["id"]) for item in (state.get("evidence_continuity") or {}).get("observations", [])]
+    known = [item for item in (state.get("evidence_continuity") or {}).get("observations", []) if isinstance(item, dict) and "id" in item]
     if args.judgment:
         single = [flag for dest, flag in (("requirement", "--requirement"), ("outcome", "--outcome"), ("observations", "--observations"),
                                           ("reasoning", "--reasoning"), ("judgment_id", "--id"), ("judgment_refs", "--judgment-refs"))
@@ -141,13 +148,13 @@ def _judge(args, state: dict) -> dict:
             if len(parts) != 4 or not all(parts) or parts[1] not in _OUTCOMES:
                 raise ValueError("INVALID_JUDGMENT: use REQ|OUTCOME|OBS[,OBS]|REASONING with OUTCOME one of " + ", ".join(_OUTCOMES))
             judgments.append({"id": next_free(ids, "", "J"), "candidate": args.candidate, "requirement_ref": parts[0],
-                              "observation_refs": _resolve_refs(_names(parts[2]), known), "outcome": parts[1], "reasoning": parts[3]})
+                              "observation_refs": _resolve_refs(_names(parts[2]), known, args.candidate, parts[0]), "outcome": parts[1], "reasoning": parts[3]})
         return {"judgments": judgments}
     _need(args, "judge", (("requirement", "--requirement"), ("candidate", "--candidate"), ("outcome", "--outcome"),
                           ("observations", "--observations"), ("reasoning", "--reasoning")))
     payload = {"id": _label(args.judgment_id, "judgment id") if args.judgment_id else next_free(used_ids(state), "", "J"),
                "candidate": args.candidate, "requirement_ref": args.requirement,
-               "observation_refs": _resolve_refs(_names(args.observations), known),
+               "observation_refs": _resolve_refs(_names(args.observations), known, args.candidate, args.requirement),
                "outcome": args.outcome, "reasoning": args.reasoning}
     if args.judgment_refs:
         payload["judgment_refs"] = _names(args.judgment_refs)

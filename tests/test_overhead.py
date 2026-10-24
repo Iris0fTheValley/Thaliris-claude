@@ -155,6 +155,40 @@ def test_sibling_observations_with_the_same_id_stay_distinct_and_judge_resolves_
     assert run_cli("get", "J1")[1]["object"]["observation_refs"] == [f"{second}.O2", f"{first}.O1"]
 
 
+def _observation_for(task, tool_use_id, candidate, requirements):
+    """A fresh investigator, handed `candidate`/`requirements`, makes one observation; returns its qualified id."""
+    from .test_flow import _agent_call
+    prompt = "Look.\nthaliris-evidence: " + json.dumps({"candidate": candidate, "requirement_refs": requirements})
+    handoff = _handoff(run_hook("PreToolUse", _agent_call(task, tool_use_id, "thaliris:investigator", prompt)))
+    _start(task, f"agent-{tool_use_id}", "thaliris:investigator", tool_use_id)
+    code, observed = run_cli("observe", "--text", "x", "--source", "app.py:1", agent=f"agent-{tool_use_id}")
+    assert code == 0 and observed["observation_id"] == f"{handoff}.O1", observed
+    return observed["observation_id"]
+
+
+def test_bare_observation_ids_resolve_only_within_the_judged_candidate_and_requirement(task):
+    run_cli("register", "--base-revision", str(_revision()), "--requirement", "R2=second")
+    other_candidate = _observation_for(task, "tu1", "C2", ["R1"])
+    judge = ["judge", "--candidate", "C1", "--requirement", "R1", "--outcome", "unknown", "--reasoning", "r"]
+    # The only suffix match belongs to another candidate: it is not chosen, Core refuses the bare id.
+    revision = _revision()
+    code, refused = run_cli(*judge[:1], "--base-revision", str(revision), *judge[1:], "--observations", "O1")
+    assert code == 2 and refused.get("code") and _revision() == revision
+    first = _observation_for(task, "tu2", "C1", ["R1"])
+    other_requirement = _observation_for(task, "tu3", "C1", ["R2"])
+    # Three suffix matches, one for this candidate and requirement: it resolves, and the response echoes it per judgment.
+    revision = _revision()
+    code, judged = run_cli("judge", "--base-revision", str(revision), *judge[1:], "--observations", "O1")
+    assert code == 0, judged
+    assert judged["observation_refs"] == {"J1": [first]}
+    # Judging R2 with a bare id finds nothing scoped to R2 for C1 other than its own: resolved; for C2 it finds none: refused.
+    code, scoped = run_cli("judge", "--base-revision", str(judged["revision"]), "--candidate", "C1", "--judgment", "R2|unknown|O1|r")
+    assert code == 0 and scoped["observation_refs"] == {"J2": [other_requirement]}
+    code, none = run_cli("judge", "--base-revision", str(scoped["revision"]), "--candidate", "C2", "--judgment", "R2|unknown|O1|r")
+    assert code == 2 and none.get("code") and _revision() == scoped["revision"]
+    assert other_candidate not in {first, other_requirement}
+
+
 def test_batch_judge_by_flags_and_by_json_is_atomic_and_one_revision(task):
     handoff, observation = _observed(task)
     run_cli("register", "--base-revision", str(_revision()), "--requirement", "R2=second")
@@ -169,7 +203,7 @@ def test_batch_judge_by_flags_and_by_json_is_atomic_and_one_revision(task):
     # A later judgment in the batch that Core rejects leaves the earlier one unwritten.
     code, partial = run_cli(*common, "--judgment", "R1|satisfied|O1|fine", "--judgment", "R2|satisfied|NOPE|fine")
     assert code == 2 and _revision() == revision
-    code, judged = run_cli(*common, "--judgment", "R1|satisfied|O1|a reason, with | pipes and 中文", "--judgment", "R2|unknown|O1|b")
+    code, judged = run_cli(*common, "--judgment", "R1|satisfied|O1|a reason, with | pipes and 中文", "--judgment", f"R2|unknown|{observation}|b")
     assert code == 0 and judged["appended"] == ["J1", "J2"] and judged["revision"] == revision + 1
     assert run_cli("get", "J1")[1]["object"]["reasoning"] == "a reason, with | pipes and 中文"
     payload = {"judgments": [{"id": "J3", "candidate": "C1", "requirement_ref": "R1", "observation_refs": [observation],

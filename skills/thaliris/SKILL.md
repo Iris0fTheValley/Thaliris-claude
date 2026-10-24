@@ -17,13 +17,15 @@ never decides what anything means.
 
 `<runner>` below is the exact command your session context gives
 (`python ".../bin/thaliris.py"`). Run it as **one direct command**: no pipes, `&&`,
-`;`, redirection, variables, `$(...)`, trailing `# comment`, extra line or unquoted
-backslash path (quote the runner path, or use forward slashes). The PreToolUse hook
-appends your native identity; a call it cannot recognise is denied with the reason,
-and you never add `--native-session` or `--native-agent` yourself. Pass text as
-quoted flags (Chinese is fine); never write a temporary JSON file for a call that
-has a flag form. Output is compact JSON; a failure is `{"ok":false,"error","code",
-"recovery","details"}`, so act on `code`, `recovery` and `details`.
+`;`, redirection, `$(...)`, trailing `# comment`, extra line or unquoted backslash
+path (quote the runner path, or use forward slashes). The PreToolUse hook appends
+your native identity; a call it cannot recognise is denied with the reason, and you
+never add `--native-session` or `--native-agent` yourself. Pass text as quoted flags
+(Chinese works); put text with `$`, backslashes or curly quotes in single quotes
+(double quotes expand `$name`; PowerShell has no `\"` escape). Never write a
+temporary JSON file for a call that has a flag form. Output is compact JSON; a
+failure is `{"ok":false,"error","code","recovery","details"}`: act on `code`,
+`recovery`, `details`.
 
 ## 1. Admission
 
@@ -281,19 +283,20 @@ handoff, candidate and requirement refs. This adds no search duty for them and n
 global-importance judgment. Sibling children may both call theirs `O1`: Core stores
 the adapter's handoff-qualified id, `H1a2b3c4d.O1`.
 
-You keep critical observations visible until you have **explicitly** reassessed
-each related user requirement for the current candidate:
+Critical observations stay visible until you have **explicitly** reassessed each
+related user requirement for the current candidate:
 
 ```
 <runner> judge --base-revision <n> --requirement R1 --candidate C1 --outcome repair --observations O1,O2 --reasoning "..."
 ```
 
 `outcome` is `satisfied`, `unknown`, `repair` or `no-current-impact`. In the flag
-form a bare `O1` resolves to the one qualified id it is a suffix of (`H1a2b3c4d.O1`;
-ambiguous means qualify it); `--json` takes the qualified ids as the packet shows
-them. Judgment ids are assigned (`J<n>`; `--id` overrides). Several judgments are
-one atomic call and one revision: repeat `--judgment "R1|satisfied|O1|reasoning"`
-with one `--candidate`, or pass `--json '{"judgments":[...]}'` (1-64). Reading,
+form a bare `O1` resolves to the one qualified id of this candidate (scoped to this
+requirement) it is a suffix of, echoed as `observation_refs` in the answer; otherwise
+qualify it (`H1a2b3c4d.O1`). `--json` takes qualified ids. Judgment ids are assigned
+(`--id` overrides). Several judgments are one atomic call and one revision: repeat
+`--judgment "R1|satisfied|O1|reasoning"` with one `--candidate`, or pass
+`--json '{"judgments":[...]}'` (1-64). Reading,
 retrieving, acknowledging or forwarding evidence is not a disposition. An
 `unknown` or `repair` judgment stays visible as unresolved until a later judgment
 addresses it through `judgment_refs` (or cites its complete observation basis);
@@ -303,30 +306,29 @@ truth; matching candidate labels never prove identical file states, and you may
 judge a newer candidate C2.
 
 While unincorporated observations or unresolved judgments remain, the hooks
-re-present a bounded "Thaliris evidence for task …" packet when a child's result
-reaches you. That happens on the Agent result itself, and at the start of any turn
-(including `<task-notification>` turns) where the packet has changed or your
-context was compacted. An unchanged packet is not repeated (a background launch
-acknowledgement says "Evidence unchanged" instead); a child's final report always
-carries it. The packet and every dispatch acknowledgement state "task revision now
-N": that is your next `--base-revision`. Before a broad completion or requirement
-decision, run `<runner> status` if the latest packet is not in front of you. To
+re-present a bounded "Thaliris evidence for task …" packet on a child's Agent
+result, and at the start of any turn (including `<task-notification>` turns) where
+it changed or your context was compacted. An unchanged packet is not repeated (a
+background launch acknowledgement says "Evidence unchanged"); a child's final
+report always carries it. The packet and every dispatch acknowledgement state "task
+revision now N": your next `--base-revision`. Before a broad completion or
+requirement decision, run `<runner> status` if the latest packet is not in view. To
 import a historical child result, `observe --handoff-id <id> --text "..." --source
 "..."` with ids qualified by that handoff; this neither reactivates the child nor
 establishes current truth.
 
 **Writes and revisions.** `register`, `judge`, `observe`, `task-update`, `artifact`
 and `close` answer with a compact acknowledgement: `revision`, `changed`,
-`appended` (assigned ids) and `evidence` (open-evidence totals plus bounded items,
-paged by `next_offset`); no status call is needed after a write. Writes are strict
-compare-and-set on `--base-revision`. On `TASK_REVISION_CONFLICT` read
-`details.current_revision` and `details.changes_since` (a bounded, non-exact hint
-of what moved, with the open evidence), decide whether your write still applies,
-and retry once with `--base-revision <current_revision>`; do not re-read `status`.
-`status` is compact (header, counts, open evidence, authority mode and hash, open
-dispatches, the 12 latest current records at 200 characters); `status --view full`
-returns every section, `--since-revision N` adds the same change hint and
-`--evidence-offset N` pages open evidence.
+`appended` (assigned ids) and `evidence` (open-evidence totals and bounded items,
+paged by `next_offset`); no status call follows a write. Writes are strict
+compare-and-set on `--base-revision`. On `TASK_REVISION_CONFLICT` review
+`details.changes_since` and its open evidence: an approximate hint (`exact:false`;
+`recent` is the last few items per kind and can miss a batch's; Active Work,
+Pending Results, milestone, status and sources are untracked). If your write still
+applies, retry once with `--base-revision <details.current_revision>`; read `status`
+for Active Work, Pending Results or anything the hint does not cover. `status` is
+compact; `--view full` shows every section, `--since-revision N` adds the hint,
+`--evidence-offset N` pages evidence.
 
 **Your task context.** Keep the task's global semantic state in the ledger, not
 only in your conversation, so a long task, a compaction or a later session does
@@ -339,16 +341,14 @@ completed or started Workstream, an open item, a milestone:
 ```
 
 Every flag is optional. `--record [ID=]KIND:TEXT` appends a record (`kind` is your
-label: `fact`, `decision`, `progress`, `open-item`, ...; the id is assigned when
-omitted and returned in `appended`); correct one by appending a new record with
-`--supersedes D1` (several records: `--supersedes D3=D1`) rather than rewriting
-history. `--active-work` and `--pending` (repeatable) REPLACE the current lists
+label: `fact`, `decision`, `progress`, `open-item`, ...; the id is assigned and
+returned in `appended`); correct one by appending a record with `--supersedes D1`
+(several records: `--supersedes D3=D1`), not by rewriting history. `--active-work` and `--pending` (repeatable) REPLACE the current lists
 (at most 64 short entries; put long content in a record or Artifact);
 `--clear-active-work` / `--clear-pending` empty them; `--milestone` is at most 128
 characters. `--json` takes the full payload for anything the flags cannot say.
-`status` shows these and the most recent current records; after compaction or
-resume the session start re-presents them, and `attach` returns them in a new
-session (for example after `/clear`). They are
+`status` shows these and the latest current records; session start re-presents them
+after compaction or resume, and `attach` returns them in a new session. They are
 what you recorded, not fresh verification: re-check what a decision depends on.
 Only you update the task context; children report in their final message.
 

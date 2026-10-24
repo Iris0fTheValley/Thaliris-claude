@@ -76,3 +76,83 @@ def test_equivalent_runner_paths_are_recognized():
     """Live probe: a Controller spelled the runner path with `..` segments and lost its identity."""
     spelled = "/opt/plugins/x/../Thaliris-claude/bin/thaliris.py"
     assert guards.runner_invocation(f'python "{spelled}" status', RUNNER)["direct"] is True
+
+
+# ---------------------------------------------- dialect-aware classification (PowerShell is not POSIX)
+
+def _run(text: str) -> str:
+    return f'python "{RUNNER}" {text}'
+
+
+# Each of these is one thing to the POSIX reader and something else to PowerShell (which has no backslash escape).
+POWERSHELL_AMBIGUOUS = [
+    (r'observe --text "abc\" ; Write-Output x"', "escape"),          # the reviewed repro: `\"` ends the string in PowerShell
+    (r"observe --text a\; Write-Output x", "escape"),                 # `\;` is a backslash and a statement separator
+    (r"observe --text a\| Write-Output x", "escape"),
+    (r"""observe --text \'"x' ; Write-Output y; " """, "escape"),      # PowerShell opens a single quote the POSIX reader skips
+    (r'observe --text "q\\" ; Write-Output x ; "b"', "escape"),       # `\\"`: still a backslash before a closing quote
+    (r'observe --text "\$(Write-Output x)"', "expansion"),            # `\$(` is literal to POSIX, evaluated by PowerShell
+    ('observe --text "a \u201c ; Write-Output x ; \u201d b"', "smart_quote"),   # curly quotes end a double-quoted string
+    ("observe --text 'it\u2019s' ; Write-Output x ; ''", "smart_quote"),
+    ("observe --text x --% y", "stop_parsing"),
+]
+
+
+@pytest.mark.parametrize("text, problem", POWERSHELL_AMBIGUOUS)
+def test_powershell_ambiguity_is_never_direct(text, problem):
+    found = guards.runner_invocation(_run(text), RUNNER, powershell=True)
+    assert found["direct"] is False and problem in found["problems"], found
+
+
+def test_the_reviewed_powershell_repro_was_direct_under_the_posix_reader():
+    command = _run(r'observe --text "abc\" ; Write-Output x"')
+    assert guards.runner_invocation(command, RUNNER)["direct"] is True  # POSIX balances the quotes (Bash tool: harmless)
+    assert guards.runner_invocation(command, RUNNER, powershell=True)["direct"] is False
+
+
+@pytest.mark.parametrize("powershell", [False, True])
+@pytest.mark.parametrize("text", [
+    'observe --text "中文说明：这是一段普通的引号文本，包含 # 与 | 和 100%"',
+    'judge --base-revision 3 --judgment "R1|satisfied|O1|a | b"',
+    'judge --base-revision 3 --judgment "R1|satisfied|O1|中文 | 理由" --judgment "R2|unknown|O1|b"',
+    r"observe --text 'literal $name, ${x}, $(y), `z` and C:\dir\'",
+    "observe --text 'a \u201cquoted\u201d phrase'",         # curly double quotes inside single quotes are plain data
+    'observe --text "it\u2019s ok, \u2018x\u2019"',        # curly single quotes inside double quotes are plain data
+    'observe --text "price $ 5 and a trailing $"',         # `$` before a space or at the end is a literal dollar
+    r'observe --text "path C:\dir\file and \n"',           # backslashes that precede no quote are literal
+    "observe --text 'it''s fine'",                         # PowerShell's doubled apostrophe (POSIX reads adjacent strings)
+])
+def test_ordinary_quoted_text_stays_direct_on_both_shells(text, powershell):
+    found = guards.runner_invocation(_run(text), RUNNER, powershell=powershell)
+    assert found["direct"] is True, found
+
+
+@pytest.mark.parametrize("fragment", ['"cost $5"', '"hello $name"', '"a ${HOME} b"', '"exit $? now"', '"x_$_y"'])
+@pytest.mark.parametrize("powershell", [False, True])
+def test_dollar_variables_in_double_quotes_are_refused_on_both_shells(fragment, powershell):
+    found = guards.runner_invocation(_run(f"observe --text {fragment}"), RUNNER, powershell=powershell)
+    assert found["direct"] is False and "variable" in found["problems"], found
+
+
+def test_powershell_only_automatic_variables_are_refused_there():
+    command = _run('observe --text "pid $$ and $^"')
+    assert "variable" in guards.runner_invocation(command, RUNNER, powershell=True)["problems"]
+    assert guards.runner_invocation(command, RUNNER)["direct"] is True  # not variables in the Bash rule set
+
+
+@pytest.mark.parametrize("powershell", [False, True])
+def test_single_quoted_dollars_keep_working(powershell):
+    assert guards.runner_invocation(_run("observe --text 'cost $5 and $name'"), RUNNER, powershell=powershell)["direct"] is True
+
+
+def test_bash_escaped_dollar_is_literal():
+    assert guards.runner_invocation(_run(r'observe --text "cost \$5"'), RUNNER)["direct"] is True
+
+
+def test_powershell_ambiguity_counts_as_a_write_for_non_runner_commands():
+    command = r'Write-Output "a\" ; Set-Content f x ; \"b"'
+    assert not guards.obvious_write(command)  # the POSIX reading sees one harmless string (the gap this closes)
+    assert guards.obvious_write(command, powershell=True)
+    assert guards.direct_core_call(r'Write-Output "a\" ; thaliris-core task-close ; \"b"', powershell=True)
+    assert not guards.obvious_write("Get-Content app.py -Tail 5", powershell=True)
+    assert not guards.obvious_write("git log --oneline -5", powershell=True)
