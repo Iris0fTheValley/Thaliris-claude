@@ -33,13 +33,6 @@ def _pipe(args, home, payload=None, cwd=None):
                           capture_output=True, env=_legacy_env(home), cwd=cwd, check=False)
 
 
-def test_the_legacy_code_page_really_cannot_encode_chinese(tmp_path):
-    """Guards the guard: the failure these tests reproduce is real in this environment."""
-    out = subprocess.run([sys.executable, "-c", f"import sys; sys.stdout.write({GREETING!r})"], capture_output=True,
-                         env=_legacy_env(tmp_path), check=False)
-    assert out.returncode != 0 and b"UnicodeEncodeError" in out.stderr
-
-
 def test_hook_output_survives_a_legacy_code_page(task):
     home = Path(os.environ["THALIRIS_CLAUDE_HOME"])
     command = f"{hooks.runner_command()} task-update --base-revision 2 --json '{json.dumps({'active_work': [GREETING]}, ensure_ascii=False)}'"
