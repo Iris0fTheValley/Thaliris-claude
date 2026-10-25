@@ -178,8 +178,11 @@ def _controller(args) -> str:
 
 
 def _task(args) -> tuple[Path, str]:
-    association = store.resolve_session(_session(args))
+    association, problem = store.inspect_session(_session(args))
     if association is None:
+        if problem is not None:
+            # The session's task exists but cannot be read: report that, never "no task" (a different fact and a different recovery).
+            raise store.unreadable_error(problem)
         raise ValueError("NO_ACTIVE_TASK_FOR_SESSION: start a task, or `attach` this session to an existing one")
     return association
 
@@ -667,7 +670,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"DUPLICATE_IDENTITY_FLAG: {flag}")
         result = run(_parser().parse_args(argv))
     except core.TaskStateSchemaIncompatible as exc:
-        result, code = {"ok": False, **exc.diagnostic}, 3
+        result, code = {"ok": False, **exc.diagnostic, **({"task_id": exc.task_id} if exc.task_id else {}),
+                        "recovery": store.SCHEMA_RECOVERY}, 3
     except (ValueError, OSError, RuntimeError, KeyError) as exc:
         result, code = _error(exc), 2
     else:

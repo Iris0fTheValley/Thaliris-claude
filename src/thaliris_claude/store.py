@@ -297,17 +297,47 @@ def lifecycle_path(root: Path, task_id: str) -> Path:
     return core._safe_without_final_symlink(root, f".context/tasks/{task_id}/{LIFECYCLE_NAME}")
 
 
+# Keys every version-1 entry carries (the 0.1 shape included): hooks and the runner index them directly.
+# `role_binding`, `requested_effort` and the observed_* fields were added later and are read with .get().
+REQUIRED_ENTRY_KEYS = ("tool_use_id", "role", "subagent_type", "parent", "handoff_id", "binding", "native_status", "disposed")
+_LIFECYCLE_RECOVERY = ("The lifecycle file is damaged or was written by another adapter version. Do not edit it by hand. Child "
+                       "writes and messages are refused while it is unreadable; the Controller's own work is unaffected. "
+                       "Ask the user: run the adapter version that wrote it, or start an independent new task. "
+                       "See `guidance --section recovery`.")
+
+
+def _lifecycle_error(code: str, detail: str) -> core.ThalirisError:
+    return core.ThalirisError(code, f"{code}: {detail}", recovery=_LIFECYCLE_RECOVERY)
+
+
+def _check_entries(task_id: str, dispatches: list) -> None:
+    for index, item in enumerate(dispatches):
+        if not isinstance(item, dict):
+            raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", f"dispatch {index} of task {task_id} is not an object")
+        missing = [key for key in REQUIRED_ENTRY_KEYS if key not in item]
+        if missing:
+            raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", f"dispatch {index} of task {task_id} lacks {', '.join(missing)}")
+        if (not isinstance(item["disposed"], bool) or item["native_status"] not in UNRESOLVED_STATUSES | TERMINAL_STATUSES
+                or not isinstance(item["parent"], str)):
+            raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", f"dispatch {index} of task {task_id} has an unreadable field")
+
+
 def read_lifecycle(root: Path, task_id: str) -> dict:
     path = lifecycle_path(root, task_id)
     if not path.is_file():
         return {"version": LIFECYCLE_VERSION, "task_id": task_id, "dispatches": []}
-    value = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:  # JSON or encoding damage
+        raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", "the lifecycle file is not valid UTF-8 JSON") from exc
     if not isinstance(value, dict) or value.get("task_id") != task_id or not isinstance(value.get("dispatches"), list):
-        raise ValueError("CLAUDE_LIFECYCLE_INVALID")
+        raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", "the lifecycle file has an unexpected shape")
     if value.get("version") != LIFECYCLE_VERSION:
         # A newer plugin wrote this (or an older one, after a downgrade). Never
         # reinterpret it: identity facts stay UNKNOWN until a matching version runs.
-        raise ValueError(f"CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED: {value.get('version')!r}; this adapter reads version {LIFECYCLE_VERSION}")
+        raise _lifecycle_error("CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED",
+                               f"{value.get('version')!r}; this adapter reads version {LIFECYCLE_VERSION}")
+    _check_entries(task_id, value["dispatches"])
     return value
 
 
@@ -377,18 +407,73 @@ def critical(root: Path, task_id: str, *, checkpoint: bool = True):
             core._lock = original
 
 
-def resolve_session(session_id: str | None) -> tuple[Path, str] | None:
-    """Return the associated (root, task_id) when its Core task is still ACTIVE."""
+def inspect_session(session_id: str | None) -> tuple[tuple[Path, str] | None, dict | None]:
+    """Return ``(association, problem)`` for a session.
+
+    ``association`` is (root, task_id) when the associated Core task is ACTIVE and readable. ``problem`` is set when the
+    session names a task whose state exists but cannot be read (an incompatible schema after an upgrade or downgrade,
+    damaged JSON, an identity conflict, an I/O error): that task is NOT absent, so callers must not treat the session as
+    unmanaged. A task whose state file is missing or that is no longer ACTIVE is simply "no task". The common no-task
+    path reads one small file and nothing else.
+    """
     association = read_session(session_id)
     if association is None:
-        return None
-    root = Path(association["root"])
+        return None, None
+    root, task_id = Path(association["root"]), association["task_id"]
     try:
-        core.select_task(root, association["task_id"])
+        core.select_task(root, task_id)
+    except ValueError:
+        return None, None  # a session record that names no valid task id names no task
+    try:
         state = core._load_state(root)
-    except (ValueError, OSError):
-        return None
-    return (root, association["task_id"]) if state["status"] == "ACTIVE" else None
+    except core.TaskStateSchemaIncompatible as exc:
+        return None, {"root": root, "task_id": task_id, "code": "STATE_SCHEMA_INCOMPATIBLE", "diagnostic": exc.diagnostic,
+                      "message": "the task state schema is incompatible with this Core"}
+    except core.ThalirisError as exc:
+        if exc.code == core.errors.TASK_STATE_MISSING:
+            return None, None
+        return None, {"root": root, "task_id": task_id, "code": exc.code, "message": exc.message[:300]}
+    except (ValueError, OSError) as exc:
+        return None, {"root": root, "task_id": task_id, "code": "TASK_STATE_UNREADABLE", "message": str(exc)[:300]}
+    return ((root, task_id) if state["status"] == "ACTIVE" else None), None
+
+
+def resolve_session(session_id: str | None) -> tuple[Path, str] | None:
+    """Return the associated (root, task_id) when its Core task is still ACTIVE and readable."""
+    return inspect_session(session_id)[0]
+
+
+SCHEMA_RECOVERY = ("Do not edit or delete the task state. Managed assurance for this task is UNKNOWN. The user decides: run the "
+                   "plugin/Core version that wrote it, follow Core's recovery_action where it applies, or start an independent "
+                   "new task with `task-start`. See `guidance --section recovery`.")
+
+
+def problem_text(problem: dict) -> str:
+    """What the Controller needs to know about an associated task that cannot be read (bounded, no secrets)."""
+    detail = ""
+    diagnostic = problem.get("diagnostic")
+    if diagnostic:
+        detail = (f" (state schema {diagnostic.get('from_version')!r}, this Core reads {diagnostic.get('to_version')!r}; "
+                  f"Core's recovery_action: {diagnostic.get('recovery_action')})")
+    return (f"task {problem['task_id']} in `{problem['root']}` exists but its state cannot be read: {problem['code']}{detail}. "
+            "Managed assurance for it is UNKNOWN: not absent, not safe. Do not edit or delete its files. Read `status` for the "
+            "diagnosis; the user decides whether to repair it (for example by running the plugin version that wrote it) or to "
+            "start an independent new task with `task-start`. See `guidance --section recovery`.")
+
+
+def unreadable_error(problem: dict) -> Exception:
+    """The error a runner command raises for an associated task that cannot be read."""
+    if problem.get("diagnostic"):
+        return core.TaskStateSchemaIncompatible(problem["diagnostic"], problem["task_id"])
+    return core.ThalirisError(problem["code"], f"{problem['code']}: the session's task {problem['task_id']} exists but its "
+                              f"state cannot be read ({problem['message']})", recovery=problem_text(problem),
+                              details={"task_id": problem["task_id"]})
+
+
+def child_task(session_id: str | None) -> tuple[Path, str] | None:
+    """The (root, task_id) whose lifecycle governs a session's children, even when the task state is unreadable."""
+    association, problem = inspect_session(session_id)
+    return association or ((problem["root"], problem["task_id"]) if problem else None)
 
 
 def dispatch_for_agent(lifecycle: dict, agent_id: str) -> dict | None:
@@ -511,11 +596,19 @@ def bind(ctx: dict, entry: dict, agent_id: str, how: str) -> bool:
 
 
 def set_status(ctx: dict, entry: dict, status: str, **fields) -> None:
-    # A late launch acknowledgement never hides terminal evidence. A new start
-    # (a resumed agent) is real activity; the event history keeps the old fact.
-    if status == "launched" and entry["native_status"] in {"completed", "stopped"}:
+    # A late launch acknowledgement never hides terminal evidence. A start after the
+    # child finished (a SendMessage resume) or after its disposal is real activity,
+    # but it grants nothing: the status stays and the event history records the fact.
+    terminal = entry["native_status"] in TERMINAL_STATUSES
+    if status == "launched" and terminal:
         note(entry, status, **fields)
         ctx["lifecycle_changed"] = True
+        return
+    if status == "running" and (terminal or entry["disposed"]):
+        event = "resumed-after-terminal" if terminal else "started-after-dispose"
+        if (entry.get("events") or [{}])[-1].get("event") != event:  # a resume loop must not push the history out
+            note(entry, event, **fields)
+            ctx["lifecycle_changed"] = True
         return
     entry["native_status"] = status
     note(entry, status, **fields)
