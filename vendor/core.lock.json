@@ -1,13 +1,13 @@
 {
   "repository": "https://github.com/Iris0fTheValley/Thaliris",
-  "commit": "fc170edddbc41ce09aba57d3cf30d9a50344c570",
+  "commit": "f0ee56320a7e3d8bcd04ca9369804af66851fee9",
   "path": "src/thaliris",
   "files": {
-    "thaliris/__init__.py": "141dd2c78b07f93d05c580c52d0b045854127f8bb51e11183ece8418ea11b4de",
-    "thaliris/authority.py": "0048bd1a617884ca937c53c0218bb10d7326382b8cf275b37c9f690b0725d698",
+    "thaliris/__init__.py": "93a24a61bbee498e1504a85f42bd5c043e399a4a59ab078952a69c44c82a9bb2",
+    "thaliris/authority.py": "273fcc15b2eaa1490da1bf9305cb1f10e2405fddb9e8de041cd32902829bfca9",
     "thaliris/cli.py": "6ab44d96881e29b6e5436066c3feb2995f5c915ea8d7ef6f14e5bc31570ff394",
-    "thaliris/core.py": "37dd5165e825e4565942547ea72e60160e8eeacef28cba163f7410ca98f9e367",
-    "thaliris/errors.py": "070049f1782e068b6cb3be1b24577ddfc48acf65bf1458c550169bbe2fb6ddde",
+    "thaliris/core.py": "1bf8013507be6236ed464192fd45ae8b916f9c8a68ea866c185e2241313f85ce",
+    "thaliris/errors.py": "3d9363f367316a04d91e2f17eaea5f29597886b7049685722ea408a3787e384e",
     "thaliris/identity.py": "577ae35421096685b5e2651b689fb3414775d3cd0f3068ad1c1a926ddc1b4aab",
     "thaliris/identity_basis.py": "1176186bd8c7b67f2de0b11bb663179de6a918a47315ec02b58821ec827cb6a3",
     "thaliris/markdown.py": "7f04f940243ace6d52d614e643db611c51c423b232d8472d224bda745bb2cd24",

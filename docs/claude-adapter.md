@@ -21,7 +21,7 @@ Thaliris-claude/
 ├── hooks/hooks.json               SessionStart / UserPromptSubmit / PreToolUse / PostToolUse(+Failure) / SubagentStart / SubagentStop
 ├── bin/thaliris-hook             Hook 入口（sh，与官方插件同一约定；命中缓存时只启动一个解释器）
 ├── bin/thaliris.py                Runner 启动器（兼容旧 Python，自动发现并缓存 ≥3.11 运行时）
-├── vendor/                        固定提交的 Thaliris Core（e29c837，Core 0.5.1）与 core.lock.json
+├── vendor/                        固定提交的 Thaliris Core（f0ee563，Core 0.5.3）与 core.lock.json
 ├── scripts/vendor_core.py         内置/校验 Core
 └── src/thaliris_claude/
     ├── roles.py    RoleSpec + ClaudeExecutionBinding；角色提示词唯一权威来源
