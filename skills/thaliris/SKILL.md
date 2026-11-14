@@ -55,10 +55,22 @@ Implementer with a short handoff. Unless the user opts out:
    once if your Agent tool says to spawn agents only when the user asks, and
    `delegated` if it does not. Optionally `--execution-constraint
    claude-model:<sonnet|opus|haiku|fable>` when the user wants every Thaliris child
-   pinned to one model. (`--contract <absolute path>` to a UTF-8 JSON file with the
-   same keys, `human_instruction` ... `execution_mode` and optional
-   `execution_constraint`, is the alternative; never mix the two.)
-4. Keep the returned Task ID. One session holds at most one ACTIVE task; another
+   pinned to one model. **Adaptive quick admission**: with `--execution-mode
+   adaptive` you may omit `--boundary` and `--invariants` (Core records each as
+   `unspecified`, never an inferred value) and add `--write-surface '<glob>'`
+   (repeatable) for the paths you expect to touch. (`--contract <absolute path>` to a
+   UTF-8 JSON file with the same keys, `human_instruction` ... `execution_mode` and
+   optional `execution_constraint` / `write_surface`, is the alternative; never mix
+   the two.)
+4. Type the requirements and declare their checks before the first dispatch or
+   edit: `register --requirement R1=<ref> --kind R1=compiled|partial|judgment-only
+   [--contract-surface R1]` (absent kind is `judgment-only`). `compiled` means a
+   declared check decides it, so declare that check now: `<runner> check
+   --base-revision <n> --json
+   '{"id":"tests","requirement_refs":["R1"],"command":["python","-m","pytest","-q"],"files":["tests/test_x.py"]}'`
+   (argv, no shell; `files` are hashed so a later edit shows as tamper; `--supersede`
+   accepts changed content). Only you declare checks.
+5. Keep the returned Task ID. One session holds at most one ACTIVE task; another
    workspace's old ACTIVE record never becomes yours. To continue a task from a new
    session (for example after `/clear`), `<runner> attach --task-id <id> --reason "<why>"`.
 
@@ -77,6 +89,12 @@ baseline needs an actual decision by the user.
 - **controller-direct**: you may read, edit, test and use Git yourself, and still
   use children where they add value.
 - **single-agent**: you execute directly; Thaliris children are refused.
+- **adaptive**: quick admission (section 1); you execute directly and may dispatch
+  children. Lane advisories (in `status` and the evidence packet: a check failing
+  twice, writes outside `write_surface`, a large change, judgment-only or
+  contract-surface requirements, heavy Controller tool output) never block; when
+  one fires, record why and escalate to delegated with `mode`, or continue with a
+  recorded reason.
 
 To switch mode on the user's decision: `<runner> mode --mode <m>
 --human-instruction "<their words>" --base-revision <n>
@@ -203,7 +221,9 @@ your prompt — never your conversation. Make the prompt **decision-complete**:
   covered and did not cover;
 - authoritative sources and what is derived from them; affected surfaces;
 - hard invariants and boundaries you have already decided;
-- a verification entry that works; decision-changing unknowns.
+- a verification entry that works: the declared check ids the executor runs with
+  `verify --check <id>` before reporting (children run checks, never declare them);
+- decision-changing unknowns.
 
 Resolve ambiguity from the user's request and confirmed facts before handing off,
 and bound any cleanup, migration or synchronization to the specific discrepancy.
@@ -276,12 +296,14 @@ without re-confirming the same completion.
 
 ## 6. Evidence continuity
 
-Children record already-discovered facts that change their local conclusion,
-acceptance or a critical UNKNOWN with `observe --text "..." --source "path:line"`
-(`--source` is required and repeatable; ids are assigned); the adapter attaches
-handoff, candidate and requirement refs. This adds no search duty for them and no
-global-importance judgment. Sibling children may both call theirs `O1`: Core stores
-the adapter's handoff-qualified id, `H1a2b3c4d.O1`.
+Every child ends its final report with a `thaliris-claims` block, which the
+SubagentStop hook ingests for its handoff: `contradicts` and `unknown` claims
+become open observations (`H1a2b3c4d.c1`), `supports` claims are counted per
+requirement, and a missing or malformed block is recorded as such (read that
+report yourself). Claims are the child's statement, not acceptance. `observe
+--text "..." --source "path:line"` stays for mid-flight findings a child wants
+visible before it returns; the adapter attaches handoff, candidate and requirement
+refs, and sibling ids are qualified the same way (`H1a2b3c4d.O1`).
 
 Critical observations stay visible until you have **explicitly** reassessed each
 related user requirement for the current candidate:
@@ -296,7 +318,12 @@ requirement) it is a suffix of, echoed as `observation_refs` in the answer; othe
 qualify it (`H1a2b3c4d.O1`). `--json` takes qualified ids. Judgment ids are assigned
 (`--id` overrides). Several judgments are one atomic call and one revision: repeat
 `--judgment "R1|satisfied|O1|reasoning"` with one `--candidate`, or pass
-`--json '{"judgments":[...]}'` (1-64). Reading,
+`--json '{"judgments":[...]}'` (1-64). **The gate withholds** a `satisfied`
+judgment (`VERIFICATION_WITHHELD`) while any declared check of that requirement is
+red, unrun or stale for the current tree, or a `compiled` requirement has no check:
+run `verify --check <id>` (you or the executor), or pass `--override-reason
+"<why>"`, which is recorded with the checks it overrode. A green check grants
+nothing; the judgment is still yours. Reading,
 retrieving, acknowledging or forwarding evidence is not a disposition. An
 `unknown` or `repair` judgment stays visible as unresolved until a later judgment
 addresses it through `judgment_refs` (or cites its complete observation basis);
@@ -305,10 +332,15 @@ basis visible. Earlier observations and judgments are history, not current
 truth; matching candidate labels never prove identical file states, and you may
 judge a newer candidate C2.
 
-While unincorporated observations or unresolved judgments remain, the hooks
-re-present a bounded "Thaliris evidence for task …" packet on a child's Agent
+While unincorporated observations or unresolved judgments remain, or a
+**Verification** line (a red, stale or unrun check, changed check files, a
+compiled/partial requirement without a check), a **Claims** line (handoffs without
+a readable claims block) or an adaptive **Advisories** line needs attention, the
+hooks re-present a bounded "Thaliris evidence for task …" packet on a child's Agent
 result, and at the start of any turn (including `<task-notification>` turns) where
-it changed or your context was compacted. An unchanged packet is not repeated (a
+it changed or your context was compacted. Background completions also record the
+dispatch's usage (tokens, tool uses, duration; unreported values stay null) and
+say the new task revision. An unchanged packet is not repeated (a
 background launch acknowledgement says "Evidence unchanged"); a child's final
 report always carries it. The packet and every dispatch acknowledgement state "task
 revision now N": your next `--base-revision`. Before a broad completion or
@@ -317,8 +349,8 @@ import a historical child result, `observe --handoff-id <id> --text "..." --sour
 "..."` with ids qualified by that handoff; this neither reactivates the child nor
 establishes current truth.
 
-**Writes and revisions.** `register`, `judge`, `observe`, `task-update`, `artifact`
-and `close` answer with a compact acknowledgement: `revision`, `changed`,
+**Writes and revisions.** `register`, `judge`, `observe`, `check`, `verify`,
+`task-update`, `artifact` and `close` answer with a compact acknowledgement: `revision`, `changed`,
 `appended` (assigned ids) and `evidence` (open-evidence totals and bounded items,
 paged by `next_offset`); no status call follows a write. Writes are strict
 compare-and-set on `--base-revision`. On `TASK_REVISION_CONFLICT` review
@@ -354,7 +386,8 @@ Only you update the task context; children report in their final message.
 
 ## 7. Endpoints and review
 
-Executors close local loops; you route Workstreams by semantic dependency,
+Executors close local loops and run the declared checks you name; their
+`verify` results and typed claims are evidence for you to judge. You route Workstreams by semantic dependency,
 decision coupling and independent closure, never by counts of files, calls,
 tokens or time. Remaining work is "independently deterministic" only when the
 accepted contract uniquely determines the behavior to preserve; compatibility
@@ -403,8 +436,13 @@ explicitly deferred, or blocked by a decision-changing dependency. Near the end,
 decide whether anything learned has reusable future value; if so, hand exact
 material to a fresh Curator.
 
-`<runner> close --base-revision <n>` records DONE. It refuses while any child
-dispatch is reserved, launched or running; wait for terminal evidence or
+`<runner> close --base-revision <n>` records DONE through the close gate: it is
+withheld while any declared check is red, unrun or stale for the current tree, or
+a `satisfied` compiled requirement has no check, unless you pass
+`--override-reason "<why>"` (recorded in `closure`). Its answer lists `surfaced`:
+every judgment-only and partial requirement with its latest judgment. No check
+decides those; account for each before you tell the user the work is done. Close
+also refuses while any child dispatch is reserved, launched or running; wait for terminal evidence or
 `<runner> dispose --handoff-id <id> --reason "<decision>"`, which ends management
 and fences that child's writes without claiming it stopped. Isolate or coordinate
 any writes it might still make before new work.

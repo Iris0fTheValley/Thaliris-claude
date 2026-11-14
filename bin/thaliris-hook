@@ -25,7 +25,27 @@ has_task() {
 if [ "$event" = "UserPromptSubmit" ] && ! has_task; then
   exit 0
 fi
-payload=$(cat)
+# `--lane`: Controller tool results for the adaptive lane counter. Only a session whose task is adaptive has a marker
+# (`$home/lane/<session_id>`, written at admission/attach/mode switch, removed at close/detach/switch away); every
+# other session exits here without starting Python. The session id is read by parameter expansion (no process); an
+# id that is not a plain filename has a hashed marker, found only by the any-marker fallback. Python re-checks.
+if [ "$2" = "--lane" ]; then
+  [ -d "$home/lane" ] || exit 0
+  payload=$(cat)
+  rest=${payload#*\"session_id\"}
+  rest=${rest#*\"}
+  session=${rest%%\"*}
+  case $session in
+    ''|*[!A-Za-z0-9-]*)
+      found=
+      for marker in "$home"/lane/*; do
+        [ -e "$marker" ] && found=1 && break
+      done
+      [ -n "$found" ] || exit 0 ;;
+    *) [ -f "$home/lane/$session" ] || exit 0 ;;
+  esac
+fi
+[ "$2" = "--lane" ] || payload=$(cat)
 if [ "$2" = "--filter" ]; then
   case $payload in
     *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*|*[Cc][Ll][Aa][Uu][Dd][Ee]-[Rr][Oo][Ll][Ee][Ss]*|*[Pp][Rr][Oo][Jj][Ee][Cc][Tt]-[Ii][Dd][Ee][Nn][Tt][Ii][Tt][Yy]*) ;;

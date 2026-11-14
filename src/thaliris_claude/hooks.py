@@ -7,6 +7,7 @@ Host fields that are missing stay UNKNOWN; hook events never decide acceptance.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,8 @@ from . import __version__, guards, roles, store
 AGENT_TOOLS = frozenset({"Agent", "Task"})
 SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+# Controller tool results the adaptive lane counter adds up (registered in hooks.json with the launcher's `--lane` fast path).
+LANE_TOOLS = frozenset({"Read", "Bash", "PowerShell", "Grep", "Glob", "WebFetch"})
 _MARKER = re.compile(r"^[ \t]*thaliris-evidence:[ \t]*(\{.*\})[ \t]*$", re.MULTILINE)
 _READ_ONLY_CORE = ("task-status", "task-get", "task-show", "catalog", "document-get", "version", "stale", "milestone-check",
                   "identity-status", "identity-get", "identity-trace")
@@ -98,16 +101,93 @@ def _dispatched_binding(payload: dict, agent_id: str | None, agent_type: object)
         return None
 
 
-def evidence_state(root: Path, task_id: str) -> dict | None:
-    """Open evidence for the Controller: the packet text and a digest of its content.
+PACKET_SECTION_LINES = 8
 
-    The digest leaves out the task revision (every dispatch bumps it), so "nothing new to judge" keeps the same
-    digest however many dispatches were reserved in between. UserPromptSubmit and PostToolUse compare the same digest.
+
+def _task_contract(root: Path, task_id: str) -> dict | None:
+    try:
+        record = store.authority(root, task_id).read()
+    except (OSError, ValueError):
+        return None
+    return record.get("contract") if isinstance(record, dict) and isinstance(record.get("contract"), dict) else None
+
+
+def _bounded(lines: list[str], more: str) -> list[str]:
+    return lines if len(lines) <= PACKET_SECTION_LINES else lines[:PACKET_SECTION_LINES] + [f"- … {len(lines) - PACKET_SECTION_LINES} more {more}"]
+
+
+def _verification_lines(section: dict | None) -> list[str]:
+    """Checks that withhold (red, stale, unrun), tampered check files and compiled/partial requirements without a check."""
+    if not section:
+        return []
+    lines = []
+    for entry in section.get("checks", []):
+        if entry.get("status") == "green":
+            continue
+        detail = str(entry.get("status")) + (f" ({entry['reason']})" if entry.get("reason") else "")
+        if entry.get("result_id"):
+            detail += f", latest {entry.get('outcome')} {entry['result_id']}"
+        lines.append(f"- check {entry['id']}: {detail}; withholds satisfied for {', '.join(entry.get('requirement_refs') or []) or '(none)'}")
+    for item in section.get("tamper", []):
+        state = f"recorded as observation {item['observation_id']}" if item.get("recorded") else "not yet recorded"
+        lines.append(f"- check {item['check_id']}: declared files changed ({', '.join(item.get('paths') or [])}); {state}. "
+                     "Accept the content with `check --supersede`, or restore it")
+    if section.get("uncovered_requirements"):
+        lines.append("- compiled/partial requirement(s) without a declared check: " + ", ".join(section["uncovered_requirements"][:16]))
+    lines = _bounded(lines, "in `status`")
+    if lines:
+        lines.append("A satisfied judgment or close on these needs the checks green on the current tree (`verify --check <id>`), "
+                     "or `--override-reason` (recorded).")
+    return lines
+
+
+def _claims_lines(section: dict | None) -> list[str]:
+    without = (section or {}).get("handoffs_without_typed_claims") or {}
+    if not without.get("total"):
+        return []
+    return [f"- {without['total']} handoff(s) returned without a readable `thaliris-claims` block (missing {without.get('missing', 0)}, "
+            f"malformed {without.get('malformed', 0)}): {', '.join(without.get('ids') or [])}. Nothing was ingested from them; "
+            "read their final reports yourself."]
+
+
+def _advisory_detail(item: dict) -> str:
+    for key in ("requirements", "paths"):
+        if item.get(key):
+            return ", ".join(map(str, item[key][:6])) + (" …" if len(item[key]) > 6 else "")
+    if item.get("code") == "CHECK_FAILED_TWICE":
+        return f"check {item.get('check_id')}"
+    if item.get("code") == "CHANGE_SIZE_EXCEEDED":
+        return f"{item.get('files')} file(s), {item.get('changed_lines')} changed line(s)"
+    if item.get("code") == "CONTROLLER_TOOL_OUTPUT":
+        return f"{item.get('tokens')} of {item.get('threshold')} tokens"
+    return ""
+
+
+def _advisory_lines(section: dict | None) -> list[str]:
+    items = (section or {}).get("items") or []
+    if not items:
+        return []
+    lines = _bounded([f"- advisory {item.get('code')}: {_advisory_detail(item)}".rstrip(": ") for item in items], "in `status`")
+    lines.append("Adaptive lane advisories never block. When one fires, record why and escalate to delegated "
+                 "(`mode --mode delegated`, on the user's instruction) or continue with a reason.")
+    return lines
+
+
+def evidence_state(root: Path, task_id: str) -> dict | None:
+    """What needs the Controller's attention: the packet text and a digest of its content.
+
+    Open observations and unresolved judgments, plus (Core 0.6.0) checks that withhold, handoffs without typed claims
+    and adaptive lane advisories. The digest leaves out the task revision (every dispatch bumps it), so "nothing new to
+    judge" keeps the same digest however many dispatches were reserved in between. UserPromptSubmit and PostToolUse
+    compare the same digest.
     """
     core.select_task(root, task_id)
-    status = core.task_status(root, view="compact")
+    status = core.task_status(root, view="compact", contract=_task_contract(root, task_id))
     evidence = status["Evidence"]
-    if not (evidence["unincorporated_total"] or evidence["unresolved_judgments_total"]):
+    verification = _verification_lines(status.get("Verification"))
+    claims = _claims_lines(status.get("Claims"))
+    advisories = _advisory_lines(status.get("Advisories"))
+    if not (evidence["unincorporated_total"] or evidence["unresolved_judgments_total"] or verification or claims or advisories):
         return None
     counts = (f"{evidence['unincorporated_total']} observation(s) not yet incorporated into a requirement judgment, "
               f"{evidence['unresolved_judgments_total']} unresolved repair/unknown judgment(s)")
@@ -119,8 +199,12 @@ def evidence_state(root: Path, task_id: str) -> dict | None:
         lines.append(f"- judgment {item['id']}: {item['outcome']} for {item['requirement_ref']} (candidate {item['candidate']})")
     if evidence["next_offset"] is not None:
         lines.append(f"- … more with `status --evidence-offset {evidence['next_offset']}`")
-    lines.append("Before you call a requirement satisfied or close the task, reassess each item for the current candidate "
-                 "(satisfied / unknown / repair / no-current-impact) with `judge`. Reading or forwarding it is not a disposition.")
+    if evidence["unincorporated_total"] or evidence["unresolved_judgments_total"]:
+        lines.append("Before you call a requirement satisfied or close the task, reassess each item for the current candidate "
+                     "(satisfied / unknown / repair / no-current-impact) with `judge`. Reading or forwarding it is not a disposition.")
+    for title, section in (("Verification", verification), ("Claims", claims), ("Advisories", advisories)):
+        if section:
+            lines += [f"{title}:"] + section
     revision = status["Task"]["revision"]
     body = "\n".join(lines)
     return {"revision": revision, "counts": counts, "unincorporated": evidence["unincorporated_total"],
@@ -421,7 +505,131 @@ def pre_tool_use(payload: dict) -> dict | None:
 
 # ------------------------------------------------------ native lifecycle facts
 
+_COUNT_LIMIT = 10 ** 12
+
+
+def _count(value: object) -> int | None:
+    """A Host-reported non-negative integer, or None (UNKNOWN). Booleans and floats are not counts."""
+    if type(value) is int and 0 <= value <= _COUNT_LIMIT:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 12:
+        return int(value)
+    return None
+
+
+def _record_usage(association: tuple[Path, str], match, measured: dict, outcome: str) -> dict | None:
+    """Record dispatch usage on the matched managed handoff (Core `set_handoff_usage`, one revision).
+
+    Every value the Host did not report stays null (UNKNOWN). Usage is a mechanical record for the Controller's routing;
+    it decides nothing. A failure never fails the hook: a bounded diagnostic is noted in the lifecycle instead.
+    Returns {"handoff_id", "revision"} when something was recorded.
+    """
+    try:
+        with store.transaction(*association) as ctx:
+            entry = match(ctx["lifecycle"])
+            if entry is None or not entry.get("handoff_id") or store.handoff(ctx["state"], entry["handoff_id"]) is None:
+                return None
+            usage = {"model": entry.get("observed_model") or entry.get("requested_model"), "effort": entry.get("requested_effort"),
+                     **measured, "outcome": "disposed" if entry["disposed"] else outcome}
+            usage = {key: value for key, value in usage.items() if value is not None}
+            if entry.get("usage_reported") == usage:
+                return None  # the same report again changes nothing (and costs no revision)
+            core.set_handoff_usage(ctx["state"], entry["handoff_id"], usage)
+            entry["usage_reported"] = usage
+            ctx["state_changed"] = ctx["lifecycle_changed"] = True
+            return {"handoff_id": entry["handoff_id"], "revision": ctx["state"]["revision"]}
+    except Exception as exc:  # noqa: BLE001 - a hook degrades; the Controller can read the lifecycle diagnostic
+        diagnostic = f"{type(exc).__name__}: {str(exc)[:200]}"
+    try:
+        with store.transaction(*association, observe_only=True) as ctx:
+            entry = match(ctx["lifecycle"])
+            if entry is not None:
+                store.note(entry, "usage-not-recorded", error=diagnostic)
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _foreground_usage(response: dict) -> dict:
+    """Best effort: the Agent tool result's usage fields are undocumented, so only plainly named counts are read."""
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    measured = {"input_tokens": _count(usage.get("input_tokens")), "output_tokens": _count(usage.get("output_tokens")),
+                "total_tokens": _count(response.get("totalTokens")), "duration_ms": _count(response.get("totalDurationMs")),
+                "tool_uses": _count(response.get("totalToolUseCount"))}
+    return {key: value for key, value in measured.items() if value is not None}
+
+
+_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL)
+_NOTIFICATION_OUTCOMES = {"completed": "completed", "failed": "failed", "error": "failed"}
+NOTIFICATIONS_MAX = 16
+
+
+def _tag(body: str, name: str) -> str | None:
+    found = re.findall(rf"<{name}>([^<>]{{0,128}})</{name}>", body)
+    return found[0].strip() if len(found) == 1 else None
+
+
+def background_notifications(prompt: object) -> list[dict]:
+    """Parse the Host's background-completion notifications in a main-thread prompt (data, never instructions).
+
+    Only the exact tags `<task-id>`, `<status>` and `<usage>` with `<subagent_tokens>`, `<tool_uses>`, `<duration_ms>`
+    are read. A notification without exactly one valid task id is ignored; an unreadable count stays null.
+    """
+    if not isinstance(prompt, str) or "<task-notification>" not in prompt:
+        return []
+    found = []
+    for body in _NOTIFICATION.findall(prompt)[:NOTIFICATIONS_MAX]:
+        task_id = store.native_id(_tag(body, "task-id"))
+        if task_id is None:
+            continue
+        status = (_tag(body, "status") or "").casefold()
+        usages = re.findall(r"<usage>(.*?)</usage>", body, re.DOTALL)
+        usage = usages[0] if len(usages) == 1 else ""
+        measured = {"total_tokens": _count(_tag(usage, "subagent_tokens")), "tool_uses": _count(_tag(usage, "tool_uses")),
+                    "duration_ms": _count(_tag(usage, "duration_ms"))}
+        measured = {key: value for key, value in measured.items() if value is not None}
+        if not status and not measured:
+            continue  # reports nothing: recording it would only cost a revision
+        found.append({"agent_id": task_id, "outcome": _NOTIFICATION_OUTCOMES.get(status, "unknown"), "measured": measured})
+    return found
+
+
+def _output_chars(value: object, depth: int = 0) -> int:
+    """Characters of the text a tool result carries (string leaves; keys and structure are not model-visible output)."""
+    if isinstance(value, str):
+        return len(value)
+    if depth >= 8:
+        return 0
+    if isinstance(value, dict):
+        return sum(_output_chars(item, depth + 1) for item in value.values())
+    if isinstance(value, list):
+        return sum(_output_chars(item, depth + 1) for item in value[:10_000])
+    return 0
+
+
+def _lane_count(payload: dict) -> None:
+    """Adaptive lane counter: add ceil(chars / 4) of a Controller tool result to the task's sidecar counter.
+
+    The launcher only starts Python when this session's lane marker exists; here the association and the anchored
+    mode are re-checked (a stale marker is removed and counts nothing). The counter is advisory input, never a gate,
+    and lives outside the ledger (no revision, no authority bytes).
+    """
+    if payload.get("agent_id") is not None:
+        return  # a child's tool output is its own working set, not the Controller's
+    session = store.native_id(payload.get("session_id"))
+    association = store.resolve_session(session)
+    if not store.sync_lane_marker(session, association) or association is None:
+        return
+    chars = _output_chars(payload.get("tool_response"))
+    if chars:
+        core.select_task(*association)
+        core.task_lane_counter(association[0], add=min(math.ceil(chars / 4), core.LANE_COUNTER_MAX))
+
+
 def post_tool_use(payload: dict) -> dict | None:
+    if payload.get("tool_name") in LANE_TOOLS:
+        _lane_count(payload)
+        return None
     if payload.get("tool_name") not in AGENT_TOOLS:
         return None
     association = store.resolve_session(payload.get("session_id"))
@@ -431,6 +639,13 @@ def post_tool_use(payload: dict) -> dict | None:
     response = payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     agent_id, status = store.native_id(response.get("agentId")), response.get("status")
+    if status == "completed":
+        # Before the observe-only pass, so the revision reported below already includes this write.
+        measured = _foreground_usage(response)
+        if measured:
+            _record_usage(association, lambda lifecycle: next((item for item in lifecycle["dispatches"]
+                                                               if item["tool_use_id"] == payload.get("tool_use_id")), None),
+                          measured, "completed")
     summary, revision = None, None
     with store.transaction(root, task_id, observe_only=True) as ctx:
         revision = ctx["state"]["revision"]
@@ -542,13 +757,37 @@ def subagent_stop(payload: dict) -> dict | None:
     association = store.resolve_session(payload.get("session_id"))
     if agent_id is None or association is None or not _managed_child_type(payload, association):
         return None
+    message = payload.get("last_assistant_message")
+    claims, diagnostic = _ingest_claims(association, agent_id, payload, message)
     with store.transaction(*association, observe_only=True) as ctx:
         entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
         if entry is not None:
-            message = payload.get("last_assistant_message")
-            store.set_status(ctx, entry, "stopped", final_message_chars=len(message) if isinstance(message, str) else None)
+            if diagnostic:
+                store.note(entry, "claims-not-ingested", error=diagnostic)
+            store.set_status(ctx, entry, "stopped", final_message_chars=len(message) if isinstance(message, str) else None,
+                             **({"claims": claims} if claims else {}))
             store.record_host_facts(ctx, entry, payload.get("transcript_path"))
     return None
+
+
+def _ingest_claims(association: tuple[Path, str], agent_id: str, payload: dict, message: object) -> tuple[str | None, str | None]:
+    """Ingest the typed claims of an exactly bound, still running managed handoff, before it is marked stopped.
+
+    Core turns adverse claims into open observations under the handoff's producer and counts supports; a missing or
+    malformed block leaves only Core's marker. Nothing here judges a claim. Returns (claims status, diagnostic);
+    any failure is a bounded diagnostic, never a failed or blocking hook.
+    """
+    try:
+        with store.transaction(*association) as ctx:  # ledger write: authority check, then re-anchor on change
+            entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
+            if (entry is None or entry["binding"] not in store.EXACT_BINDINGS or not entry.get("handoff_id") or entry["disposed"]
+                    or entry["native_status"] in store.TERMINAL_STATUSES or store.handoff(ctx["state"], entry["handoff_id"]) is None):
+                return None, None
+            result = core.ingest_claims(ctx["state"], entry["handoff_id"], message)
+            ctx["state_changed"] = bool(result["changed"])
+            return result["status"], None
+    except Exception as exc:  # noqa: BLE001 - SubagentStop must still record the stop
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
 GLOBAL_GUIDANCE = """\
@@ -635,19 +874,22 @@ def _mode_preference() -> str:
     recorded choice the Controller asks once instead of assuming.
     """
     mode = os.environ.get(MODE_SETTING)
-    if mode in ("delegated", "controller-direct", "single-agent"):
+    if mode in ("delegated", "controller-direct", "single-agent", "adaptive"):
         meaning = {
             "delegated": "For managed Thaliris tasks this is the user explicitly asking you to use the `thaliris:*` "
                          "subagent types, including where your Agent tool says to spawn agents only when the user asks.",
             "controller-direct": "Do managed work yourself and use `thaliris:*` subagents only where the user asks for them.",
             "single-agent": "Do managed work yourself, without Thaliris subagents.",
+            "adaptive": "Admit small tasks quickly (boundary and invariants may be omitted) and do the work yourself; lane "
+                        "advisories never block, and when one fires this is the user asking you to move the work to "
+                        "`thaliris:*` subagents (escalate to delegated).",
         }[mode]
         return (f"\n- User's standing execution mode (the `default_execution_mode` option they chose in this plugin's "
                 f"Claude Code configuration): **{mode}**. {meaning} A mode the user states for a specific task wins; "
                 "record the effective mode in the task's authority contract.")
     return ("\n- No standing execution mode is configured. If your Agent tool says to spawn agents only when the user "
-            "asks, ask the user once at task admission which mode to record (delegated, controller-direct or "
-            "single-agent) instead of assuming delegation.")
+            "asks, ask the user once at task admission which mode to record (delegated, controller-direct, "
+            "single-agent or adaptive) instead of assuming delegation.")
 
 
 def session_start(payload: dict) -> dict | None:
@@ -658,6 +900,7 @@ def session_start(payload: dict) -> dict | None:
     if payload.get("source") in {"compact", "resume", "clear"}:
         store.forget_packet(payload.get("session_id"))  # context was lost; show pending evidence again
     association = store.resolve_session(payload.get("session_id"))
+    store.sync_lane_marker(payload.get("session_id"), association)  # an adaptive task counts; anything else pays nothing
     summary = store.identity_summary(association[0] if association
                                      else store.project_root(Path(payload.get("cwd") or ".")))
     if summary:  # navigation only; nothing at all when the project has no identity
@@ -704,10 +947,19 @@ def user_prompt_submit(payload: dict) -> dict | None:
             for entry in ctx["lifecycle"]["dispatches"]:
                 if entry.get("agent_id") and entry["native_status"] in store.TERMINAL_STATUSES and not entry.get("observed_tools"):
                     store.record_host_facts(ctx, entry, payload.get("transcript_path"))
+    recorded = []
+    if association is not None:
+        for notice in background_notifications(payload.get("prompt")):
+            done = _record_usage(association, lambda lifecycle, agent=notice["agent_id"]: store.dispatch_for_agent(lifecycle, agent),
+                                 notice["measured"], notice["outcome"])
+            if done:
+                recorded.append(done)
+    lines = [f"Thaliris recorded dispatch usage for handoff(s) {', '.join(item['handoff_id'] for item in recorded)}; "
+             f"task revision now {recorded[-1]['revision']}."] if recorded else []
     evidence = evidence_state(*association) if association else None
-    if not evidence or not store.packet_is_new(payload.get("session_id"), evidence["digest"]):
-        return None
-    return _context("UserPromptSubmit", evidence["text"])
+    if evidence and store.packet_is_new(payload.get("session_id"), evidence["digest"]):
+        lines.append(evidence["text"])
+    return _context("UserPromptSubmit", "\n".join(lines)) if lines else None
 
 
 HANDLERS = {

@@ -1,6 +1,6 @@
 {
   "name": "thaliris",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Thaliris context orchestration for Claude Code: a Controller skill, fresh role subagents, and hooks that bind native agent identity and evidence continuity to the shared Thaliris Core (vendored; needs only Python 3.11+).",
   "author": {
     "name": "Thaliris contributors"
@@ -16,11 +16,12 @@
     "default_execution_mode": {
       "type": "string",
       "title": "Default Thaliris execution mode",
-      "description": "How managed project tasks run unless you say otherwise for a task. delegated: Claude hands investigation, implementation and review to fresh thaliris:* subagents (choosing this is your standing request for those subagents; it uses more of your plan's usage). controller-direct: Claude works in the main session and uses subagents only when you ask. single-agent: no Thaliris subagents.",
+      "description": "How managed project tasks run unless you say otherwise for a task. delegated: Claude hands investigation, implementation and review to fresh thaliris:* subagents (choosing this is your standing request for those subagents; it uses more of your plan's usage). controller-direct: Claude works in the main session and uses subagents only when you ask. single-agent: no Thaliris subagents. adaptive: Claude admits small tasks quickly and works directly, and moves to thaliris:* subagents when a lane advisory fires (choosing this is your standing request for those subagents when it does).",
       "options": [
         "delegated",
         "controller-direct",
-        "single-agent"
+        "single-agent",
+        "adaptive"
       ],
       "default": "delegated"
     },
