@@ -154,6 +154,15 @@ effort that fit that working set:
   contracts, involves concurrency, lifecycle or timing, has an unclear causal
   model, or follows a failed attempt or a decision-basis finding; a Reasoning
   Specialist or Reviewer whose challenge is decision-critical.
+- **Frontend work needs a strong model.** Substantive frontend work (new UI or
+  layout, component architecture, responsive behavior, interaction, animation,
+  creative SVG, nontrivial visual design, even when only a few files or lines
+  change) goes to `opus` or a stronger available model, usually a fresh Focused
+  Implementer. Only a genuinely trivial, fully specified edit such as changing a
+  colour or a text, with no design or behavior decision, may use a light model.
+  Route by the described work and the decisions it needs, not by keyword,
+  file-count or diff-size heuristics. If a frozen `claude-model:` constraint
+  prevents this, report the conflict instead of silently downgrading.
 
 Keep long waits off expensive children: when a Focused Implementer converges, send
 push, CI observation and remaining deterministic closure to a fresh `haiku`
@@ -268,10 +277,18 @@ requirements.
   acknowledgement at once; a `<task-notification>` arrives when the child
   finishes. The acknowledgement is not a result. Use background for independent
   Workstreams you can run in parallel.
-- Independent investigations and Workstreams with isolated writes can run in
-  parallel (several Agent calls in one message). Coordinate known overlapping
-  writes first, or give writers `isolation: "worktree"`. File CAS catches lost
-  updates, not semantic overlap. Thaliris roles never use `isolation: "remote"`.
+- Parallel dispatch is user-directed and has no program cap. When the user asks
+  for parallel or large-scale work, run it at the scale they chose (several
+  Agent calls in one message, in as many waves as needed). Read-only work fans
+  out freely: queries across different domains, investigations, review. The one
+  boundary is that writers running at the same time must not overlap in domain or
+  files. Partition the work into non-overlapping domains (different research
+  areas, partitioned material, clearly independent modules, and so on; these are
+  examples, not a list), and give writers that could overlap
+  `isolation: "worktree"` or sequence them. File CAS catches lost updates, not
+  semantic overlap. Thaliris roles never use `isolation: "remote"`. The nested
+  limits (depth two, one Scanner per parent) are authority boundaries, not
+  parallelism caps, and stay.
 - While a child is active you may send it selected supplemental evidence or a
   factual correction inside the same goal and role (SendMessage to its agent ID).
   A message cannot change its authority. After a child returns its final report

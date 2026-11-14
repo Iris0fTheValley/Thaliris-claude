@@ -93,7 +93,7 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
 | --- | --- | --- |
 | `default_execution_mode` | `delegated` | 受管任务的常驻执行模式。选 `delegated` 即用户对 `thaliris:*` 子代理的常驻请求（见下文 Pro 计划限制） |
 | `auto_approve_runner` | 开 | Hook 只批准“单条直接调用本插件 Runner”的命令，避免受管流程每步停下来问权限；plan 模式下只批准只读子命令；串接其他命令一律拒绝 |
-| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型：先定分工与认知隔离，再选能胜任的最便宜模型与 effort（`haiku`/low 用于 Git 收尾、CI 观察与确定性本地工作，`sonnet` 用于因果清晰的本地工作，`opus` 用于耦合或不清晰的工作；设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
+| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型：先定分工与认知隔离，再选能胜任的最便宜模型与 effort（`haiku`/low 用于 Git 收尾、CI 观察与确定性本地工作，`sonnet` 用于因果清晰的本地工作，`opus` 用于耦合或不清晰的工作；实质性前端工作用 `opus` 或更强模型，仅改颜色、改文本等完全明确的琐碎改动可用轻量模型；设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
 
 无需其他步骤：
 
@@ -392,3 +392,22 @@ H136/H137（Curator 不做实时证据、Reviewer 非必经关卡）、H147（�
   切出 adaptive 时删除，SessionStart 重新同步。非 adaptive 会话每次工具调用不启动 Python。
 - **证据包**：`hooks.evidence_state` 传入合同与 root；只在观察/判断待处理，或 Verification（red/stale/unrun、check 文件被改、无 check 的
   compiled/partial）、Claims（无可读声明块的 handoff）、Advisories（adaptive）需要关注时出现；新行进入 digest，每节最多 8 行。
+
+
+## 并行派发由用户决定
+
+适配层对并发的顶层派发没有数量上限。用户要求并行或大规模并行时，Controller 按用户选择的规模执行，程序不替用户设限。
+只读工作可自由扇出：跨不同领域的查询、调查、评审。唯一的边界是：同时运行的写入者不得在领域或文件上重叠。Controller 把工作
+划分成互不重叠的领域（不同的研究方向、分区整理的资料、明确互不影响的模块等，不限于这些），可能重叠的写入者使用
+`isolation: "worktree"` 或改为串行。嵌套限制（深度二、每个父级同时只有一个 Scanner）属于权限边界，不是并行上限，保持不变。
+
+## 兼容性：按 Hook 形状，而非 Claude Code 版本
+
+适配层没有任何 Claude Code 版本闸门，也不在 `plugin.json` 中声明 `engines`（那是精确范围限制）。兼容性取决于 Host 发来的 Hook
+载荷是否具备适配层绑定或记录所需的字段。自检点：SessionStart（`session_id`、`cwd`）、SubagentStart/SubagentStop（`agent_id`、
+`agent_type`）、Agent 的 PostToolUse（`tool_use_id`、`tool_response.status`）、后台 `<task-notification>`（`<task-id>`）。
+字段缺失或类型不符时，只记录一条有界诊断 `host_hook_shape: UNKNOWN (事件 ... 缺少: 字段名)`：SessionStart / SubagentStart /
+PostToolUse / UserPromptSubmit 写入其 additionalContext，SubagentStop 无上下文通道，写 stderr。诊断不改变任何现有行为：不会比
+以前拒绝更多，也不会把未验证的形状当作已绑定。
+
+本地观察到的 Claude Code 为 2.1.312，上游最新为 2.1.325，其更新日志在 2.1.314–2.1.325 未见 Hook 改名。这些只是观察，不是要求。

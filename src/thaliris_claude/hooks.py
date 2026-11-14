@@ -54,6 +54,25 @@ def _context(event: str, text: str, **extra) -> dict:
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text, **extra}}
 
 
+def _shape_gaps(event: str, payload: object, needed: dict[str, type]) -> str:
+    """Hook-shape self-check: name the Host fields this event needs that are missing or of another type.
+
+    Compatibility is by hook shape, never by Claude Code version. A gap is reported as UNKNOWN and changes nothing
+    else: the caller keeps its existing fail-closed or skip behaviour, and an unverified shape is never treated as bound.
+    Dotted names look into nested objects. Returns "" when the shape is as expected; the text is short and bounded.
+    """
+    missing = []
+    for name, kind in needed.items():
+        value = payload
+        for part in name.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if not isinstance(value, kind) or (kind is str and not value):
+            missing.append(name)
+    if not missing:
+        return ""
+    return f"host_hook_shape: UNKNOWN ({event} payload lacks or mistypes: {', '.join(missing[:6])}); binding for this event is not assumed."
+
+
 def _caller(payload: dict) -> dict:
     """Return the caller's identity: child?, Thaliris role or None, native agent id, permissions.
 
@@ -639,6 +658,20 @@ def background_notifications(prompt: object) -> list[dict]:
     return found
 
 
+def notification_gaps(prompt: object) -> str:
+    """Shape check for background-completion notifications: a notification the parser cannot read is UNKNOWN, not absent."""
+    if not isinstance(prompt, str) or "<task-notification>" not in prompt:
+        return ""
+    missing = set()
+    for body in _NOTIFICATION.findall(prompt)[:NOTIFICATIONS_MAX]:
+        for tag in ("task-id",):
+            if store.native_id(_tag(body, tag)) is None:
+                missing.add(f"<{tag}>")
+    if not missing:
+        return ""
+    return f"host_hook_shape: UNKNOWN (task-notification lacks or mistypes: {', '.join(sorted(missing))}); its completion and usage are not recorded."
+
+
 def _output_chars(value: object, depth: int = 0) -> int:
     """Characters of the text a tool result carries (string leaves; keys and structure are not model-visible output)."""
     if isinstance(value, str):
@@ -682,6 +715,7 @@ def post_tool_use(payload: dict) -> dict | None:
         return None
     root, task_id = association
     response = payload.get("tool_response")
+    gaps = _shape_gaps("PostToolUse(Agent)", payload, {"tool_use_id": str, "tool_response.status": str})
     response = response if isinstance(response, dict) else {}
     agent_id, status = store.native_id(response.get("agentId")), response.get("status")
     if status == "completed":
@@ -713,7 +747,7 @@ def post_tool_use(payload: dict) -> dict | None:
             summary = entry
     if payload.get("agent_id") is not None:
         return None  # A nested Scanner result belongs to its parent; global evidence stays with the Controller.
-    lines = []
+    lines = [gaps] if gaps else []
     if summary is not None:
         state = "returned its final report (native execution completed)" if summary["native_status"] == "completed" else (
             "was launched in the background; its completion notification is the result, not this acknowledgement"
@@ -772,6 +806,10 @@ def _managed_child_type(payload: dict, association: tuple[Path, str] | None) -> 
 def subagent_start(payload: dict) -> dict | None:
     agent_id = store.native_id(payload.get("agent_id"))
     association = store.resolve_session(payload.get("session_id"))
+    gaps = _shape_gaps("SubagentStart", payload, {"agent_id": str, "agent_type": str})
+    if gaps and (association is not None or roles.role_for_agent_type(payload.get("agent_type")) is not None):
+        # The child cannot be bound without these fields: say so, and bind nothing (the fail-closed gates stay as they are).
+        return _context("SubagentStart", gaps + " Keep decision-changing observations, with their sources, in your final report.")
     if agent_id is None or not _managed_child_type(payload, association):
         return None
     lines = [f"Thaliris runner for this session: `{runner_command()}` (run it as one direct command)."]
@@ -806,6 +844,9 @@ def subagent_start(payload: dict) -> dict | None:
 def subagent_stop(payload: dict) -> dict | None:
     agent_id = store.native_id(payload.get("agent_id"))
     association = store.resolve_session(payload.get("session_id"))
+    gaps = _shape_gaps("SubagentStop", payload, {"agent_id": str, "agent_type": str})
+    if gaps and association is not None:
+        print(f"thaliris {gaps}", file=sys.stderr)  # this event has no context channel; stderr is what hooks already use
     if agent_id is None or association is None or not _managed_child_type(payload, association):
         return None
     message = payload.get("last_assistant_message")
@@ -904,8 +945,13 @@ def _model_choice() -> str:
             "explicitly asking you to set it. Division of labor and cognitive isolation come first, never traded for cost; "
             "then pick the cheapest fitting model: `haiku` (effort low) for Git closure, CI observation and "
             "deterministic fully specified local work, `sonnet` for clear local work, `opus` for coupled or unclear "
-            "work and decision-critical challenges. Send CI waits to a fresh haiku Implementer, and move up a tier only "
-            "on evidence.")
+            "work and decision-critical challenges. Substantive frontend work (new UI or layout, component architecture, "
+            "responsive behavior, interaction, animation, creative SVG, nontrivial visual design, even when the diff is "
+            "small) goes to `opus` or a stronger available model, usually a fresh Focused Implementer; only a genuinely "
+            "trivial, fully specified edit such as changing a colour or text, with no design or behavior decisions, may "
+            "use a light model. Route by the described work and its decisions, not by keyword, file-count or diff-size; "
+            "if a frozen `claude-model:` constraint prevents this, report the conflict instead of silently downgrading. "
+            "Send CI waits to a fresh haiku Implementer, and move up a tier only on evidence.")
 
 
 def _controller_model_warning(model: object) -> str:
@@ -948,6 +994,9 @@ def session_start(payload: dict) -> dict | None:
             + _controller_model_warning(payload.get("model")))
     # Name the code actually loaded: a fixed checkout is not proof of what a Host runs (H096).
     text += f"\n- Loaded adapter: thaliris-claude {__version__} from `{plugin_root().as_posix()}`."
+    gaps = _shape_gaps("SessionStart", payload, {"session_id": str, "cwd": str})
+    if gaps:
+        text += "\n- " + gaps
     if payload.get("source") in {"compact", "resume", "clear"}:
         store.forget_packet(payload.get("session_id"))  # context was lost; show pending evidence again
     association, problem = store.inspect_session(payload.get("session_id"))
@@ -1014,6 +1063,9 @@ def user_prompt_submit(payload: dict) -> dict | None:
                 recorded.append(done)
     lines = [f"Thaliris recorded dispatch usage for handoff(s) {', '.join(item['handoff_id'] for item in recorded)}; "
              f"task revision now {recorded[-1]['revision']}."] if recorded else []
+    gaps = notification_gaps(payload.get("prompt")) if association is not None else ""
+    if gaps:
+        lines.append(gaps)
     evidence = evidence_state(*association) if association else None
     if evidence and store.packet_is_new(payload.get("session_id"), evidence["digest"]):
         lines.append(evidence["text"])
