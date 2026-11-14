@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/Iris0fTheValley/Thaliris",
-  "commit": "4f4137fedf6746a9f7b054083098378ac1340dda",
+  "commit": "ca4661168d3499c693c5ba9559ed84fdd4a943f9",
   "path": "src/thaliris",
   "files": {
     "thaliris/__init__.py": "7d6f24ba041dc05c09a17c3c632ae6e6657b9ae735620877d4c53ad88a87143c",
-    "thaliris/authority.py": "e96e9cd687338721eb15e523c2463a99a19b571dbbd6825ac2a79376913e9454",
+    "thaliris/authority.py": "60331c3f5330ce79d65f8390ae0c17a3990486bd20a1f9cf940bef88778487cd",
     "thaliris/claims.py": "6b9e3a4f773c65a7c0aca3dff8281f56ae1b9fcfe6f8ad3f429f54a40a9dd4bc",
     "thaliris/cli.py": "ade61bda731f273afdbbd1e58826c8f31caa3e3a4f334ec42d6befae08506f81",
     "thaliris/core.py": "99bb1df90fe8e5ccb9421aa03830a53406169c103b5f8ac939946484c7db62b4",
