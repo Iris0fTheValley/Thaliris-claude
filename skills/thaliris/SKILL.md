@@ -136,7 +136,7 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
 
 **Choosing models is yours.** The table shows defaults, which apply only when you
 set no `model`. Unless the user chose `role-defaults` (your session context says
-which), set `model` on each Agent call as the work requires; the adapter never
+which; even then the frontend minimum below still applies), set `model` on each Agent call as the work requires; the adapter never
 overrides or refuses your choice. **Division of labor and cognitive isolation come
 first**: decide the Workstream's shape, role and self-contained working set before
 thinking about cost. Never merge separable Workstreams, skip a fitting role or hand

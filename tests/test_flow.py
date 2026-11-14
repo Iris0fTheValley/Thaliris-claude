@@ -416,9 +416,14 @@ def test_session_start_warns_about_a_small_controller(task, monkeypatch):
     assert "small or low-capability model" not in strong["hookSpecificOutput"]["additionalContext"]
 
 
-def test_model_guidance_requires_a_strong_model_for_frontend(task):
+def test_model_guidance_requires_a_strong_model_for_frontend(task, monkeypatch):
+    monkeypatch.delenv(hooks.MODEL_SETTING, raising=False)
     text = run_hook("SessionStart", _base(task, "SessionStart", source="startup"))["hookSpecificOutput"]["additionalContext"]
     assert "Substantive frontend work" in text and "trivial" in text and "claude-model:" in text
+    monkeypatch.setenv(hooks.MODEL_SETTING, "role-defaults")
+    text = run_hook("SessionStart", _base(task, "SessionStart", source="startup"))["hookSpecificOutput"]["additionalContext"]
+    assert "substantive frontend work" in text and "`opus`" in text and "trivial" in text
+    assert "not by keyword" in text and "instead of silently downgrading" in text and "claude-model:" in text
 
 
 def test_hook_shape_gaps_surface_as_unknown_and_bind_nothing(task, capsys):

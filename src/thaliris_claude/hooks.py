@@ -939,7 +939,14 @@ def _model_choice() -> str:
     """
     if os.environ.get(MODEL_SETTING, "controller") == "role-defaults":
         return ("\n- Model selection (plugin option `model_selection`): the user prefers each role's default model; "
-                "set `model` only when they ask for one.")
+                "set `model` only when they ask for one. Exception, the user's frontend rule: this is the user "
+                "explicitly asking you to set `model` for substantive frontend work (new UI or layout, component "
+                "architecture, responsive behavior, interaction, animation, creative SVG, nontrivial visual design, "
+                "even when the diff is small), which goes to `opus` or a stronger available model; only a genuinely "
+                "trivial, fully specified edit such as changing a colour or a text, with no design or behavior "
+                "decision, may use a light model. Route by the described work and the decisions it needs, not by "
+                "keyword, file-count or diff-size heuristics. If a frozen `claude-model:` constraint prevents this, "
+                "report the conflict instead of silently downgrading. Every other dispatch uses the role defaults.")
     return ("\n- Model selection (plugin option `model_selection` = controller): the user asks you to choose the model "
             "of every Thaliris role per dispatch, so set `model` on Agent calls as the work requires; this is the user "
             "explicitly asking you to set it. Division of labor and cognitive isolation come first, never traded for cost; "
