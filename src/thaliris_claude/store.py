@@ -611,9 +611,51 @@ def set_status(ctx: dict, entry: dict, status: str, **fields) -> None:
             note(entry, event, **fields)
             ctx["lifecycle_changed"] = True
         return
+    # A start after an interim stop is the same handoff continuing (it never returned its final report).
+    resumed = status == "running" and entry.pop("interim_stop", None) is not None
+    if status in TERMINAL_STATUSES:
+        entry.pop("interim_stop", None)
+        entry.pop("interim_claims", None)  # ingested (or superseded) by the final report just before this
     entry["native_status"] = status
-    note(entry, status, **fields)
+    note(entry, "resumed-after-interim" if resumed else status, **fields)
     ctx["lifecycle_changed"] = True
+
+
+INTERIM_IDS_MAX = 16
+
+
+def mark_interim(ctx: dict, entry: dict, background_task_ids: list[str]) -> None:
+    """Record a turn end the Host keeps alive for the child's own live background work (not its final report).
+
+    Only an exactly bound, undisposed, unfinished background handoff reaches here. The entry stays unresolved
+    (`running`), so the child keeps the writes its handoff grants when it resumes; nothing about acceptance changes.
+    The next stop without live background work of its own is the final report, and finishes it as before.
+    """
+    if entry["disposed"] or entry["native_status"] in TERMINAL_STATUSES:
+        raise ValueError("INTERIM_STOP_ON_CLOSED_HANDOFF")  # a caller bug: a closed handoff is never reopened
+    entry["native_status"] = "running"
+    entry["interim_stop"] = {"at": now(), "background_task_ids": background_task_ids[:INTERIM_IDS_MAX]}
+    entry["was_interim"] = True  # kept for the entry's life: the bounded event history may drop the event
+    note(entry, "interim-stop", background_tasks=len(background_task_ids))
+    ctx["lifecycle_changed"] = True
+
+
+INTERIM_CLAIMS_MAX_CHARS = 64 * 1024
+
+
+def keep_interim_claims(entry: dict, message: object) -> None:
+    """Keep a bounded copy of an interim stop's message when it carries a readable claims block.
+
+    A child often writes its report, claims block included, at the stop where it starts waiting, and ends with a bare
+    message. The final stop ingests this copy when its own message has no readable block; the latest kept copy wins.
+    """
+    if not isinstance(message, str) or core.parse_claim_block(message)["status"] != "present":
+        return
+    if len(message) > INTERIM_CLAIMS_MAX_CHARS:
+        note(entry, "interim-claims-not-kept", chars=len(message))
+        return
+    entry["interim_claims"] = {"message": message, "at": now()}
+    note(entry, "interim-claims-kept", chars=len(message))
 
 
 def host_agent_meta(transcript_path: object, agent_id: str) -> dict | None:
