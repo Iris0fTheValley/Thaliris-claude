@@ -88,48 +88,117 @@ def _valid_write_surface(value: object) -> bool:
     return True
 
 
-_SCOPE_META = set("*?[]{}")
-_SHORT_NAME = re.compile(r"~\d+")
+_SCOPE_META = set("*?")
+_SHORT_NAME = re.compile(r"^[^.~]{1,6}~\d{1,6}(\.[^.]{0,3})?$", re.IGNORECASE)
+_PARENT_HINT = "; declare a parent directory instead"
 
 
 def canonical_scope(value: str) -> str:
     """Return the canonical repo-relative spelling of a dispatch scope.
 
+    Scopes are literal paths, never patterns: ``[ ] { } ( )`` are ordinary characters.
     NFC, casefolded on every platform (a false overlap refusal is the conservative
     direction), backslash becomes ``/``, repeated ``/`` collapse and a leading ``./``
-    or leading/trailing ``/`` is stripped.  Raises ``ValueError`` for empty scopes,
-    ``.``/``..`` segments, drive-letter, UNC or ``~`` home forms, glob metacharacters,
-    segments ending in a dot or space, 8.3 short names (``~N``), ``:`` and control
-    characters.  Scopes are therefore plain, case- and Unicode-insensitive paths.
+    or leading/trailing ``/`` is stripped.  Raises ``ValueError`` (naming the failed
+    rule) for empty scopes, ``.``/``..`` segments, drive-letter, UNC or ``~`` home
+    forms, ``*``/``?``, segments ending in a dot or space, ``:`` and control
+    characters.  Windows 8.3-looking segments (``PROGRA~1``) are admitted; see
+    ``scopes_overlap`` for how they are compared.
     """
     if not isinstance(value, str):
-        raise ValueError("invalid scope")
+        raise ValueError("invalid scope: must be a string")
     text = unicodedata.normalize("NFC", value.strip()).replace("\\", "/")
     if text.startswith("//"):
-        raise ValueError("invalid scope: UNC path")
+        raise ValueError("invalid scope: UNC paths are not repo-relative" + _PARENT_HINT)
     if any(ord(c) < 32 or ord(c) == 127 for c in text):
-        raise ValueError("invalid scope: control character")
+        raise ValueError("invalid scope: control characters are not allowed")
     if _SCOPE_META & set(text):
-        raise ValueError("invalid scope: glob metacharacter")
+        raise ValueError("invalid scope: '*' and '?' are glob-only characters and invalid in Windows file names" + _PARENT_HINT)
     if ":" in text:
-        raise ValueError("invalid scope: drive or stream form")
+        raise ValueError("invalid scope: ':' (drive letter or stream form) is not allowed; use a repo-relative path")
     text = re.sub(r"/+", "/", text)
     while text.startswith("./"):
         text = text[2:]
     text = text.strip("/")
-    if not text or text.startswith("~"):
-        raise ValueError("invalid scope")
+    if not text:
+        raise ValueError("invalid scope: empty scope")
+    if text.startswith("~"):
+        raise ValueError("invalid scope: a leading '~' means a home directory; use a repo-relative path")
     segments = text.split("/")
     for part in segments:
-        if part in {".", ".."} or part.endswith((".", " ")) or part != part.strip() or _SHORT_NAME.search(part):
-            raise ValueError("invalid scope segment")
+        if part in {".", ".."}:
+            raise ValueError("invalid scope: '.' and '..' segments are not allowed")
+        if part.endswith((".", " ")) or part != part.strip():
+            raise ValueError("invalid scope: a segment may not start or end with a space or end with a dot" + _PARENT_HINT)
     return unicodedata.normalize("NFC", "/".join(segments).casefold())
 
 
 def scopes_overlap(a: str, b: str) -> bool:
-    """True when the canonical scopes are equal or one is a path-segment prefix of the other."""
-    ca, cb = canonical_scope(a), canonical_scope(b)
-    return ca == cb or ca.startswith(cb + "/") or cb.startswith(ca + "/")
+    """True when the canonical scopes may name the same write domain.
+
+    Equal or path-segment prefix overlaps.  A segment that looks like a Windows 8.3
+    short name (``PROGRA~1``) may alias any sibling under the same parent, so if either
+    scope has one at index i the scopes also overlap when both have at least i segments
+    and agree on every segment below i.  This can over-refuse siblings; it never
+    under-detects.
+    """
+    return _canonical_overlap(canonical_scope(a), canonical_scope(b))
+
+
+def _canonical_overlap(ca: str, cb: str) -> bool:
+    if ca == cb or ca.startswith(cb + "/") or cb.startswith(ca + "/"):
+        return True
+    sa, sb = ca.split("/"), cb.split("/")
+    for segs in (sa, sb):
+        for i, part in enumerate(segs):
+            if _SHORT_NAME.match(part) and len(sa) >= i and len(sb) >= i and sa[:i] == sb[:i]:
+                return True
+    return False
+
+
+def _first_short_index(segs: list[str]) -> int | None:
+    for i, part in enumerate(segs):
+        if _SHORT_NAME.match(part):
+            return i
+    return None
+
+
+class _WriteScopeIndex:
+    """Near-linear equivalent of pairwise ``_canonical_overlap`` over claimed scopes.
+
+    ``claimed`` holds whole scopes, ``prefixes`` every prefix (including the empty one
+    and the scope itself) of every claimed scope, and ``short_parents`` the canonical
+    parent prefix of the first 8.3-looking segment of each claimed scope.  Only the first
+    8.3 segment matters: agreement below a later one implies agreement below the first.
+    """
+
+    def __init__(self) -> None:
+        self.claimed: set[tuple[str, ...]] = set()
+        self.prefixes: set[tuple[str, ...]] = set()
+        self.short_parents: set[tuple[str, ...]] = set()
+
+    def overlaps(self, canonical: str) -> bool:
+        segs = tuple(canonical.split("/"))
+        # equal to, or a descendant of, a claimed scope
+        if any(segs[:k] in self.claimed for k in range(1, len(segs) + 1)):
+            return True
+        # an ancestor of (or equal to) a claimed scope
+        if segs in self.prefixes:
+            return True
+        # a claimed 8.3 segment may alias one of our segments
+        if any(segs[:j] in self.short_parents for j in range(len(segs) + 1)):
+            return True
+        # our 8.3 segment may alias a sibling of any claimed scope that extends the parent
+        i = _first_short_index(list(segs))
+        return i is not None and segs[:i] in self.prefixes
+
+    def add(self, canonical: str) -> None:
+        segs = tuple(canonical.split("/"))
+        self.claimed.add(segs)
+        self.prefixes.update(segs[:k] for k in range(len(segs) + 1))
+        i = _first_short_index(list(segs))
+        if i is not None:
+            self.short_parents.add(segs[:i])
 
 
 # State-size guard only: total characters across all declared workstream strings.
@@ -157,8 +226,7 @@ def _validate_parallel_dispatch(value: object) -> None:
     if not isinstance(streams, list):
         raise ValueError("invalid parallel_dispatch workstreams")
     ids: set[str] = set()
-    write_scopes: set[str] = set()
-    write_ancestors: set[str] = set()  # every proper path prefix of a claimed write scope
+    write_scopes = _WriteScopeIndex()
     text = 0
     for stream in streams:
         if not isinstance(stream, dict) or set(stream) != {"id", "domain", "scope", "worktree", "mode"}:
@@ -186,14 +254,10 @@ def _validate_parallel_dispatch(value: object) -> None:
         if mode != "write":
             continue
         for item in normalized:
-            parts = item.split("/")
-            prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
-            if item in write_ancestors or any(prefix in write_scopes for prefix in prefixes):
+            if write_scopes.overlaps(item):
                 raise ValueError("overlapping parallel_dispatch write scopes")
         for item in normalized:
-            parts = item.split("/")
             write_scopes.add(item)
-            write_ancestors.update("/".join(parts[:i]) for i in range(1, len(parts)))
 
 
 def digest(target: Path) -> str:
