@@ -315,9 +315,10 @@ def test_message_to_finished_child_still_refused(task):
 
 # ------------------------------------------------- H: an interim turn end is not the final report
 #
-# Shapes observed on Claude Code 2.1.325: SubagentStop's `background_tasks` lists the session's in-flight tasks
-# (id, type, status; no owner) and the child's transcript holds the Host's tool result for each background launch. The
-# main thread's notification for such a stop says "completed" but notes that the result "may be interim".
+# SubagentStop's `background_tasks` (id, type, status of the session's in-flight tasks; no owner) is as documented in
+# the Claude Code hooks reference; no live SubagentStop payload has been probed. The child-transcript tool results and
+# the main-thread notification text ("completed", but its note says the result "may be interim") are as observed in
+# real Claude Code 2.1.325 transcripts.
 
 INTERIM_NOTE = ("This agent stopped with background work of its own still running. It may resume on its own when that work "
                 "completes or reports, and the same task-id notifies again if it does; the result below may be interim.")
@@ -402,7 +403,8 @@ def test_interim_stop_then_resume_keeps_the_handoff_writable(task):
     _stop_now(task, [SUITE, CONTROLLER_SHELL, SELF, MONITOR], message=_claims_message())
 
     entry = _entry()
-    assert entry["native_status"] == "running" and entry["events"][-1]["event"] == "interim-stop"
+    assert entry["native_status"] == "running" and [item["event"] for item in entry["events"][-2:]] == [
+        "interim-stop", "interim-claims-kept"]
     assert entry["interim_stop"]["background_task_ids"] == ["bmon0001", "bsuite01"]  # never the Controller's or its own
     assert len(_ledger(task)["observations"]) == observations and "claims" not in _handoff_record(task, handoff)
     assert run_cli("status")[1]["Dispatches"]["open"][0]["handoff_id"] == handoff
@@ -503,13 +505,18 @@ def test_only_launches_the_host_recorded_for_the_child_count(task):
     assert _decision(run_hook("PreToolUse", _write(task, **IMPL))) == "deny"
 
 
-def test_timed_out_command_moved_to_the_background_counts_as_own_work(task):
-    _background_implementer(task)
-    _child_transcript(task, "impl", ("PowerShell", {"command": "pytest -q"},
-                                     "Command did not complete within its 120s timeout and was moved to the background "
-                                     "(ID: bsuite01). Output is being written to: C:\\t\\bsuite01.output."))
-    _stop_now(task, [SUITE])
-    assert _entry()["native_status"] == "running" and _entry()["interim_stop"]["background_task_ids"] == ["bsuite01"]
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_moved_to_background_wording_is_never_own_work(task, tool):
+    """A foreground result is the command's own output: echoing the Host's timeout wording forges nothing (fails closed)."""
+    handoff = _background_implementer(task)
+    wording = ("Command did not complete within its 1s timeout and was moved to the background (ID: bctrl001). Output is "
+               "being written to: C:\\t\\bctrl001.output.")
+    _child_transcript(task, "impl", (tool, {"command": f"echo '{wording}'"}, wording))
+    _stop_now(task, [CONTROLLER_SHELL, SELF], message=_claims_message("**Conclusion** done"))
+    entry = _entry()
+    assert entry["native_status"] == "stopped" and "interim_stop" not in entry and not entry.get("was_interim")
+    assert _handoff_record(task, handoff)["claims"]["status"] == "present"  # its claims were ingested as the final report
+    assert _decision(run_hook("PreToolUse", _write(task, **IMPL))) == "deny"
 
 
 def test_disposed_child_with_live_background_work_stays_fenced(task):
@@ -534,6 +541,88 @@ def test_host_final_notification_finishes_a_child_the_adapter_saw_as_interim(tas
     assert "now finished and fenced" in context and "read its final report yourself" in context
     assert _entry()["native_status"] == "stopped" and "interim_stop" not in _entry()
     assert _decision(run_hook("PreToolUse", _write(task, **IMPL))) == "deny"
+
+
+def test_host_final_notification_ingests_the_claims_an_interim_stop_kept(task):
+    handoff = _background_implementer(task)
+    _child_transcript(task, "impl", _launch("bsuite01"))
+    _stop_now(task, [SUITE, SELF], message=_claims_message("**Conclusion** done; waiting on the suite."))
+    context = _notify(task, "impl", FINAL_NOTE, "finished")
+    assert "claims block from its interim report was ingested" in context
+    assert _handoff_record(task, handoff)["claims"]["status"] == "present"
+    assert any(item["id"] == f"{handoff}.c1" for item in _ledger(task)["observations"])
+    entry = _entry()
+    assert entry["native_status"] == "stopped" and entry["claims_source"]["stop"] == "interim" and "interim_claims" not in entry
+
+
+def test_claims_written_at_the_interim_stop_survive_a_bare_final_message(task):
+    """Observed on the Host: the report with the claims block comes at the interim stop; the final message is bare."""
+    handoff = _background_implementer(task)
+    _child_transcript(task, "impl", _launch("bsuite01"))
+    _stop_now(task, [SUITE, SELF], message=_claims_message("**Conclusion** done; waiting on the suite to confirm."))
+    kept_at = _entry()["interim_claims"]["at"]
+    assert "claims" not in _handoff_record(task, handoff)  # not final yet: nothing ingested
+    _start(task, "impl", "thaliris:implementer")
+    assert _entry()["interim_claims"]["at"] == kept_at  # a resume keeps the copy
+    _stop_now(task, [SELF], message="Suite passed; nothing new to add.")
+
+    entry = _entry()
+    assert entry["native_status"] == "stopped" and "interim_claims" not in entry
+    assert entry["claims_source"] == {"stop": "interim", "at": kept_at}
+    assert any(item["event"] == "claims-from-interim-stop" for item in entry["events"])
+    assert _handoff_record(task, handoff)["claims"]["status"] == "present"
+    assert any(item["id"] == f"{handoff}.c1" for item in _ledger(task)["observations"])
+    assert _decision(run_hook("PreToolUse", _write(task, **IMPL))) == "deny"
+
+
+def test_a_claims_block_in_the_final_message_supersedes_the_kept_one(task):
+    handoff = _background_implementer(task)
+    _child_transcript(task, "impl", _launch("bsuite01"))
+    _stop_now(task, [SUITE, SELF], message=_claims_message())
+    final = ("Done.\n\n```thaliris-claims\n" + json.dumps({"claims": [
+        {"requirement": "R1", "polarity": "supports", "text": "suite green", "evidence": "pytest -q", "basis": "check"}]})
+        + "\n```\n")
+    _stop_now(task, [SELF], message=final)
+    assert _entry()["claims_source"] == {"stop": "final"}
+    record = _handoff_record(task, handoff)
+    assert record["claims"]["status"] == "present" and record["claims"]["supports"][0]["evidence"] == "pytest -q"
+    assert not any(item["id"] == f"{handoff}.c1" for item in _ledger(task)["observations"])  # the kept adverse claim is not
+
+
+def test_notified_and_interim_markers_outlive_the_bounded_event_history(task):
+    """The guards are entry fields: more than 16 later events (the history bound) change nothing."""
+    _background_implementer(task)
+    _child_transcript(task, "impl", _launch("bsuite01"))
+    _stop_now(task, [SUITE, SELF])
+    _start(task, "impl", "thaliris:implementer")
+    _stop_now(task, [SELF])  # final; the earlier interim stop is a field, not only an event
+    for _ in range(10):
+        _start(task, "impl", "thaliris:implementer")  # resumed-after-terminal
+        _result(task, "tu1", {"isAsync": True, "status": "async_launched", "agentId": "impl"})  # a late acknowledgement
+    assert not any(item["event"] == "interim-stop" for item in _entry()["events"]) and len(_entry()["events"]) == 16
+    assert "stays finished" not in _notify(task, "impl", INTERIM_NOTE, "is waiting on its own background work")
+
+    _dispatch(task, "tu2", role="implementer", run_in_background=True)
+    _result(task, "tu2", {"isAsync": True, "status": "async_launched", "agentId": "impl2"})
+    _start(task, "impl2", "thaliris:implementer", "tu2")
+    _stop_now(task, None, agent_id="impl2")  # fenced without an interim stop
+    assert "stays finished" in _notify(task, "impl2", INTERIM_NOTE, "is waiting on its own background work")
+    for _ in range(10):
+        _start(task, "impl2", "thaliris:implementer")
+        _result(task, "tu2", {"isAsync": True, "status": "async_launched", "agentId": "impl2"})
+    assert not any(item["event"] == "host-interim-while-fenced" for item in _entry(1)["events"])
+    assert "stays finished" not in _notify(task, "impl2", INTERIM_NOTE, "is waiting on its own background work")
+
+
+def test_launches_not_in_flight_leave_a_diagnostic_that_explains_a_host_interim_note(task):
+    _background_implementer(task)
+    _child_transcript(task, "impl", _launch("bsuite01"))
+    _stop_now(task, [CONTROLLER_SHELL, SELF])
+    entry = _entry()
+    assert entry["native_status"] == "stopped"
+    assert "lists none of them in flight" in entry["final_stop_reason"] and "bsuite01" in entry["final_stop_reason"]
+    context = _notify(task, "impl", INTERIM_NOTE, "is waiting on its own background work")
+    assert "stays finished" in context and "lists none of them in flight" in context
 
 
 @pytest.mark.parametrize(("note", "summary", "phase"), [

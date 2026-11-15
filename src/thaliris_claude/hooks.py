@@ -691,16 +691,18 @@ def _reconcile_stop(ctx: dict, entry: dict, phase: str) -> str | None:
     name = entry["handoff_id"] or "(no evidence association)"
     if phase == "final" and entry.get("interim_stop") is not None and entry["native_status"] in store.UNRESOLVED_STATUSES:
         store.set_status(ctx, entry, "stopped", reason="host-reported-final")
+        claims = ("the claims block from its interim report was ingested, but its final message was not read, so check its "
+                  "final report too" if (entry.get("claims_source") or {}).get("stop") == "interim"
+                  else "its typed claims were not ingested, so read its final report yourself")
         return (f"Thaliris {entry['role']} dispatch {name}: the Host reports it finished with no live background work of its "
-                "own, while the adapter had recorded its last stop as interim. It is now finished and fenced; its typed "
-                "claims were not ingested, so read its final report yourself.")
-    events = [item.get("event") for item in entry.get("events") or []]
+                f"own, while the adapter had recorded its last stop as interim. It is now finished and fenced; {claims}.")
+    # Markers are entry fields, not events: the event history keeps only the last 16.
     if (phase == "interim" and entry["native_status"] in store.TERMINAL_STATUSES and not entry["disposed"]
-            and "interim-stop" not in events and "host-interim-while-fenced" not in events):
-        reasons = [item.get("reason") for item in entry.get("events") or [] if item.get("event") == "stop-treated-final"]
+            and not entry.get("was_interim") and not entry.get("host_interim_notified")):
         store.note(entry, "host-interim-while-fenced")
+        entry["host_interim_notified"] = True
         ctx["lifecycle_changed"] = True
-        why = f" ({reasons[-1]})" if reasons and reasons[-1] else ""
+        why = f" ({entry['final_stop_reason']})" if entry.get("final_stop_reason") else ""
         return (f"Thaliris {entry['role']} dispatch {name}: the Host reports this child is waiting on its own background work "
                 f"(its result may be interim), but the adapter recorded that stop as its final report{why}. Lifecycle "
                 "faults fail closed, so it stays finished: when it resumes, its writes, `observe` and commits are refused. "
@@ -901,8 +903,6 @@ def subagent_start(payload: dict) -> dict | None:
 # launched is in flight. Anything else, including an unreadable or unexpected signal, is today's final report.
 
 _BACKGROUND_RUN = re.compile(r"Command running in background with ID: ([A-Za-z0-9_-]{1,64})\.")
-_BACKGROUND_MOVED = re.compile(r"Command did not complete within its \d{1,7}s timeout and was moved to the background "
-                               r"\(ID: ([A-Za-z0-9_-]{1,64})\)")
 _MONITOR_STARTED = re.compile(r"Monitor started \(task ([A-Za-z0-9_-]{1,64})[,)]")
 # The Host lists only in-flight tasks (running or pending, not foreground). A Monitor task is a shell task kind.
 LIVE_TASK_STATUSES = frozenset({"running", "pending"})
@@ -931,10 +931,12 @@ def _result_text(content: object) -> str:
 def own_background_launches(path: Path | None) -> set[str] | None:
     """Ids of the background shell and Monitor tasks a child launched, read from the Host's tool results in its transcript.
 
-    Only the result the Host writes for a launch counts, matched to the call that made it: a Bash/PowerShell call with
-    `run_in_background` ("Command running in background with ID: …"), one the Host moved to the background on its
-    timeout, or a Monitor start. The transcript format is undocumented: None (UNKNOWN) when it cannot be read or is
-    larger than the bound; a line that does not parse is skipped.
+    Only a result that the child's own output cannot write counts, matched to the call that made it: a Bash/PowerShell
+    call with `run_in_background` ("Command running in background with ID: …", returned before the command prints
+    anything) or a Monitor start. A foreground command the Host moves to the background on its timeout is not counted:
+    that tool result is the command's output, which the child controls, so such a stop stays a final report. The
+    transcript format is undocumented: None (UNKNOWN) when it cannot be read or is larger than the bound; a line that
+    does not parse is skipped.
     """
     if path is None:
         return None
@@ -962,8 +964,8 @@ def own_background_launches(path: Path | None) -> set[str] | None:
                 calls[block["id"]] = (block.get("name"), block["input"] if isinstance(block.get("input"), dict) else {})
             elif record.get("type") == "user" and block.get("type") == "tool_result" and block.get("is_error") is not True:
                 name, tool_input = calls.get(block.get("tool_use_id"), (None, {}))
-                if name in SHELL_TOOLS:
-                    pattern = _BACKGROUND_RUN if tool_input.get("run_in_background") is True else _BACKGROUND_MOVED
+                if name in SHELL_TOOLS and tool_input.get("run_in_background") is True:
+                    pattern = _BACKGROUND_RUN
                 elif name == "Monitor":
                     pattern = _MONITOR_STARTED
                 else:
@@ -990,13 +992,17 @@ def own_live_background_work(payload: dict, agent_id: str) -> tuple[list[str], s
         return [], None
     listed = {item["id"]: item for item in tasks if isinstance(item.get("id"), str) and item["id"] != agent_id
               and item.get("type") in OWN_TASK_TYPES}
-    if not listed:
-        return [], None  # nothing of a kind the child can own is in flight: an ordinary final report
     launched = own_background_launches(_agent_transcript(payload, agent_id))
     if launched is None:
+        if not listed:
+            return [], None  # nothing of a kind the child can own is in flight: an ordinary final report
         return [], (f"{len(listed)} background shell/monitor task(s) were in flight, but the child's transcript could not be "
                     "read, so whether any is its own is UNKNOWN; this stop was treated as its final report.")
     own = sorted(task_id for task_id in listed if task_id in launched)
+    if launched and not own:
+        # Usually the launches finished long ago. Recorded so that a Host "interim" notification can be explained.
+        return [], (f"the child launched background task(s) {', '.join(sorted(launched)[:8])}, but background_tasks lists "
+                    "none of them in flight, so this stop was treated as its final report.")
     unexpected = [task_id for task_id in own if listed[task_id].get("status") not in LIVE_TASK_STATUSES]
     if unexpected:
         return [], (f"the child's background task(s) {', '.join(unexpected[:8])} were listed with an unexpected status "
@@ -1027,6 +1033,10 @@ def _record_interim_stop(association: tuple[Path, str], agent_id: str, payload: 
         own, diagnostic = own_live_background_work(payload, agent_id)
         if own and entry["binding"] in store.EXACT_BINDINGS and entry.get("background") is True:
             store.mark_interim(ctx, entry, own)
+            try:
+                store.keep_interim_claims(entry, payload.get("last_assistant_message"))
+            except Exception as exc:  # noqa: BLE001 - the interim stop stands; the final message is still ingested
+                store.note(entry, "interim-claims-not-kept", error=f"{type(exc).__name__}: {str(exc)[:200]}")
             return True
         if own:
             diagnostic = (f"the child's own background task(s) {', '.join(own[:8])} were in flight, but its dispatch is "
@@ -1034,6 +1044,7 @@ def _record_interim_stop(association: tuple[Path, str], agent_id: str, payload: 
                           "so this stop was treated as its final report.")
         if diagnostic:
             store.note(entry, "stop-treated-final", reason=diagnostic[:400])
+            entry["final_stop_reason"] = diagnostic[:400]  # a field: the bounded event history may drop the event
             ctx["lifecycle_changed"] = True
             print(f"thaliris SubagentStop: {diagnostic}", file=sys.stderr)
     return False
@@ -1066,8 +1077,10 @@ def _ingest_claims(association: tuple[Path, str], agent_id: str, payload: dict, 
     """Ingest the typed claims of an exactly bound, still running managed handoff, before it is marked stopped.
 
     Core turns adverse claims into open observations under the handoff's producer and counts supports; a missing or
-    malformed block leaves only Core's marker. Nothing here judges a claim. Returns (claims status, diagnostic);
-    any failure is a bounded diagnostic, never a failed or blocking hook.
+    malformed block leaves only Core's marker. Nothing here judges a claim. When the message has no readable block and
+    an interim stop of the same handoff kept one, that kept block is ingested instead, and its provenance is recorded on
+    the entry (`claims_source`). Returns (claims status, diagnostic); any failure is a bounded diagnostic, never a
+    failed or blocking hook.
     """
     try:
         with store.transaction(*association) as ctx:  # ledger write: authority check, then re-anchor on change
@@ -1075,6 +1088,15 @@ def _ingest_claims(association: tuple[Path, str], agent_id: str, payload: dict, 
             if (entry is None or entry["binding"] not in store.EXACT_BINDINGS or not entry.get("handoff_id") or entry["disposed"]
                     or entry["native_status"] in store.TERMINAL_STATUSES or store.handoff(ctx["state"], entry["handoff_id"]) is None):
                 return None, None
+            kept = entry.get("interim_claims") if isinstance(entry.get("interim_claims"), dict) else None
+            if kept and isinstance(kept.get("message"), str) and core.parse_claim_block(message)["status"] != "present":
+                message = kept["message"]
+                entry["claims_source"] = {"stop": "interim", "at": kept.get("at")}
+                store.note(entry, "claims-from-interim-stop", kept_at=kept.get("at"))
+                ctx["lifecycle_changed"] = True
+            elif kept:
+                entry["claims_source"] = {"stop": "final"}  # the final report's own block supersedes the kept one
+                ctx["lifecycle_changed"] = True
             result = core.ingest_claims(ctx["state"], entry["handoff_id"], message)
             ctx["state_changed"] = bool(result["changed"])
             return result["status"], None
@@ -1264,6 +1286,14 @@ def user_prompt_submit(payload: dict) -> dict | None:
     recorded, reconciled = [], []
     if association is not None:
         notices = background_notifications(payload.get("prompt"))
+        finals = [notice["agent_id"] for notice in notices if notice["phase"] == "final"]
+        if finals:
+            # A final stop the adapter saw as interim: ingest the claims block it kept, before the entry is finished.
+            lifecycle = store.read_lifecycle(*association)
+            for agent in finals:
+                entry = store.dispatch_for_agent(lifecycle, agent)
+                if entry is not None and entry.get("interim_stop") is not None and entry.get("interim_claims"):
+                    _ingest_claims(association, agent, {}, None)
         if any(notice["phase"] != "unknown" for notice in notices):
             with store.transaction(*association, observe_only=True) as ctx:
                 for notice in notices:

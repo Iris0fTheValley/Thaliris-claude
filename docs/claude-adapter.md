@@ -323,7 +323,8 @@ PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、
 - `SendMessage` 恢复：同一 `agent_id` 再次 SubagentStart → SubagentStop；lifecycle 记为
   `launched → running → stopped → running → stopped`（0.4.3 起，已结束的 child 再次 SubagentStart 不再复位为 `running`，
   只记 `resumed-after-terminal` 事件）。
-- 中间停止（Claude Code 2.1.325 实测）：后台 child 在自己启动的后台 shell / Monitor 仍在运行时结束一个回合，Host 照样发
+- 中间停止（通知文字与 child transcript 取自 Claude Code 2.1.325 的真实会话记录；`background_tasks` 的形状取自 Hooks 参考文档与
+  Host 代码，尚未用实时 SubagentStop 载荷探测验证）：后台 child 在自己启动的后台 shell / Monitor 仍在运行时结束一个回合，Host 照样发
   SubagentStop，主线程通知的 `<status>` 仍是 `completed`，但 `<summary>` 写 “is waiting on its own background work”，`<note>`
   写 “the result below may be interim”；后台工作报告后，同一 `agent_id` 再次 SubagentStart（不是 SendMessage）继续同一 handoff，
   真正结束时的通知 `<note>` 写 “stops with no live background children of its own”。Host 的判定（`isBackgrounded`、回合结束、
@@ -391,15 +392,21 @@ H136/H137（Curator 不做实时证据、Reviewer 非必经关卡）、H147（�
   `core.ingest_claims(last_assistant_message)`；缺失/畸形只留 Core 标记；失败时在 lifecycle 记录有界诊断（`claims-not-ingested`）并继续。
 - **中间停止不是最终报告**：SubagentStop 先判断这次停止是否中间停止。条件同时成立才算：dispatch 精确绑定、未处置、未结束、
   是后台 dispatch；`background_tasks` 中有 `shell`/`monitor` 任务（不含 child 自身）的 `id` 出现在 child 自己 transcript 里
-  Host 写下的启动结果中（`run_in_background` 的 Bash/PowerShell 的 “Command running in background with ID: …”、超时被移到
-  后台的 “moved to the background (ID: …)”、Monitor 的 “Monitor started (task …”，且必须对应同一 `tool_use_id` 的调用；child
-  命令自己输出的同样文字不算）。中间停止时 entry 保持 `running`，记录 `interim_stop`（任务 id）与 `interim-stop` 事件，**不摄取
-  声明**，handoff 继续授予写入；再次 SubagentStart 记 `resumed-after-interim`。之后不再有自己的后台任务在运行的那次停止才是最终
-  报告：照旧摄取声明、标记 `stopped`、封禁。已处置、已结束（含最终报告后被恢复）的 child 永不重开。
+  Host 写下的启动结果中，且必须对应同一 `tool_use_id` 的调用。只认 child 输出写不进去的结果：`run_in_background` 的
+  Bash/PowerShell 的 “Command running in background with ID: …”（命令输出之前就返回）与 Monitor 的 “Monitor started (task …”。
+  前台命令超时后被移到后台的 “moved to the background (ID: …)” **不算**：那个工具结果就是命令自己的输出，child 可以 `echo`
+  伪造，因此这种停止仍按最终报告处理（与 0.4.3 相同）。中间停止时 entry 保持 `running`，记录 `interim_stop`（任务 id）、
+  `was_interim` 与 `interim-stop` 事件，**不摄取声明**，handoff 继续授予写入；再次 SubagentStart 记 `resumed-after-interim`。
+  中间停止的消息若带可读的 `thaliris-claims` 块，保留有界副本（`interim_claims`，≤ 64 KiB，以最近一次为准）。之后不再有自己的
+  后台任务在运行的那次停止才是最终报告：照旧摄取声明、标记 `stopped`、封禁；最终消息没有可读块时摄取保留的副本，并在 entry 记
+  `claims_source`（`interim` 与保留时间）和 `claims-from-interim-stop` 事件；最终消息有块时以它为准。已处置、已结束（含最终报告后
+  被恢复）的 child 永不重开。
 - **信号不明确时失败封闭**：`background_tasks` 缺失或类型不符而 transcript 显示 child 启动过后台任务、transcript 不可读、
-  自己的任务状态不是 running/pending、前台 dispatch、绑定非精确：一律按最终报告处理（与 0.4.3 相同），在 lifecycle 记
-  `stop-treated-final`（原因）并写 stderr。主线程随后收到 Host 的 interim 通知时，UserPromptSubmit 告诉 Controller 该 child
-  仍被封禁及原因（只说一次）；反过来，Host 通知说已结束而适配层记为中间停止时，立即标记 `stopped` 并提示声明未被摄取。
+  自己的任务状态不是 running/pending、前台 dispatch、绑定非精确，或 child 启动过后台任务而 `background_tasks` 未列出其中任何一个：
+  一律按最终报告处理（与 0.4.3 相同），在 lifecycle 记 `stop-treated-final` 事件与 `final_stop_reason` 字段并写 stderr。主线程随后
+  收到 Host 的 interim 通知时，UserPromptSubmit 告诉 Controller 该 child 仍被封禁及原因（只说一次，以 entry 字段
+  `host_interim_notified` 判断，不依赖只保留 16 条的事件历史）；反过来，Host 通知说已结束而适配层记为中间停止时，先摄取保留的
+  声明副本（若有），再立即标记 `stopped`，并说明最终消息未被读取。
   interim 通知的用量以 outcome `unknown` 记录，真正结束的通知再记为 `completed`。
 - **用量**：后台完成的 `<task-notification>`（UserPromptSubmit 的 `prompt`）只解析 `<task-id>`、`<status>`、`<usage>` 内的
   `<subagent_tokens>`、`<tool_uses>`、`<duration_ms>`；前台 Agent 结果尽力读取 `totalTokens`、`totalDurationMs`、`totalToolUseCount`、
