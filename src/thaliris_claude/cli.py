@@ -64,6 +64,18 @@ def _parser() -> argparse.ArgumentParser:
         _payload_args(command)
         if name in inputs.FLAGS:
             inputs.add_flags(command, name)
+        if name == "judge":
+            command.add_argument("--override-reason", dest="override_reason",
+                                 help="recorded reason for judging satisfied while a declared check is not green (or a compiled "
+                                      "requirement has none); without it the gate withholds")
+    command = add("check", "declare or supersede checks: argv commands that decide compiled requirements (Controller)")
+    command.add_argument("--base-revision", type=int, required=True)
+    _payload_args(command)
+    command.add_argument("--supersede", action="store_true",
+                         help="re-declare an existing check id, accepting its current command and file content")
+    command = add("verify", "run one declared check and record its result (Controller or a bound child)")
+    command.add_argument("--check", dest="check_id", required=True)
+    command.add_argument("--base-revision", type=int, help="optional; enforced before the run and again at the append")
     add("identity-status", "project identity state, items and open challenges (read-only; absent identity is normal)")
     command = add("identity-get", "read the recorded project identity, selected items, one amendment or one challenge")
     command.add_argument("--version", type=int)
@@ -119,8 +131,10 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("--path", required=True)
     command.add_argument("--summary", required=True)
     command.add_argument("--source-ref", action="append")
-    command = add("close", "record mechanical closure (DONE) after your product decision")
+    command = add("close", "record mechanical closure (DONE) after your product decision, through the verification gate")
     command.add_argument("--base-revision", type=int, required=True)
+    command.add_argument("--override-reason", dest="override_reason",
+                         help="recorded reason for closing while a declared check is not green; without it the gate withholds")
     add("detach", "end this session's association; the task stays ACTIVE for a later attach").add_argument("--reason", required=True)
     command = add("recover-authority", "restore anchored task bytes after an authority conflict and fence known children")
     command.add_argument("--expected-authority-sha256", required=True)
@@ -242,12 +256,22 @@ def _authority_summary(root: Path, task_id: str, *, full: bool) -> dict | None:
     return summary
 
 
+def _contract(root: Path, task_id: str) -> dict | None:
+    """The anchored authority contract (lane advisories need its mode and write surface); None when unreadable."""
+    try:
+        record = store.authority(root, task_id).read()
+    except (OSError, ValueError):
+        return None
+    return record.get("contract") if isinstance(record, dict) and isinstance(record.get("contract"), dict) else None
+
+
 def _status(root: Path, task_id: str, offset: int = 0, *, view: str = "compact", since_revision: int | None = None) -> dict:
     if view == "full":
         return _status_full(root, task_id, offset, since_revision)
     core.select_task(root, task_id)
     state = core._load_state(root)
-    result = core.task_status_packet(state, offset, view="compact", since_revision=since_revision)
+    result = core.task_status_packet(state, offset, view="compact", since_revision=since_revision, root=root,
+                                     contract=_contract(root, task_id))
     dispatches = store.read_lifecycle(root, task_id)["dispatches"]
     by_status: dict[str, int] = {}
     for item in dispatches:
@@ -266,7 +290,7 @@ def _status(root: Path, task_id: str, offset: int = 0, *, view: str = "compact",
 
 def _status_full(root: Path, task_id: str, offset: int = 0, since_revision: int | None = None) -> dict:
     core.select_task(root, task_id)
-    result = core.task_status(root, offset, view="full", since_revision=since_revision)
+    result = core.task_status(root, offset, view="full", since_revision=since_revision, contract=_contract(root, task_id))
     lifecycle = store.read_lifecycle(root, task_id)
     result["Claude Dispatches"] = [
         {key: item.get(key) for key in ("handoff_id", "role", "native_status", "binding", "background", "disposed", "parent",
@@ -426,6 +450,9 @@ def run(args) -> dict:
             contract = json.loads(inputs.read_text(args.contract))
         result = store.start_task(root, args.goal, contract, session)
         result["agents_dir_created"] = store.ensure_agents_dir(root)
+        if contract.get("execution_mode") == "adaptive":
+            result["lane"] = ("adaptive: work directly; lane advisories in `status` and the evidence packet never block. When one "
+                              "fires, record why and escalate with `mode --mode delegated` on the user's instruction.")
         return result
     if name == "attach":
         session = _controller(args)
@@ -435,6 +462,7 @@ def run(args) -> dict:
         with store.transaction(root, args.task_id) as ctx:
             pass  # The anchored authority must be ACTIVE and intact.
         store.write_session(session, root, args.task_id, args.reason)
+        store.sync_lane_marker(session, (root, args.task_id))
         # A new session lost the conversation: hand back what the Controller recorded.
         result = {"ok": True, "task_id": args.task_id, "root": str(root), "Task Context": store.task_context_text(ctx["state"])}
         summary = store.identity_summary(root)
@@ -513,6 +541,8 @@ def run(args) -> dict:
                 return function(root, actor, args.base_revision, str(temporary))
             finally:
                 temporary.unlink(missing_ok=True)
+    if name == "verify":
+        return _verify(args, root, task_id)
     _controller(args)
     if name in _IDENTITY_MUTATIONS:
         # Identity mutations never bump the task revision and are not memory promotion; the Controller's act, on the
@@ -539,11 +569,30 @@ def run(args) -> dict:
     if name in {"register", "judge"}:
         with store.transaction(root, task_id) as ctx:
             payload = _payload(args, ctx["state"])
-            appended = store.append_controller(ctx, args.base_revision, payload, "register" if name == "register" else "judgments")
+            appended, mechanical = store.append_controller(
+                ctx, args.base_revision, payload, "register" if name == "register" else "judgments",
+                override_reason=getattr(args, "override_reason", None))
             response = _write_response(ctx["state"], ["evidence_continuity"], appended=appended)
             if name == "judge":  # echo what a bare id resolved to, per judgment
                 response["observation_refs"] = {item["id"]: item["observation_refs"] for item in payload.get("judgments") or [payload]}
+                overridden = {item["id"]: [check["id"] for check in item["overridden_checks"]]
+                              for item in ctx["state"]["evidence_continuity"]["judgments"]
+                              if item["id"] in appended and item.get("overridden_checks")}
+                if overridden:
+                    response["overridden_checks"] = overridden
+            if mechanical:
+                response["mechanical_observations"] = mechanical
             return response
+    if name == "check":
+        with store.transaction(root, task_id) as ctx:
+            core.check_revision(ctx["state"], args.base_revision)
+            written = core.declare_checks(root, ctx["state"], "controller", _payload(args), supersede=args.supersede)
+            ctx["state_changed"] = bool(written)
+            declared = {str(item["id"]): item for item in ctx["state"].get("checks", [])}
+            return {**_write_response(ctx["state"], ["checks"] if written else []), "declared": written,
+                    "checks": [{"id": identifier, "declaration": declared[identifier]["declaration"],
+                                "requirement_refs": declared[identifier]["requirement_refs"],
+                                "files": len(declared[identifier]["files"])} for identifier in written]}
     if name == "dispose":
         with store.transaction(root, task_id) as ctx:
             matches = [item for item in ctx["lifecycle"]["dispatches"]
@@ -562,7 +611,9 @@ def run(args) -> dict:
             unresolved = store.unresolved(ctx["lifecycle"])
             if unresolved:
                 raise ValueError(f"UNRESOLVED_CHILD_DISPATCHES: {len(unresolved)} pending/running; wait for them or `dispose` them first")
-            return ctx["store"].switch_mode(args.expected_authority_sha256, args.base_revision, args.mode, args.human_instruction)
+            result = ctx["store"].switch_mode(args.expected_authority_sha256, args.base_revision, args.mode, args.human_instruction)
+        store.sync_lane_marker(args.native_session, (root, task_id))
+        return result
     if name == "artifact":
         with store.critical(root, task_id):
             core.select_task(root, task_id)
@@ -577,11 +628,15 @@ def run(args) -> dict:
                     f"{item['role']}:{item['handoff_id'] or item['tool_use_id']}={item['native_status']}" for item in unresolved)
                     + ". Wait for terminal evidence or `dispose` the dependency.")
             core.check_revision(ctx["state"], args.base_revision)
-            ctx["state"]["status"] = "DONE"
-            ctx["state"]["revision"] += 1
+            # Core's close gate: VERIFICATION_WITHHELD while a declared check is not green, unless an override reason is
+            # recorded. A DONE state with checks and no closure record is refused by Core's state validation anyway.
+            extras = core.close_state(root, ctx["state"], override_reason=args.override_reason, actor="claude:controller")
             ctx["state_changed"] = True
-            result = {**_write_response(ctx["state"], ["status"]),
-                      "note": "DONE records mechanical closure; it is not product acceptance."}
+            changed = extras.pop("changed")
+            result = {**_write_response(ctx["state"], ["status", *changed]), **extras,
+                      "note": "DONE records mechanical closure; it is not product acceptance. `surfaced` lists the requirements "
+                              "no declared check decides, with their latest judgment: those rest on your judgment."}
+        store.sync_lane_marker(args.native_session)
         try:  # after the close committed; any failure just leaves the field out
             offer = identity_basis.identity_offer(root, store.native_id(args.native_session))
         except Exception:
@@ -590,7 +645,7 @@ def run(args) -> dict:
             result["identity_offer"] = offer
         return result
     if name == "detach":
-        store.clear_session(args.native_session)
+        store.clear_session(args.native_session)  # also removes the adaptive lane marker
         return {"ok": True, "task_id": task_id, "status": "ACTIVE", "note": "Session association removed; authority and ledger are unchanged."}
     if name == "recover-authority":
         lifecycle_path = store.lifecycle_path(root, task_id)
@@ -609,6 +664,50 @@ def run(args) -> dict:
             archive_paths={store.LIFECYCLE_NAME: lifecycle_path} if lifecycle_path.is_file() else {})
         return {**result, "native_termination": "UNKNOWN"}
     raise ValueError(f"unsupported command: {name}")
+
+
+def _verify(args, root: Path, task_id: str) -> dict:
+    """Run one declared check: the argv runs outside the task lock, the result is appended under it.
+
+    The Controller or a bound managed child may run a declared check; only the Controller declares checks. A child's
+    result is recorded with its handoff producer as the actor. A PASS grants nothing: it only stops the gate withholding
+    while it stays fresh.
+    """
+    def actor(ctx: dict) -> str:
+        if args.native_agent is None:
+            _controller(args)
+            return "controller"
+        entry = _child_entry(ctx, args)
+        return f"handoff:{entry['handoff_id']}" if entry["handoff_id"] else f"claude:{entry['role']}"
+
+    with store.transaction(root, task_id) as ctx:
+        who = actor(ctx)
+        if args.base_revision is not None:
+            core.check_revision(ctx["state"], args.base_revision)
+        declaration = json.loads(json.dumps(core._declared_check(ctx["state"], args.check_id)))
+    run = core._run_declared_check(root, declaration)
+    with store.transaction(root, task_id) as ctx:
+        if actor(ctx) != who:  # disposal or a finished dispatch in between fences the append
+            raise ValueError("NATIVE_IDENTITY_CHANGED: the caller's dispatch changed during the run; nothing was recorded")
+        if args.base_revision is not None:
+            core.check_revision(ctx["state"], args.base_revision)
+        result, mechanical = core.record_check_run(root, ctx["state"], who, run)
+        ctx["state_changed"] = True
+        standing = next(entry for entry in core.verification_view(root, ctx["state"], tree=str(run["tree_identity"]))["checks"]
+                        if entry["id"] == declaration["id"])
+        changed = ["verification_results"] + (["evidence_continuity"] if mechanical else [])
+        response = {"ok": True, **_write_response(ctx["state"], changed, child=args.native_agent is not None)}
+    response["result"] = {
+        **{key: result[key] for key in ("id", "check_id", "run", "outcome", "exit_code", "duration_ms", "tree_identity",
+                                        "files_changed_during_run", "output_bytes")},
+        "output_tail": str(result["output_tail"] or "")[-1500:],
+        "tree_changed_during_run": result["tree_identity"] != result["tree_identity_before"],
+        "status": standing["status"], "fresh": standing["status"] in ("green", "red")}
+    if "reason" in standing:
+        response["result"]["reason"] = standing["reason"]
+    if mechanical:
+        response["mechanical_observations"] = mechanical
+    return response
 
 
 def _write_response(state: dict, changed: list[str], *, appended: list[str] | None = None, child: bool = False) -> dict:

@@ -34,10 +34,11 @@ def read_text(path: str | Path) -> str:
 # command -> flag destinations that select the flag form (argparse dest names)
 FLAGS: dict[str, tuple[str, ...]] = {
     "judge": ("requirement", "candidate", "outcome", "observations", "reasoning", "judgment_refs", "judgment_id", "judgment"),
-    "register": ("requirement",),
+    "register": ("requirement", "kind", "contract_surface"),
     "observe": ("text", "source", "observation_id", "requirement_refs"),
     "task-update": ("record", "supersedes", "milestone", "active_work", "pending", "clear_active_work", "clear_pending"),
-    "task-start": ("human_instruction", "boundary", "invariants", "acceptance", "execution_mode", "execution_constraint"),
+    "task-start": ("human_instruction", "boundary", "invariants", "acceptance", "execution_mode", "execution_constraint",
+                   "write_surface"),
 }
 
 
@@ -55,6 +56,11 @@ def add_flags(command: argparse.ArgumentParser, name: str) -> None:
             help="flag form, batch (repeatable, atomic, one revision; needs --candidate; instead of the single-judgment flags)")
     elif name == "register":
         add("--requirement", action="append", metavar="ID=WORKCHAIN_REF", help="flag form (repeatable): register one requirement")
+        add("--kind", action="append", metavar="ID=" + "|".join(core.REQUIREMENT_KINDS),
+            help="flag form (repeatable): the kind of a requirement registered in this call (absent: judgment-only); "
+                 "compiled means a declared check decides it")
+        add("--contract-surface", dest="contract_surface", action="append", metavar="ID",
+            help="flag form (repeatable): mark a requirement registered in this call as touching a contract surface")
     elif name == "observe":
         add("--text", help="flag form: the observation")
         add("--source", action="append", metavar="LOCATOR", help="flag form (repeatable): a source locator, recorded verbatim")
@@ -76,6 +82,9 @@ def add_flags(command: argparse.ArgumentParser, name: str) -> None:
         add("--acceptance", help="flag form: how we will know the request is met")
         add("--execution-mode", dest="execution_mode", choices=core_authority.MODES, help="flag form")
         add("--execution-constraint", dest="execution_constraint", help="flag form, optional: claude-model:<alias>")
+        add("--write-surface", dest="write_surface", action="append", metavar="GLOB",
+            help="flag form, optional (repeatable): a repo-relative POSIX glob the task expects to write; adaptive lane advisories "
+                 "report writes outside it")
 
 
 def flag_form(args, name: str) -> bool:
@@ -162,13 +171,34 @@ def _judge(args, state: dict) -> dict:
 
 
 def _register(args) -> dict:
-    requirements = []
+    requirements: dict[str, dict] = {}
     for item in args.requirement or []:
         identifier, separator, reference = item.partition("=")
         if not separator or not identifier.strip() or not reference.strip():
             raise ValueError(f"INVALID_REQUIREMENT: `{item}` must look like ID=WORKCHAIN_REF")
-        requirements.append({"id": identifier.strip(), "workchain_ref": reference.strip()})
-    return {"requirements": requirements}
+        if identifier.strip() in requirements:
+            raise ValueError(f"INVALID_REQUIREMENT: `{identifier.strip()}` is given twice")
+        requirements[identifier.strip()] = {"id": identifier.strip(), "workchain_ref": reference.strip()}
+
+    def target(identifier: str, flag: str) -> dict:
+        if identifier not in requirements:
+            raise ValueError(f"INVALID_REQUIREMENT: {flag} `{identifier}` names no --requirement of this call; a kind or "
+                             "contract surface is set when the requirement is registered")
+        return requirements[identifier]
+
+    for item in args.kind or []:
+        identifier, separator, kind = (part.strip() for part in item.partition("="))
+        if not separator or kind not in core.REQUIREMENT_KINDS:
+            raise ValueError(f"INVALID_REQUIREMENT_KIND: `{item}` must look like ID=" + "|".join(core.REQUIREMENT_KINDS))
+        record = target(identifier, "--kind")
+        if "kind" in record:
+            raise ValueError(f"INVALID_REQUIREMENT_KIND: `{identifier}` has more than one --kind")
+        record["kind"] = kind
+    for identifier in args.contract_surface or []:
+        target(identifier.strip(), "--contract-surface")["surface"] = "contract"
+    if not requirements:
+        raise ValueError("FLAG_FORM_INCOMPLETE: `register` in flag form needs --requirement")
+    return {"requirements": list(requirements.values())}
 
 
 def _source_kind(locator: str) -> str:
@@ -259,13 +289,18 @@ def _task_update(args, state: dict) -> dict:
 
 
 def _contract(args) -> dict:
-    _need(args, "task-start", (("human_instruction", "--human-instruction"), ("boundary", "--boundary"),
-                               ("invariants", "--invariants"), ("acceptance", "--acceptance"),
-                               ("execution_mode", "--execution-mode")))
-    contract = {"human_instruction": args.human_instruction, "boundary": args.boundary, "invariants": args.invariants,
-                "acceptance": args.acceptance, "execution_mode": args.execution_mode}
-    if args.execution_constraint is not None:
-        contract["execution_constraint"] = args.execution_constraint
+    """The contract the flags stand for. Adaptive quick admission may omit boundary and invariants: Core then stores each
+    as the explicit `unspecified` marker (never an inferred value); goal, instruction and acceptance stay required."""
+    quick = args.execution_mode == "adaptive"
+    required = (("human_instruction", "--human-instruction"), ("acceptance", "--acceptance"), ("execution_mode", "--execution-mode"))
+    _need(args, "task-start", required if quick else required[:1] + (("boundary", "--boundary"), ("invariants", "--invariants"))
+          + required[1:])
+    contract = {"human_instruction": args.human_instruction, "acceptance": args.acceptance, "execution_mode": args.execution_mode}
+    for field in ("boundary", "invariants", "execution_constraint"):
+        if getattr(args, field) is not None:
+            contract[field] = getattr(args, field)
+    if args.write_surface:
+        contract["write_surface"] = list(args.write_surface)
     return contract
 
 

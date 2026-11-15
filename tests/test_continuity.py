@@ -54,7 +54,8 @@ def _entry(index=0):
 
 # ------------------------------------------------- A: a task that exists but cannot be read is not "no task"
 
-@pytest.mark.parametrize("version", [core._STATE_SCHEMA_VERSION + 1, 1])
+# Newer than every schema this Core reads (Core 0.6.0 reads 7, 8 and 9 as current), and an old unmigratable one.
+@pytest.mark.parametrize("version", [max(core._SUPPORTED_SCHEMAS) + 1, 1])
 def test_incompatible_state_schema_is_reported_and_dispatch_fails_closed(task, version):
     original = _set_schema(task, version)
     association, problem = store.inspect_session(SESSION)

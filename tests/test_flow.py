@@ -414,3 +414,48 @@ def test_session_start_warns_about_a_small_controller(task, monkeypatch):
     assert "small or low-capability model" in small["hookSpecificOutput"]["additionalContext"]
     strong = run_hook("SessionStart", _base(task, "SessionStart", source="startup", model="claude-opus-5-5"))
     assert "small or low-capability model" not in strong["hookSpecificOutput"]["additionalContext"]
+
+
+def test_model_guidance_requires_a_strong_model_for_frontend(task, monkeypatch):
+    monkeypatch.delenv(hooks.MODEL_SETTING, raising=False)
+    text = run_hook("SessionStart", _base(task, "SessionStart", source="startup"))["hookSpecificOutput"]["additionalContext"]
+    assert "Substantive frontend work" in text and "trivial" in text and "claude-model:" in text
+    monkeypatch.setenv(hooks.MODEL_SETTING, "role-defaults")
+    text = run_hook("SessionStart", _base(task, "SessionStart", source="startup"))["hookSpecificOutput"]["additionalContext"]
+    assert "substantive frontend work" in text and "`opus`" in text and "trivial" in text
+    assert "not by keyword" in text and "instead of silently downgrading" in text and "claude-model:" in text
+
+
+def test_hook_shape_gaps_surface_as_unknown_and_bind_nothing(task, capsys):
+    _dispatch(task, "tu1")
+    # SubagentStart without agent_id: diagnostic, and the dispatch stays unbound.
+    started = run_hook("SubagentStart", _base(task, "SubagentStart", agent_type="thaliris:investigator"))
+    text = started["hookSpecificOutput"]["additionalContext"]
+    assert "host_hook_shape: UNKNOWN" in text and "agent_id" in text
+    assert [item["binding"] for item in _dispatches()] == ["unbound"]
+    # SubagentStop without agent_id: stderr diagnostic, no status change.
+    before = _dispatches()[0]["native_status"]
+    assert run_hook("SubagentStop", _base(task, "SubagentStop", agent_type="thaliris:investigator",
+                                          last_assistant_message="done")) is None
+    assert "host_hook_shape: UNKNOWN" in capsys.readouterr().err
+    assert _dispatches()[0]["native_status"] == before
+    # PostToolUse without tool_use_id and tool_response.status: diagnostic, nothing bound.
+    done = run_hook("PostToolUse", _base(task, "PostToolUse", tool_name="Agent", tool_input={}, tool_response={"agentId": "agent-x"}))
+    text = done["hookSpecificOutput"]["additionalContext"]
+    assert "host_hook_shape: UNKNOWN" in text and "tool_use_id" in text and "tool_response.status" in text
+    assert [item["binding"] for item in _dispatches()] == ["unbound"]
+    # A well-formed payload carries no diagnostic.
+    ok = _result(task, "tu1", {"status": "completed"})
+    assert "host_hook_shape" not in ok["hookSpecificOutput"]["additionalContext"]
+    # SessionStart without cwd.
+    started = run_hook("SessionStart", {"session_id": SESSION, "hook_event_name": "SessionStart", "source": "startup"})
+    assert "host_hook_shape: UNKNOWN" in started["hookSpecificOutput"]["additionalContext"]
+
+
+def test_unreadable_task_notification_is_unknown_not_silent(task):
+    prompt = "<task-notification><status>completed</status><task-id></task-id></task-notification>"
+    result = run_hook("UserPromptSubmit", _base(task, "UserPromptSubmit", prompt=prompt))
+    assert "host_hook_shape: UNKNOWN" in result["hookSpecificOutput"]["additionalContext"]
+    good = "<task-notification><task-id>agent-zz</task-id><status>completed</status></task-notification>"
+    result = run_hook("UserPromptSubmit", _base(task, "UserPromptSubmit", prompt=good))
+    assert "host_hook_shape" not in ((result or {}).get("hookSpecificOutput", {}).get("additionalContext", ""))

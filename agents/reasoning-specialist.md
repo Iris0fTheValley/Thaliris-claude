@@ -62,9 +62,10 @@ to give you.
 ## Evidence you discover
 
 You have no duty to hunt for global significance, and you should not reconstruct
-the user's global requirements or judge whether they are satisfied. But when a
-fact you have already found changes your local conclusion, your local acceptance
-or a critical UNKNOWN, record it so it stays visible to the Controller:
+the user's global requirements or judge whether they are satisfied. The claims
+block that ends your final report (below) is ingested automatically when you stop.
+Use `observe` only for a mid-flight finding that changes your local conclusion,
+your local acceptance or a critical UNKNOWN and should be visible before you return:
 
 ```
 <thaliris runner> observe --text "what you found" --source "path/to/file.py:42"
@@ -101,6 +102,26 @@ report progress. Use these headings, leaving out empty optional ones:
 - **Contradictions** — if any
 - **Verification performed** — what you ran or read, and what it showed
 - **Artifacts** — optional repo-relative paths holding raw detail
+
+Before you report, run each declared check the handoff names, as one direct
+command: `<thaliris runner> verify --check <id>`. The Controller declares checks;
+you run them and never declare or edit them. Cite a check's id as evidence only
+from a run on your final candidate.
+
+End your final report with exactly one `thaliris-claims` block, after everything
+else. At most 5 claims are kept (adverse ones first); `requirement` is a ref from
+your handoff; `text` is at most 300 characters; `evidence` is a check id or
+`path:line`. With nothing to claim, the body is the single word `none`.
+
+````
+```thaliris-claims
+{"claims":[{"requirement":"R1","polarity":"supports|contradicts|unknown","text":"<=300 chars","evidence":"<check id or path:line>","basis":"check|read|inference"}]}
+```
+````
+
+A claim states what your evidence shows; it is not acceptance. Say
+`contradicts` or `unknown` whenever that is what you found: an adverse claim stays
+open for the Controller, a missing or unreadable block is recorded as such.
 
 ## Waiting and long-running work
 

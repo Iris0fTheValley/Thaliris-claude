@@ -21,7 +21,7 @@ Thaliris-claude/
 ├── hooks/hooks.json               SessionStart / UserPromptSubmit / PreToolUse / PostToolUse(+Failure) / SubagentStart / SubagentStop
 ├── bin/thaliris-hook             Hook 入口（sh，与官方插件同一约定；命中缓存时只启动一个解释器）
 ├── bin/thaliris.py                Runner 启动器（兼容旧 Python，自动发现并缓存 ≥3.11 运行时）
-├── vendor/                        固定提交的 Thaliris Core（f0ee563，Core 0.5.3）与 core.lock.json
+├── vendor/                        固定提交的 Thaliris Core（8e5cdce，Core 0.6.0）与 core.lock.json
 ├── scripts/vendor_core.py         内置/校验 Core
 └── src/thaliris_claude/
     ├── roles.py    RoleSpec + ClaudeExecutionBinding；角色提示词唯一权威来源
@@ -58,14 +58,14 @@ Thaliris-claude/
 | --- | --- |
 | Fresh child、无父对话历史 | Claude 普通子代理默认独立上下文；Thaliris 角色禁止 `fork` / 通用代理充当角色 |
 | Authority 为持久的人类选定意图，子代理不可建立/扩展 | `task-start` 需合同文件；Controller-only 子命令在 PreToolUse 对子代理拒绝；身份参数由 Hook 注入，模型自带即拒绝 |
-| 执行模式 delegated / controller-direct / single-agent | 存于 Core Authority；single-agent 拒绝 Thaliris 子代理；`mode` 需人类指令 + CAS |
+| 执行模式 delegated / controller-direct / single-agent / adaptive | 存于 Core Authority；single-agent 拒绝 Thaliris 子代理；adaptive 允许快速准入（可省略 boundary/invariants，Core 记为 `unspecified`；可选 `--write-surface`），派发不受限，车道建议只呈现不阻塞；`mode` 需人类指令 + CAS |
 | 冻结执行约束 | `execution_constraint: "claude-model:<alias>"`，PreToolUse 强制并拒绝冲突覆盖 |
 | Reviewer 只读 | frontmatter `disallowedTools` + PreToolUse 拒绝文件写工具与明显写入的 Shell 命令（插件 Agent 的 `permissionMode`/`hooks` 字段会被 Claude 丢弃，已从二进制确认） |
 | 子代理不能改 Controller/安全状态 | `.context/`、`.project-identity/`、`.claude/settings*.json`、`~/.thaliris` 写入拒绝；子代理禁止直接调用 `thaliris-core`、禁止加载 Controller skill；Authority 只锚定 Thaliris 自有的 `.context/config.json`（用户的 Claude 设置不锚定，避免合法编辑被当篡改、恢复时被回滚） |
 | 委派矩阵与最大深度 2、每父级 1 个 Scanner | PreToolUse 依据 `agent_type`（Host 断言）与 lifecycle 校验 |
 | 已派发 child 的身份与权限不随配置漂移 | 预约时快照角色绑定；Hook 对已派发 child 按快照解释，角色文件改动或重新登记只影响之后的派发 |
 | Evidence Continuity | Core `evidence_continuity` 原样复用；子代理 `observe` 由适配层补全 handoff/candidate/refs 并以 handoff 前缀命名空间化 ID；Agent 结果送达时（PostToolUse，以及后台完成通知触发的 UserPromptSubmit）重新呈现未处置证据 |
-| 原生完成 ≠ 验收；DONE 只是机械关闭 | lifecycle 记录 `completed/stopped`；`close` 只检查执行残留风险（reserved/launched/running 未处置即拒绝）；已结束的 child 不再获得 `observe` 权限，也不能被 `SendMessage` 复用于新工作 |
+| 原生完成 ≠ 验收；DONE 只是机械关闭 | lifecycle 记录 `completed/stopped`；`close` 经 Core `close_state` 闸门（声明的 check 非 green 时 `VERIFICATION_WITHHELD`，`--override-reason` 记录覆盖原因），返回 `surfaced`（judgment-only/partial 需求及其最新判断），并检查执行残留风险（reserved/launched/running 未处置即拒绝）；已结束的 child 不再获得 `observe` 权限，也不能被 `SendMessage` 复用于新工作 |
 | 处置不等于终止 | `dispose` 只结束管理并 fence 写入，`native_termination: UNKNOWN` |
 | UNKNOWN 优先于猜测 | 只用精确来源绑定：Host 自写的 `subagents/agent-<id>.meta.json`（含 `toolUseId`）或 Agent 结果的 `agentId`；从不按“同角色唯一待定预约”猜身份 |
 | 优雅降级 | Hook 异常或运行时缺失/损坏时普通工作透明放行；只拒绝会因此失去守卫的动作（关联任务中的 Thaliris 派发、Reviewer 文件写入）；SessionStart 告知 managed 控制为 UNKNOWN |
@@ -93,7 +93,7 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
 | --- | --- | --- |
 | `default_execution_mode` | `delegated` | 受管任务的常驻执行模式。选 `delegated` 即用户对 `thaliris:*` 子代理的常驻请求（见下文 Pro 计划限制） |
 | `auto_approve_runner` | 开 | Hook 只批准“单条直接调用本插件 Runner”的命令，避免受管流程每步停下来问权限；plan 模式下只批准只读子命令；串接其他命令一律拒绝 |
-| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型：先定分工与认知隔离，再选能胜任的最便宜模型与 effort（`haiku`/low 用于 Git 收尾、CI 观察与确定性本地工作，`sonnet` 用于因果清晰的本地工作，`opus` 用于耦合或不清晰的工作；设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型 |
+| `model_selection` | `controller` | `controller`：Controller 为每个角色按需选择模型：先定分工与认知隔离，再选能胜任的最便宜模型与 effort（`haiku`/low 用于 Git 收尾、CI 观察与确定性本地工作，`sonnet` 用于因果清晰的本地工作，`opus` 用于耦合或不清晰的工作；实质性前端工作用 `opus` 或更强模型，仅改颜色、改文本等完全明确的琐碎改动可用轻量模型；按所述工作及其所需决策路由，而非按关键词、文件数或 diff 大小等启发式；若冻结的 `claude-model:` 约束使之无法满足，须报告冲突而非静默降级；设计如此，Hook 不覆盖也不拒绝；只有用户写入任务合同的 `claude-model:` 约束会冻结模型）。`role-defaults`：使用各角色默认模型，但用户的前端规则仍适用：实质性前端工作照样设置 `opus` 或更强模型，其余派发用角色默认 |
 
 无需其他步骤：
 
@@ -296,7 +296,7 @@ PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、
 | 谁 | 子命令 |
 | --- | --- |
 | 任何人（只读） | `guidance [--section recovery]` `status` `get` `catalog` `document-get` `version` `roles` `identity-status` `identity-get` `identity-trace` |
-| Controller | `bootstrap` `task-start` `attach` `detach` `task-update` `register` `judge` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` `unregister-role` `identity-amend` `identity-challenge` `identity-relate` |
+| Controller | `bootstrap` `task-start` `attach` `detach` `task-update` `register` `judge` `check` `mode` `dispose` `artifact` `close` `recover-authority` `register-role` `unregister-role` `identity-amend` `identity-challenge` `identity-relate` |
 | 子代理 | `observe`（Controller 用 `--handoff-id` 导入历史结果） |
 | Controller / Curator | `promote` `document-maintain` |
 
@@ -370,3 +370,44 @@ H136/H137（Curator 不做实时证据、Reviewer 非必经关卡）、H147（�
 
 仍开放：Desktop 与交互式会话下同样行为；worktree 隔离子代理的会话关联；Host 记录格式
 （`meta.json`/`prefix.json`）未文档化，版本变化时退化为 UNKNOWN 而不会误绑。
+
+## 验证优先（0.5.0，Core 0.6.0）
+
+机制只能扣留，只有模型能授予：适配层从不把需求标为 satisfied、不驳回证据、不自行关闭。闸门拒绝，Controller 以记录的理由覆盖。
+
+- **需求类型**：`register --requirement R1=REF --kind R1=compiled|partial|judgment-only [--contract-surface R1]`（缺省 judgment-only）。
+- **检查**：`check --base-revision N --json '<check 或 {"checks":[...]}>' [--supersede]` 仅 Controller（`guards.CONTROLLER_COMMANDS`）；
+  `verify --check ID [--base-revision N]` 由 Controller 或已精确绑定的受管子代理执行，子代理以其 handoff producer 作为 actor。
+  命令在锁外运行（Core `_run_declared_check`），结果在 Authority 校验的事务里追加（`record_check_run`），身份在运行前后各校验一次。
+- **闸门**：`register`/`judge` 经 `store.append_controller` 把 `root` 传给 `core._append_continuity_state`（无 root 时树为 UNKNOWN，任何受检
+  satisfied 都会被扣留）；`judge --override-reason`、`close --override-reason`；`close` 调用 `core.close_state`。
+- **类型化声明**：SubagentStop 在标记 stopped 之前，以写账本的事务（Authority 校验 + checkpoint）对精确绑定、未处置、未结束的 handoff 调用
+  `core.ingest_claims(last_assistant_message)`；缺失/畸形只留 Core 标记；失败时在 lifecycle 记录有界诊断（`claims-not-ingested`）并继续。
+- **用量**：后台完成的 `<task-notification>`（UserPromptSubmit 的 `prompt`）只解析 `<task-id>`、`<status>`、`<usage>` 内的
+  `<subagent_tokens>`、`<tool_uses>`、`<duration_ms>`；前台 Agent 结果尽力读取 `totalTokens`、`totalDurationMs`、`totalToolUseCount`、
+  `usage.input_tokens/output_tokens`。未报告的值保持 null；同一报告不重复写入（lifecycle `usage_reported`）。
+- **车道计数（仅 adaptive）**：PostToolUse 对 Controller 的 Read/Bash/PowerShell/Grep/Glob/WebFetch 结果，累加字符串叶子字符数的
+  `ceil(chars/4)`（`core.task_lane_counter`，侧车文件，不改 revision）。`bin/thaliris-hook ... --lane` 先用参数展开读出 `session_id`，
+  只有 `~/.thaliris/claude/lane/<session_id>` 存在才启动 Python；标记在 adaptive 任务准入/attach/切换到 adaptive 时写入，close/detach/
+  切出 adaptive 时删除，SessionStart 重新同步。非 adaptive 会话每次工具调用不启动 Python。
+- **证据包**：`hooks.evidence_state` 传入合同与 root；只在观察/判断待处理，或 Verification（red/stale/unrun、check 文件被改、无 check 的
+  compiled/partial）、Claims（无可读声明块的 handoff）、Advisories（adaptive）需要关注时出现；新行进入 digest，每节最多 8 行。
+
+
+## 并行派发由用户决定
+
+适配层对并发的顶层派发没有数量上限。用户要求并行或大规模并行时，Controller 按用户选择的规模执行，程序不替用户设限。
+只读工作可自由扇出：跨不同领域的查询、调查、评审。唯一的边界是：同时运行的写入者不得在领域或文件上重叠。Controller 把工作
+划分成互不重叠的领域（不同的研究方向、分区整理的资料、明确互不影响的模块等，不限于这些），可能重叠的写入者使用
+`isolation: "worktree"` 或改为串行。嵌套限制（深度二、每个父级同时只有一个 Scanner）属于权限边界，不是并行上限，保持不变。
+
+## 兼容性：按 Hook 形状，而非 Claude Code 版本
+
+适配层没有任何 Claude Code 版本闸门，也不在 `plugin.json` 中声明 `engines`（那是精确范围限制）。兼容性取决于 Host 发来的 Hook
+载荷是否具备适配层绑定或记录所需的字段。自检点：SessionStart（`session_id`、`cwd`）、SubagentStart/SubagentStop（`agent_id`、
+`agent_type`）、Agent 的 PostToolUse（`tool_use_id`、`tool_response.status`）、后台 `<task-notification>`（`<task-id>`）。
+字段缺失或类型不符时，只记录一条有界诊断 `host_hook_shape: UNKNOWN (事件 ... 缺少: 字段名)`：SessionStart / SubagentStart /
+PostToolUse / UserPromptSubmit 写入其 additionalContext，SubagentStop 无上下文通道，写 stderr。诊断不改变任何现有行为：不会比
+以前拒绝更多，也不会把未验证的形状当作已绑定。
+
+本地观察到的 Claude Code 为 2.1.312，上游最新为 2.1.325，其更新日志在 2.1.314–2.1.325 未见 Hook 改名。这些只是观察，不是要求。

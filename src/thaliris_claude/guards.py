@@ -13,7 +13,7 @@ import re
 import shlex
 
 # Subcommands only the owning Controller (main thread) may run.
-CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "mode", "dispose",
+CONTROLLER_COMMANDS = frozenset({"bootstrap", "task-start", "attach", "detach", "register", "judge", "check", "mode", "dispose",
                                  "close", "artifact", "recover-authority", "register-role", "unregister-role", "task-update",
                                  # Project identity mutations: the Controller's act on the human owner's decision.
                                  "identity-amend", "identity-challenge", "identity-relate",

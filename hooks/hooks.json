@@ -44,6 +44,16 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "Read|Bash|PowerShell|Grep|Glob|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/thaliris-hook\" PostToolUse --lane",
+            "timeout": 30
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [

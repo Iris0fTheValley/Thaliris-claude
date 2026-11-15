@@ -100,6 +100,7 @@ def clear_session(session_id: str | None) -> None:
     if native_id(session_id):
         _session_path(session_id).unlink(missing_ok=True)
         forget_packet(session_id)
+        lane_marker(session_id).unlink(missing_ok=True)
 
 
 def forget_packet(session_id: str | None) -> None:
@@ -761,12 +762,66 @@ def observe(ctx: dict, payload: dict, *, agent_id: str | None, handoff_id: str |
     return result
 
 
-def append_controller(ctx: dict, base_revision: int, payload: dict, kind: str) -> list[str]:
-    """Controller register/judge under the same lock and Core's revision CAS (a conflict carries its details)."""
+def append_controller(ctx: dict, base_revision: int, payload: dict, kind: str, *,
+                      override_reason: str | None = None) -> tuple[list[str], list[str]]:
+    """Controller register/judge under the same lock and Core's revision CAS (a conflict carries its details).
+
+    ``root`` reaches Core's withholding gate: without it a task with declared checks has an UNKNOWN tree and every
+    gated `satisfied` would be withheld. The gate refuses (VERIFICATION_WITHHELD); only the Controller's recorded
+    ``override_reason`` lifts it. Returns (appended ids, mechanical observation ids Core added in the same revision).
+    """
     core.check_revision(ctx["state"], base_revision)
-    appended = core._append_continuity_state(ctx["state"], "controller", payload, kind)
+    if override_reason is not None:
+        payload = core._with_override_reason(payload, kind, override_reason)
+    observed = len(ctx["state"].get("evidence_continuity", {}).get("observations", []))
+    appended = core._append_continuity_state(ctx["state"], "controller", payload, kind, root=ctx["root"])
     ctx["state_changed"] = True
-    return appended
+    mechanical = [item["id"] for item in ctx["state"]["evidence_continuity"]["observations"][observed:]
+                  if item.get("provenance") == core.MECHANISM_PRODUCER] if kind == "judgments" else []
+    return appended, mechanical
+
+
+# ------------------------------------------------------------ adaptive lane marker
+#
+# The lane counter adds every Controller tool result to an adaptive task's token counter. PostToolUse for Read/Bash/...
+# is most of a session's hook calls, so the shell launcher must decide without starting Python whether this session
+# counts at all: it reads `session_id` from the payload by parameter expansion and exits unless `lane/<session_id>`
+# exists under the adapter home. The marker is written when an adaptive task is admitted or attached (or a task is
+# switched to adaptive) and removed on close, detach or a switch away; SessionStart re-syncs it. A session id that is
+# not a plain filename gets a hashed marker the launcher finds only by its any-marker fallback. The marker only lets
+# Python start; Python re-checks the association and the anchored mode, so a stale marker counts nothing.
+
+_LANE_SAFE = re.compile(r"[A-Za-z0-9-]{1,128}")
+
+
+def lane_marker(session_id: str) -> Path:
+    name = session_id if _LANE_SAFE.fullmatch(session_id) else "_" + native_hash(session_id)
+    return home() / "lane" / name
+
+
+def sync_lane_marker(session_id: str | None, association: tuple[Path, str] | None = None) -> bool:
+    """Write or remove this session's marker from its associated task's anchored mode; True when it now counts."""
+    if not native_id(session_id):
+        return False
+    adaptive = False
+    association = association if association is not None else resolve_session(session_id)
+    if association is not None:
+        try:
+            record = authority(*association).read() or {}
+            adaptive = record.get("status") == "ACTIVE" and record.get("contract", {}).get("execution_mode") == "adaptive"
+        except (OSError, ValueError):
+            adaptive = False
+    marker = lane_marker(session_id)
+    try:
+        if adaptive:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            if not marker.is_file():
+                core._atomic_write(marker, b"adaptive\n")
+        else:
+            marker.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return adaptive
 
 
 def current_records(state: dict, limit: int = 12, text_chars: int = 600) -> tuple[list[dict], int]:
@@ -829,4 +884,5 @@ def start_task(root: Path, goal: str, contract: dict, session_id: str) -> dict:
     store.establish(core.task_show(root)["state"], contract, adapter_fields={
         "claude_session_sha256": native_hash(session_id), "host_actor_assurance": "UNKNOWN"})
     write_session(session_id, root, task_id, "task-start")
+    sync_lane_marker(session_id, (root, task_id))
     return result
