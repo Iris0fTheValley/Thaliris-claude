@@ -277,7 +277,7 @@ def test_malformed_or_foreign_notifications_are_ignored(task, prompt):
 def test_unreadable_counts_stay_null():
     parsed = hooks.background_notifications(_notification("agent-a", "failed", "<usage><subagent_tokens>12a</subagent_tokens>"
                                                           "<tool_uses>3</tool_uses></usage>"))
-    assert parsed == [{"agent_id": "agent-a", "outcome": "failed", "measured": {"tool_uses": 3}}]
+    assert parsed == [{"agent_id": "agent-a", "outcome": "failed", "measured": {"tool_uses": 3}, "phase": "unknown"}]
 
 
 def test_foreground_usage_is_read_best_effort(task):

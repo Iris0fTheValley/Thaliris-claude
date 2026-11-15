@@ -294,7 +294,8 @@ def _status_full(root: Path, task_id: str, offset: int = 0, since_revision: int 
     lifecycle = store.read_lifecycle(root, task_id)
     result["Claude Dispatches"] = [
         {key: item.get(key) for key in ("handoff_id", "role", "native_status", "binding", "background", "disposed", "parent",
-                                        "requested_model", "requested_effort", "observed_model", "observed_tools")}
+                                        "requested_model", "requested_effort", "observed_model", "observed_tools",
+                                        "interim_stop")}
         | {"agent": store.native_hash(item["agent_id"]) if item.get("agent_id") else None,
            "parent": item["parent"] if item["parent"] == "controller" else store.native_hash(item["parent"]),
            "role_binding": _binding_summary(item.get("role_binding"))}

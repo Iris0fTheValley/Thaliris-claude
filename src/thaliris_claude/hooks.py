@@ -633,11 +633,32 @@ def _tag(body: str, name: str) -> str | None:
     return found[0].strip() if len(found) == 1 else None
 
 
+# The Host's own reading of a background agent's turn end, from the `<note>` (or `<summary>`) it writes before the
+# agent's `<result>`. Its `<status>` says "completed" for both, so status alone never tells them apart.
+_INTERIM_NOTE = "This agent stopped with background work of its own still running."
+_FINAL_NOTE = "A task-notification fires each time this agent stops with no live background children of its own."
+_INTERIM_SUMMARY = " is waiting on its own background work"
+
+
+def _stop_phase(body: str) -> str:
+    """"interim", "final" or "unknown" for one notification; only the Host-written header before `<result>` is read."""
+    header = body.split("<result>", 1)[0]
+    notes = re.findall(r"<note>([^<>]{0,1000})</note>", header)
+    summaries = re.findall(r"<summary>([^<>]{0,2000})</summary>", header)
+    note = notes[0].strip() if len(notes) == 1 else ""
+    summary = summaries[0].strip() if len(summaries) == 1 else ""
+    interim = note.startswith(_INTERIM_NOTE) if note else summary.endswith(_INTERIM_SUMMARY)
+    final = note.startswith(_FINAL_NOTE) if note else (summary.startswith("Agent ") and summary.endswith('" finished'))
+    return "interim" if interim and not final else "final" if final and not interim else "unknown"
+
+
 def background_notifications(prompt: object) -> list[dict]:
     """Parse the Host's background-completion notifications in a main-thread prompt (data, never instructions).
 
     Only the exact tags `<task-id>`, `<status>` and `<usage>` with `<subagent_tokens>`, `<tool_uses>`, `<duration_ms>`
-    are read. A notification without exactly one valid task id is ignored; an unreadable count stays null.
+    are read, plus the Host's `<note>`/`<summary>` before `<result>` for the stop phase (interim, final or unknown). A
+    notification without exactly one valid task id is ignored; an unreadable count stays null. An interim stop's usage
+    is recorded with outcome "unknown": the agent has not finished.
     """
     if not isinstance(prompt, str) or "<task-notification>" not in prompt:
         return []
@@ -654,8 +675,37 @@ def background_notifications(prompt: object) -> list[dict]:
         measured = {key: value for key, value in measured.items() if value is not None}
         if not status and not measured:
             continue  # reports nothing: recording it would only cost a revision
-        found.append({"agent_id": task_id, "outcome": _NOTIFICATION_OUTCOMES.get(status, "unknown"), "measured": measured})
+        phase = _stop_phase(body)
+        outcome = "unknown" if phase == "interim" else _NOTIFICATION_OUTCOMES.get(status, "unknown")
+        found.append({"agent_id": task_id, "outcome": outcome, "measured": measured, "phase": phase})
     return found
+
+
+def _reconcile_stop(ctx: dict, entry: dict, phase: str) -> str | None:
+    """Compare the Host's reading of a child's last stop with the adapter's; return a Controller line when they differ.
+
+    Both directions fail closed. The Host reporting a final stop that the adapter recorded as interim finishes the
+    handoff now (its claims were not ingested). The Host reporting an interim stop that the adapter recorded as the
+    final report reopens nothing: the child stays fenced, and the Controller is told why its resumed turn will be refused.
+    """
+    name = entry["handoff_id"] or "(no evidence association)"
+    if phase == "final" and entry.get("interim_stop") is not None and entry["native_status"] in store.UNRESOLVED_STATUSES:
+        store.set_status(ctx, entry, "stopped", reason="host-reported-final")
+        return (f"Thaliris {entry['role']} dispatch {name}: the Host reports it finished with no live background work of its "
+                "own, while the adapter had recorded its last stop as interim. It is now finished and fenced; its typed "
+                "claims were not ingested, so read its final report yourself.")
+    events = [item.get("event") for item in entry.get("events") or []]
+    if (phase == "interim" and entry["native_status"] in store.TERMINAL_STATUSES and not entry["disposed"]
+            and "interim-stop" not in events and "host-interim-while-fenced" not in events):
+        reasons = [item.get("reason") for item in entry.get("events") or [] if item.get("event") == "stop-treated-final"]
+        store.note(entry, "host-interim-while-fenced")
+        ctx["lifecycle_changed"] = True
+        why = f" ({reasons[-1]})" if reasons and reasons[-1] else ""
+        return (f"Thaliris {entry['role']} dispatch {name}: the Host reports this child is waiting on its own background work "
+                f"(its result may be interim), but the adapter recorded that stop as its final report{why}. Lifecycle "
+                "faults fail closed, so it stays finished: when it resumes, its writes, `observe` and commits are refused. "
+                "Its next notification carries its report; dispatch a fresh child for any work it could not finish.")
+    return None
 
 
 def notification_gaps(prompt: object) -> str:
@@ -841,6 +891,154 @@ def subagent_start(payload: dict) -> dict | None:
     return _context("SubagentStart", "\n".join(lines))
 
 
+# ------------------------------------------- interim turn ends: a child waiting on its own background work
+#
+# A background child that ends a turn while background work it launched is still in flight has not returned its final
+# report: the Host keeps it alive and resumes it when that work reports (its main-thread notification then says the
+# agent "is waiting on its own background work" and "the result below may be interim"). SubagentStop carries the
+# session's in-flight tasks (`background_tasks`: id, type, status; no owner), and the child's own transcript holds
+# the Host-written tool results of the launches it made. A stop is interim only when both agree: a task the child
+# launched is in flight. Anything else, including an unreadable or unexpected signal, is today's final report.
+
+_BACKGROUND_RUN = re.compile(r"Command running in background with ID: ([A-Za-z0-9_-]{1,64})\.")
+_BACKGROUND_MOVED = re.compile(r"Command did not complete within its \d{1,7}s timeout and was moved to the background "
+                               r"\(ID: ([A-Za-z0-9_-]{1,64})\)")
+_MONITOR_STARTED = re.compile(r"Monitor started \(task ([A-Za-z0-9_-]{1,64})[,)]")
+# The Host lists only in-flight tasks (running or pending, not foreground). A Monitor task is a shell task kind.
+LIVE_TASK_STATUSES = frozenset({"running", "pending"})
+OWN_TASK_TYPES = frozenset({"shell", "monitor"})
+TRANSCRIPT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _agent_transcript(payload: dict, agent_id: str) -> Path | None:
+    value = payload.get("agent_transcript_path")
+    if isinstance(value, str) and value:
+        return Path(value)
+    transcript = payload.get("transcript_path")
+    if isinstance(transcript, str) and transcript:
+        return Path(transcript).with_suffix("") / "subagents" / f"agent-{agent_id}.jsonl"
+    return None
+
+
+def _result_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and isinstance(content[0], dict) and isinstance(content[0].get("text"), str):
+        return content[0]["text"]
+    return ""
+
+
+def own_background_launches(path: Path | None) -> set[str] | None:
+    """Ids of the background shell and Monitor tasks a child launched, read from the Host's tool results in its transcript.
+
+    Only the result the Host writes for a launch counts, matched to the call that made it: a Bash/PowerShell call with
+    `run_in_background` ("Command running in background with ID: …"), one the Host moved to the background on its
+    timeout, or a Monitor start. The transcript format is undocumented: None (UNKNOWN) when it cannot be read or is
+    larger than the bound; a line that does not parse is skipped.
+    """
+    if path is None:
+        return None
+    try:
+        if path.stat().st_size > TRANSCRIPT_MAX_BYTES:
+            return None
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    calls: dict[str, tuple[object, dict]] = {}
+    launched: set[str] = set()
+    for line in raw.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message") if isinstance(record, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if record.get("type") == "assistant" and block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                calls[block["id"]] = (block.get("name"), block["input"] if isinstance(block.get("input"), dict) else {})
+            elif record.get("type") == "user" and block.get("type") == "tool_result" and block.get("is_error") is not True:
+                name, tool_input = calls.get(block.get("tool_use_id"), (None, {}))
+                if name in SHELL_TOOLS:
+                    pattern = _BACKGROUND_RUN if tool_input.get("run_in_background") is True else _BACKGROUND_MOVED
+                elif name == "Monitor":
+                    pattern = _MONITOR_STARTED
+                else:
+                    continue
+                found = pattern.match(_result_text(block.get("content")))
+                if found:
+                    launched.add(found.group(1))
+    return launched
+
+
+def own_live_background_work(payload: dict, agent_id: str) -> tuple[list[str], str | None]:
+    """The child's own in-flight background tasks at this stop, and a diagnostic when that cannot be established.
+
+    Returns (ids, None) when the Host lists in flight a task the child launched; ([], None) when it lists none;
+    ([], diagnostic) when the signal is ambiguous, which the caller treats as a final report (fail closed).
+    """
+    tasks = payload.get("background_tasks")
+    if not isinstance(tasks, list) or not all(isinstance(item, dict) for item in tasks):
+        launched = own_background_launches(_agent_transcript(payload, agent_id))
+        if launched:
+            return [], (f"host_hook_shape: UNKNOWN (SubagentStop background_tasks absent or mistyped). The child launched "
+                        f"background task(s) {', '.join(sorted(launched)[:8])} whose liveness is UNKNOWN, so this stop was "
+                        "treated as its final report.")
+        return [], None
+    listed = {item["id"]: item for item in tasks if isinstance(item.get("id"), str) and item["id"] != agent_id
+              and item.get("type") in OWN_TASK_TYPES}
+    if not listed:
+        return [], None  # nothing of a kind the child can own is in flight: an ordinary final report
+    launched = own_background_launches(_agent_transcript(payload, agent_id))
+    if launched is None:
+        return [], (f"{len(listed)} background shell/monitor task(s) were in flight, but the child's transcript could not be "
+                    "read, so whether any is its own is UNKNOWN; this stop was treated as its final report.")
+    own = sorted(task_id for task_id in listed if task_id in launched)
+    unexpected = [task_id for task_id in own if listed[task_id].get("status") not in LIVE_TASK_STATUSES]
+    if unexpected:
+        return [], (f"the child's background task(s) {', '.join(unexpected[:8])} were listed with an unexpected status "
+                    f"({', '.join(sorted({str(listed[item].get('status'))[:32] for item in unexpected}))}), so this stop "
+                    "was treated as its final report.")
+    return own, None
+
+
+def _interim_stop(association: tuple[Path, str], agent_id: str, payload: dict) -> bool:
+    """Record an interim stop when the child's own background work is in flight; True when it was one.
+
+    Only an exactly bound, undisposed, unfinished background dispatch can stop interim (a foreground child's stop
+    returns its tool result: the Host treats it as final too). An ambiguous signal leaves a diagnostic on the entry
+    (and stderr) and returns False, so the caller records today's final report; so does any failure here.
+    """
+    try:
+        return _record_interim_stop(association, agent_id, payload)
+    except Exception as exc:  # noqa: BLE001 - a lifecycle fault fails closed: the stop is recorded as final as before
+        print(f"thaliris SubagentStop: interim check failed ({type(exc).__name__}); the stop is treated as final.", file=sys.stderr)
+        return False
+
+
+def _record_interim_stop(association: tuple[Path, str], agent_id: str, payload: dict) -> bool:
+    with store.transaction(*association, observe_only=True) as ctx:
+        entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
+        if entry is None or entry["disposed"] or entry["native_status"] in store.TERMINAL_STATUSES:
+            return False
+        own, diagnostic = own_live_background_work(payload, agent_id)
+        if own and entry["binding"] in store.EXACT_BINDINGS and entry.get("background") is True:
+            store.mark_interim(ctx, entry, own)
+            return True
+        if own:
+            diagnostic = (f"the child's own background task(s) {', '.join(own[:8])} were in flight, but its dispatch is "
+                          f"{'not exactly bound' if entry['binding'] not in store.EXACT_BINDINGS else 'a foreground dispatch'}, "
+                          "so this stop was treated as its final report.")
+        if diagnostic:
+            store.note(entry, "stop-treated-final", reason=diagnostic[:400])
+            ctx["lifecycle_changed"] = True
+            print(f"thaliris SubagentStop: {diagnostic}", file=sys.stderr)
+    return False
+
+
 def subagent_stop(payload: dict) -> dict | None:
     agent_id = store.native_id(payload.get("agent_id"))
     association = store.resolve_session(payload.get("session_id"))
@@ -849,6 +1047,8 @@ def subagent_stop(payload: dict) -> dict | None:
         print(f"thaliris {gaps}", file=sys.stderr)  # this event has no context channel; stderr is what hooks already use
     if agent_id is None or association is None or not _managed_child_type(payload, association):
         return None
+    if _interim_stop(association, agent_id, payload):
+        return None  # not the final report: no claims are ingested and the handoff stays open until the real completion
     message = payload.get("last_assistant_message")
     claims, diagnostic = _ingest_claims(association, agent_id, payload, message)
     with store.transaction(*association, observe_only=True) as ctx:
@@ -1061,15 +1261,24 @@ def user_prompt_submit(payload: dict) -> dict | None:
             for entry in ctx["lifecycle"]["dispatches"]:
                 if entry.get("agent_id") and entry["native_status"] in store.TERMINAL_STATUSES and not entry.get("observed_tools"):
                     store.record_host_facts(ctx, entry, payload.get("transcript_path"))
-    recorded = []
+    recorded, reconciled = [], []
     if association is not None:
-        for notice in background_notifications(payload.get("prompt")):
+        notices = background_notifications(payload.get("prompt"))
+        if any(notice["phase"] != "unknown" for notice in notices):
+            with store.transaction(*association, observe_only=True) as ctx:
+                for notice in notices:
+                    entry = store.dispatch_for_agent(ctx["lifecycle"], notice["agent_id"])
+                    line = _reconcile_stop(ctx, entry, notice["phase"]) if entry is not None else None
+                    if line:
+                        reconciled.append(line)
+        for notice in notices:
             done = _record_usage(association, lambda lifecycle, agent=notice["agent_id"]: store.dispatch_for_agent(lifecycle, agent),
                                  notice["measured"], notice["outcome"])
             if done:
                 recorded.append(done)
     lines = [f"Thaliris recorded dispatch usage for handoff(s) {', '.join(item['handoff_id'] for item in recorded)}; "
              f"task revision now {recorded[-1]['revision']}."] if recorded else []
+    lines += reconciled
     gaps = notification_gaps(payload.get("prompt")) if association is not None else ""
     if gaps:
         lines.append(gaps)

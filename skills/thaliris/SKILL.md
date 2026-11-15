@@ -276,7 +276,12 @@ requirements.
 - **Background** (`run_in_background: true`, or Host-chosen) returns an
   acknowledgement at once; a `<task-notification>` arrives when the child
   finishes. The acknowledgement is not a result. Use background for independent
-  Workstreams you can run in parallel.
+  Workstreams you can run in parallel. A notification that says the agent "is
+  waiting on its own background work" (its result "may be interim") is not the
+  final report either: the child keeps its handoff and resumes when that work
+  reports, and the same task-id notifies again. If the hooks say such a child
+  was nevertheless recorded as finished, it stays fenced; route its unfinished
+  work to a fresh child.
 - Parallel dispatch is user-directed and has no program cap. When the user asks
   for parallel or large-scale work, run it at the scale they chose (several
   Agent calls in one message, in as many waves as needed). Read-only work fans

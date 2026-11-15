@@ -611,8 +611,30 @@ def set_status(ctx: dict, entry: dict, status: str, **fields) -> None:
             note(entry, event, **fields)
             ctx["lifecycle_changed"] = True
         return
+    # A start after an interim stop is the same handoff continuing (it never returned its final report).
+    resumed = status == "running" and entry.pop("interim_stop", None) is not None
+    if status in TERMINAL_STATUSES:
+        entry.pop("interim_stop", None)
     entry["native_status"] = status
-    note(entry, status, **fields)
+    note(entry, "resumed-after-interim" if resumed else status, **fields)
+    ctx["lifecycle_changed"] = True
+
+
+INTERIM_IDS_MAX = 16
+
+
+def mark_interim(ctx: dict, entry: dict, background_task_ids: list[str]) -> None:
+    """Record a turn end the Host keeps alive for the child's own live background work (not its final report).
+
+    Only an exactly bound, undisposed, unfinished background handoff reaches here. The entry stays unresolved
+    (`running`), so the child keeps the writes its handoff grants when it resumes; nothing about acceptance changes.
+    The next stop without live background work of its own is the final report, and finishes it as before.
+    """
+    if entry["disposed"] or entry["native_status"] in TERMINAL_STATUSES:
+        raise ValueError("INTERIM_STOP_ON_CLOSED_HANDOFF")  # a caller bug: a closed handoff is never reopened
+    entry["native_status"] = "running"
+    entry["interim_stop"] = {"at": now(), "background_task_ids": background_task_ids[:INTERIM_IDS_MAX]}
+    note(entry, "interim-stop", background_tasks=len(background_task_ids))
     ctx["lifecycle_changed"] = True
 
 
