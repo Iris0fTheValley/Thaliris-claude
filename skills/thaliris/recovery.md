@@ -81,8 +81,10 @@ begins an independent task for this session; the unreadable one is left as it is
 
 ## Unreadable lifecycle
 
-`CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED` means a different adapter version wrote
-`claude-lifecycle.json` (it is never reinterpreted); `CLAUDE_LIFECYCLE_INVALID` means it
+`CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED` means a *newer* adapter version wrote
+`claude-lifecycle.json` (it is never reinterpreted; older files are migrated forward
+automatically, so the fix is to upgrade the plugin and `attach --task-id`);
+`CLAUDE_LIFECYCLE_INVALID` means it
 is damaged or an entry lacks required fields. Child identity and handoff status are
 UNKNOWN, so Thaliris children's writes and `SendMessage` fail closed and managed
 dispatch is refused; the Controller's own work, generic subagents and read-only roles

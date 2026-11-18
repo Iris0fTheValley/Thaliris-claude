@@ -109,7 +109,7 @@ claude plugin install thaliris@thaliris --config default_execution_mode=delegate
   内置 Core 与锁一致、首次 Hook 自动发现系统 Python 3.11），进行中的会话仍用旧版本文件。Windows 上若把
   `CLAUDE_CONFIG_DIR` 放在很深的目录，Git 克隆 marketplace 可能超出 260 字符路径上限；默认的 `~/.claude` 不受影响。
   用户选项与 `~/.thaliris` 数据跨版本保留；
-  lifecycle 文件带版本号，读到不认识的版本时报错而不是误读（此时 child 写与消息 fail closed，见“升级与会话连续性”）。内置 Core 随插件版本一起更新，
+  lifecycle 文件带版本号：旧版本向前迁移，只有比适配层更新的版本才报错而不是误读（此时 child 写与消息 fail closed，见“前向兼容”）。内置 Core 随插件版本一起更新，
   `scripts/vendor_core.py --check --source <Core 仓库>` 校验内置字节与固定提交一致。
 
 开发时临时加载（不改用户配置）：
@@ -282,6 +282,22 @@ effort。effort 不改变职责或权限。
 Host 限制：若 Host 清理了旧版本缓存目录，仍加载它的会话里 `sh` 找不到 Hook 脚本（通常退出码 127，Host 视为非阻塞错误），
 插件无法自行处理，此时守卫不在运行，managed 保证为 UNKNOWN；这不是任务损坏，重载插件或新开会话后用 `attach --task-id` 接回原 Task
 （Task 与 Authority 保留）。处置步骤见 `skills/thaliris/recovery.md`。
+
+### 前向兼容：老任务在升级后无感衔接（0.5.2）
+
+原则：上游（插件、Core、模型别名）更新后，ACTIVE 任务不应因“版本必须完全一致”而不可用。适配层向前兼容旧数据，
+只对“比自己更新的数据”和“无法解析的冻结意图”拒绝；安全锚点与围栏不放宽。
+
+| 对象 | 行为 | 测试 |
+| --- | --- | --- |
+| lifecycle 版本 | 旧版本（含无 `version` 字段的最早文件）按 `store.LIFECYCLE_MIGRATIONS` 逐步在内存中迁移到当前版本，下一次 transaction（含 observe-only）原样落盘新版本；条目内未知字段保留，可选字段缺失按默认读取。必填的八个键仍是硬要求（缺失意味着身份事实 UNKNOWN，不猜）。当前版本仍是 1；提升版本时必须新增一步迁移且保持加法式 | `test_older_lifecycle_version_migrates_and_is_persisted_by_the_next_transaction`、`test_lifecycle_entries_without_optional_fields_load`、`test_migration_chain_runs_each_step_in_order` |
+| 比适配层更新的 lifecycle | 仍报 `CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED`，文案明确“升级 Thaliris 插件”并给出 recovery（`claude plugin update thaliris@thaliris`、新会话或 `/reload-plugins`、`attach --task-id` 接回原任务）；文件不被改写、不被重新解释，child 写与消息照旧 fail closed | `test_newer_lifecycle_is_refused_with_an_upgrade_message` |
+| 冻结的 `claude-model:<alias>` | 派发时经别名表解析为当前别名：`store.ALIAS_RENAMES` 显式改名/退役映射，加家族映射（`claude-opus-4-1`、`sonnet-4.5`、`claude-3-5-sonnet-20241022`、`opus[1m]` 等解析为 `opus`/`sonnet`…）。冻结文本不被改写；per-spawn `model` 只要解析到同一别名即可，否则仍拒绝 | `test_renamed_or_versioned_aliases_resolve_to_the_current_family`、`test_a_frozen_renamed_alias_keeps_dispatching` |
+| 无法解析的冻结别名 | 冻结意图未知，不猜：受管派发拒绝（`UNSUPPORTED_EXECUTION_CONSTRAINT`，不预约，文案说明 `close`/`dispose` 仍可用）；`close`、`dispose`、`detach` 不经别名校验，照常工作；已处置/已结束 child 仍被围栏。`inherit` 不是合法约束 | `test_an_unknown_frozen_alias_refuses_dispatch_but_not_close_or_dispose` |
+| Authority 锚点 | 适配层对锚点里的 `execution_mode`、`status`、`contract` 与适配层字段（`claude_session_sha256`、`host_actor_assurance`）一律带默认读取，旧形状直接可读；缺省 `execution_mode` 按 Core 的默认 `delegated`，已记录的 `single-agent` 限制不被默认值冲掉。锚点本身（受保护配置摘要、`state_sha256`）的校验保持不变，Core 状态 schema 的前向提升由 Core 负责 | `test_an_older_anchor_shape_loads_and_keeps_working`、`test_an_older_anchor_still_honors_single_agent_mode_when_recorded` |
+
+仍然保留的硬检查：锚点（安全配置与状态摘要）、已登记角色的 agent 文件摘要（child 不能自己铸造角色）、已派发 child 的派发时快照、
+已处置/已结束 child 的围栏。`claude_session_sha256` 只记录不比较。
 
 ### 已派发角色的身份连续性
 

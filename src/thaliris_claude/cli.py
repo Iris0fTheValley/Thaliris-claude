@@ -248,9 +248,10 @@ def _authority_summary(root: Path, task_id: str, *, full: bool) -> dict | None:
     record = target.read()
     if record is None:
         return None
-    summary = {"status": record["status"], "execution_mode": record["contract"]["execution_mode"],
+    contract = record.get("contract") if isinstance(record.get("contract"), dict) else {}  # tolerate an older anchor shape
+    summary = {"status": record.get("status", "UNKNOWN"), "execution_mode": contract.get("execution_mode", "delegated"),
                "sha256": core_authority.digest(target.path())}
-    constraint = record["contract"].get("execution_constraint")
+    constraint = contract.get("execution_constraint")
     if full or constraint is not None:  # a frozen constraint stays visible in the compact view
         summary["execution_constraint"] = constraint
     return summary
