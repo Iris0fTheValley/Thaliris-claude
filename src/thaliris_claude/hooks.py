@@ -290,7 +290,7 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
         marker = _marker(prompt)
         with store.transaction(root, task_id) as ctx:
             contract = ctx["authority"]["contract"]
-            if contract["execution_mode"] == "single-agent":
+            if contract.get("execution_mode", "delegated") == "single-agent":  # an older anchor may omit the mode
                 raise Refusal("This task's execution mode is single-agent: do the work directly, without Thaliris children.")
             parent = "controller"
             if is_child:
@@ -313,10 +313,18 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
                     raise Refusal("A top-level evidence marker needs at least one registered requirement ref.")
                 if marker.get("durable_paths") and target_role != "curator":
                     raise Refusal("`durable_paths` is selected only for Curator handoffs.")
-            alias = store.validate_constraint(contract)
+            try:
+                alias = store.validate_constraint(contract)
+            except ValueError:
+                raise Refusal(
+                    f"UNSUPPORTED_EXECUTION_CONSTRAINT: the task's frozen execution constraint "
+                    f"`{contract.get('execution_constraint')}` names a model alias this plugin version cannot resolve, so the "
+                    "frozen intent is unknown and managed dispatch is refused. No reservation was made. `close`, `abandon` and "
+                    "`dispose` still work. Update the plugin if the alias was added later, or close this task and start a new "
+                    "one with a supported `claude-model:` constraint.") from None
             requested = tool_input.get("model")
             if alias is not None:
-                if requested not in (None, alias):
+                if requested not in (None, alias) and store.resolve_alias(requested) != alias:
                     raise Refusal(f"The task's frozen execution constraint selects model `{alias}`; per-spawn overrides are refused.")
                 updated["model"] = alias
             # Otherwise the model is the Controller's choice; the adapter never overrides or refuses it.

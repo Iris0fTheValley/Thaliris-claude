@@ -24,6 +24,14 @@ from thaliris.authority import AuthorityStore, validate_contract
 # (history H094/H098). Children are still refused writes to .claude/settings*.json.
 PROTECTED_PATHS = (".context/config.json",)
 MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable", "inherit")
+# Explicit renames: a frozen `claude-model:<name>` whose name was retired resolves to its successor here.
+# Add an entry when a Host renames or retires an alias; existing tasks keep dispatching without being rewritten.
+ALIAS_RENAMES: dict[str, str] = {}
+# Family mapping: a versioned or prefixed spelling of a family ("claude-opus-4-1", "sonnet-4.5", "3-5-sonnet-20241022",
+# "sonnet[1m]") resolves to that family's current alias, so a model update does not strand a task frozen on the old name.
+_ALIAS_FAMILY = re.compile(
+    r"(?:claude[-_.]?)?(?:\d+(?:[-_.]\d+)*[-_.])?(sonnet|opus|haiku|fable)"
+    r"(?:[-_.]?(?:\d+(?:[-_.]\d+)*|latest|preview))*(?:\[\w+\])?")
 LIFECYCLE_NAME = "claude-lifecycle.json"
 LIFECYCLE_VERSION = 1
 _NATIVE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -85,15 +93,35 @@ def authority(root: Path, task_id: str) -> AuthorityStore:
     return AuthorityStore(root, home() / "task-authority", protected_paths=PROTECTED_PATHS, task_id=task_id)
 
 
+def resolve_alias(alias: object) -> str | None:
+    """Map a model alias (current, renamed or versioned) to a currently dispatchable alias, or None when unknown.
+
+    `inherit` is never a constraint, so it does not resolve here.
+    """
+    if not isinstance(alias, str):
+        return None
+    name = alias.strip().casefold()
+    name = ALIAS_RENAMES.get(name, name)
+    if name in MODEL_ALIASES[:-1]:
+        return name
+    match = _ALIAS_FAMILY.fullmatch(name)
+    return match.group(1) if match else None
+
+
 def validate_constraint(contract: dict) -> str | None:
-    """Return the frozen model alias selected by a `claude-model:<alias>` constraint."""
+    """Return the current alias for the frozen `claude-model:<alias>` constraint.
+
+    The frozen text is never rewritten; a renamed or versioned alias keeps resolving through `resolve_alias`.
+    An alias that resolves to nothing raises, because the frozen intent is unknown and must not be guessed.
+    """
     value = contract.get("execution_constraint")
     if value is None:
         return None
     prefix, _, alias = str(value).partition(":")
-    if prefix != "claude-model" or alias not in MODEL_ALIASES[:-1]:
+    resolved = resolve_alias(alias) if prefix == "claude-model" else None
+    if resolved is None:
         raise ValueError("UNSUPPORTED_EXECUTION_CONSTRAINT")
-    return alias
+    return resolved
 
 
 def clear_session(session_id: str | None) -> None:
@@ -298,6 +326,41 @@ def lifecycle_path(root: Path, task_id: str) -> Path:
     return core._safe_without_final_symlink(root, f".context/tasks/{task_id}/{LIFECYCLE_NAME}")
 
 
+# Forward migration: each step upgrades a lifecycle value one version in memory. A file older than LIFECYCLE_VERSION is
+# migrated on read and persisted by the next transaction; only a version newer than this code is refused. Add a step
+# `{n: migrate_n_to_n_plus_1}` whenever LIFECYCLE_VERSION is raised, and keep it additive (never drop or reinterpret fields).
+def _migrate_0_to_1(value: dict) -> dict:
+    """A file with no version number predates versioning; its shape is version 1's."""
+    return {**value, "version": 1}
+
+
+LIFECYCLE_MIGRATIONS = {0: _migrate_0_to_1}
+
+
+def _migrate_lifecycle(value: dict) -> tuple[dict, bool]:
+    version = value.get("version", 0)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", f"the lifecycle version {version!r} is not a version number")
+    if version > LIFECYCLE_VERSION:
+        # A newer plugin wrote this. Never reinterpret it: identity facts stay UNKNOWN until a newer plugin runs.
+        raise core.ThalirisError(
+            "CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED",
+            f"CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED: this task's lifecycle is version {version}, newer than this adapter's "
+            f"{LIFECYCLE_VERSION}. Upgrade the Thaliris plugin to the version that wrote it (or newer).",
+            recovery=("The lifecycle file was written by a newer Thaliris plugin than the one loaded in this session. Do not edit "
+                      "it. Upgrade the plugin (`claude plugin update thaliris@thaliris`, then a new session or `/reload-plugins`) "
+                      "and `attach --task-id` to the same task; the task and its authority are intact. Child writes and messages "
+                      "are refused until then. See `guidance --section recovery`."))
+    migrated = version < LIFECYCLE_VERSION
+    while version < LIFECYCLE_VERSION:
+        step = LIFECYCLE_MIGRATIONS.get(version)
+        if step is None:
+            raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", f"no migration from lifecycle version {version}")
+        value = step(value)
+        version = value["version"]
+    return value, migrated
+
+
 # Keys every version-1 entry carries (the 0.1 shape included): hooks and the runner index them directly.
 # `role_binding`, `requested_effort` and the observed_* fields were added later and are read with .get().
 REQUIRED_ENTRY_KEYS = ("tool_use_id", "role", "subagent_type", "parent", "handoff_id", "binding", "native_status", "disposed")
@@ -324,22 +387,23 @@ def _check_entries(task_id: str, dispatches: list) -> None:
 
 
 def read_lifecycle(root: Path, task_id: str) -> dict:
+    return load_lifecycle(root, task_id)[0]
+
+
+def load_lifecycle(root: Path, task_id: str) -> tuple[dict, bool]:
+    """Return ``(lifecycle, migrated)``: an older file is migrated forward in memory; the next transaction persists it."""
     path = lifecycle_path(root, task_id)
     if not path.is_file():
-        return {"version": LIFECYCLE_VERSION, "task_id": task_id, "dispatches": []}
+        return {"version": LIFECYCLE_VERSION, "task_id": task_id, "dispatches": []}, False
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:  # JSON or encoding damage
         raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", "the lifecycle file is not valid UTF-8 JSON") from exc
     if not isinstance(value, dict) or value.get("task_id") != task_id or not isinstance(value.get("dispatches"), list):
         raise _lifecycle_error("CLAUDE_LIFECYCLE_INVALID", "the lifecycle file has an unexpected shape")
-    if value.get("version") != LIFECYCLE_VERSION:
-        # A newer plugin wrote this (or an older one, after a downgrade). Never
-        # reinterpret it: identity facts stay UNKNOWN until a matching version runs.
-        raise _lifecycle_error("CLAUDE_LIFECYCLE_VERSION_UNSUPPORTED",
-                               f"{value.get('version')!r}; this adapter reads version {LIFECYCLE_VERSION}")
+    value, migrated = _migrate_lifecycle(value)
     _check_entries(task_id, value["dispatches"])
-    return value
+    return value, migrated
 
 
 def write_lifecycle(root: Path, task_id: str, value: dict) -> None:
@@ -363,9 +427,10 @@ def transaction(root: Path, task_id: str, *, observe_only: bool = False):
         record = None if observe_only else store.check()
         if record is None and not observe_only:
             raise ValueError("TASK_AUTHORITY_NOT_ACTIVE")
-        ctx = {"root": root, "task_id": task_id, "authority": record, "store": store,
-               "state": core._load_state(root, active=not observe_only), "lifecycle": read_lifecycle(root, task_id),
-               "state_changed": False, "lifecycle_changed": False}
+        state = core._load_state(root, active=not observe_only)
+        lifecycle, migrated = load_lifecycle(root, task_id)
+        ctx = {"root": root, "task_id": task_id, "authority": record, "store": store, "state": state, "lifecycle": lifecycle,
+               "state_changed": False, "lifecycle_changed": migrated}  # an older lifecycle is persisted in its new version
         yield ctx
         if ctx["state_changed"]:
             if observe_only:
