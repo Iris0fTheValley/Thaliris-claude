@@ -26,6 +26,51 @@ IDENTITY_FLAGS = ("--native-session", "--native-agent")
 READ_ONLY_COMMANDS = frozenset({"guidance", "status", "get", "catalog", "document-get", "version", "roles",
                                 "identity-status", "identity-get", "identity-trace"})
 
+# MCP tools a Thaliris child may call. Classification is by the tool's own name (the part after `mcp__<server>__`),
+# split into words; it is a conservative name heuristic, not a sandbox. Deny words win over allow words.
+# Spawning (delegate/publish/spawn/exec/run/bash/shell/schedule) is refused for every child, writing roles included:
+# children must not create unmanaged agents or run commands outside Thaliris management.
+_MCP_SPAWN = ("delegate", "publish", "spawn", "exec", "run", "bash", "shell", "schedul")
+_MCP_MUTATING = ("task", "write", "edit", "create", "delete", "cancel")
+_MCP_READ = frozenset({"read", "get", "list", "search", "fetch", "query", "status", "health", "wait", "output"})
+_MCP_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+
+
+def mcp_tool_part(tool_name: str) -> str:
+    parts = tool_name.split("__", 2)
+    return parts[2] if len(parts) == 3 and parts[0] == "mcp" else tool_name
+
+
+def mcp_class(tool_name: str) -> str:
+    """`spawn`, `mutating`, `read` or `unknown` for an MCP tool name."""
+    words = [word.lower() for word in _MCP_WORDS.findall(mcp_tool_part(tool_name))]
+    if any(word.startswith(_MCP_SPAWN) for word in words):
+        return "spawn"
+    if any(word.startswith(_MCP_MUTATING) for word in words):
+        return "mutating"
+    if any(word in _MCP_READ or (word.endswith("s") and word[:-1] in _MCP_READ) for word in words):
+        return "read"
+    return "unknown"
+
+
+def mcp_denial(tool_name: str, writes: bool | None) -> str | None:
+    """Why a Thaliris child may not call this MCP tool, or None. `writes` is the child's role permission.
+
+    A writing role is refused only agent-spawning and command-running tools. A read-only (or unverified, `None`) role
+    may call only read-classified tools; unknown tools are refused.
+    """
+    kind = mcp_class(tool_name)
+    if kind == "spawn":
+        return (f"MCP tool `{tool_name}` spawns or delegates to agents or runs commands outside Thaliris management; "
+                "Thaliris children must not create unmanaged agents. Delegation must go through Thaliris dispatch (the "
+                "Controller's `Agent` call with a `thaliris:*` type). Return the need in your final report.")
+    if writes is not True and kind != "read":
+        return (f"MCP tool `{tool_name}` is not classified read-only ({kind}); a non-writing Thaliris child may call only "
+                "read-only MCP tools (names with read, get, list, search, fetch, query, status, health, wait or output). "
+                "Delegation must go through Thaliris dispatch; return the need in your final report.")
+    return None
+
+
 _WRITE_PROGRAMS = frozenset({
     "rm", "rmdir", "mv", "cp", "touch", "mkdir", "tee", "truncate", "dd", "ln", "chmod", "chown", "install", "patch", "unlink", "shred",
     "set-content", "add-content", "out-file", "new-item", "remove-item", "move-item", "copy-item", "rename-item", "clear-content",

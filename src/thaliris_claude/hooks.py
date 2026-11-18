@@ -77,24 +77,31 @@ def _caller(payload: dict) -> dict:
     """Return the caller's identity: child?, Thaliris role or None, native agent id, permissions.
 
     `agent_id` is present only inside a subagent; the main thread is the
-    Controller position. A child already dispatched by a managed task keeps the
+    Controller position, unless the process environment shows another agent
+    spawned this session (`store.foreign_signal`): then it is UNKNOWN. A child already dispatched by a managed task keeps the
     role binding snapshotted at its dispatch, so editing or re-registering its
     role file later never reinterprets it. Other children resolve from the
     verified registry; a child with a generic agent type has no Thaliris role.
     """
+    # The environment may only lower authority: a session spawned by another agent is UNKNOWN, never the Controller.
+    foreign = store.foreign_signal()
     if payload.get("agent_id") is None:
+        if foreign:
+            return {"child": False, "role": "unknown", "agent_id": None, "writes": True, "delegates": frozenset(),
+                    "foreign": foreign}
         controller = roles.get_binding("controller")
         return {"child": False, "role": "controller", "agent_id": None, "writes": True,
-                "delegates": controller.allowed_delegation_targets}
+                "delegates": controller.allowed_delegation_targets, "foreign": None}
     agent_id, agent_type = store.native_id(payload.get("agent_id")), payload.get("agent_type")
     snapshot = _dispatched_binding(payload, agent_id, agent_type)
     if snapshot is not None:
         return {"child": True, "role": snapshot["role"], "agent_id": agent_id, "writes": snapshot.get("writes") is True,
-                "delegates": frozenset(snapshot.get("delegates") or ())}
+                "delegates": frozenset(snapshot.get("delegates") or ()), "foreign": foreign}
     role = roles.role_for_agent_type(agent_type)
     binding = roles.get_binding(role) if role else None
-    return {"child": True, "role": role, "agent_id": agent_id, "writes": binding.repo_write_allowed if binding else None,
-            "delegates": binding.allowed_delegation_targets if binding else frozenset()}
+    writes = binding.repo_write_allowed if binding else (False if foreign else None)  # a generic subagent of an UNKNOWN session is read-only
+    return {"child": True, "role": role, "agent_id": agent_id, "writes": writes,
+            "delegates": binding.allowed_delegation_targets if binding else frozenset(), "foreign": foreign}
 
 
 def _dispatched_types(lifecycle: dict) -> set[str]:
@@ -279,6 +286,9 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
             return _deny(f"Thaliris managed dispatch refused: {store.problem_text(problem)} No reservation was made, and the "
                          "dispatch was not treated as unmanaged.")
         return None  # No managed task: ordinary native routing, no reservation.
+    if caller["foreign"]:
+        return _deny(f"This session is an unmanaged foreign session ({caller['foreign']}), not the Controller of the task it "
+                     "resolves to; Thaliris managed dispatch is refused and no reservation was made.")
     effort = tool_input.get("effort")
     if effort is not None and effort not in roles.EFFORT_LEVELS:
         return _deny(f"`effort` is one of {', '.join(roles.EFFORT_LEVELS)} (or omitted for the role default). "
@@ -460,6 +470,10 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         if invocation["forged_identity"]:
             return _deny("`--native-session` and `--native-agent` are supplied by the adapter hook; remove them.")
         subcommand = invocation["subcommand"]
+        if caller["foreign"] and subcommand not in guards.READ_ONLY_COMMANDS:
+            return _deny(f"`{subcommand}` establishes or uses Thaliris authority, and this session is an unmanaged foreign "
+                         f"session ({caller['foreign']}): it was spawned by another agent and is UNKNOWN, not the Controller. "
+                         "Only read-only views (status, guidance, catalog, roles, version) are available.")
         if is_child and subcommand in guards.CONTROLLER_COMMANDS:
             return _deny(f"`{subcommand}` belongs to the owning Controller. Return the need in your final report.")
         if is_child and subcommand in guards.CURATOR_COMMANDS and caller_role != "curator":
@@ -551,6 +565,10 @@ def _message(payload: dict, tool_input: dict) -> dict | None:
 def _skill(payload: dict, tool_input: dict) -> dict | None:
     """The Controller skill is the main thread's routine; children keep their role (H143)."""
     if payload.get("agent_id") is None:
+        foreign = store.foreign_signal()
+        if foreign and str(tool_input.get("skill") or tool_input.get("name") or "").removeprefix(f"{roles.PLUGIN_NAMESPACE}:") == "thaliris":
+            return _deny(f"The thaliris skill is the owning Controller's routine; this session is an unmanaged foreign session "
+                         f"({foreign}), UNKNOWN and not a Controller.")
         return None
     if str(tool_input.get("skill") or tool_input.get("name") or "").removeprefix(f"{roles.PLUGIN_NAMESPACE}:") == "thaliris":
         return _deny("The thaliris skill is the owning Controller's routine; your role instructions govern this assignment. "
@@ -558,8 +576,25 @@ def _skill(payload: dict, tool_input: dict) -> dict | None:
     return None
 
 
+def _mcp(payload: dict, tool: str) -> dict | None:
+    """MCP tools can spawn unmanaged agents or run commands, which no Thaliris child may do.
+
+    Applies to a Thaliris child (a bound or registered role, a Thaliris-typed agent) and to any subagent of an UNKNOWN
+    foreign session. The Controller, a foreign main thread and a generic subagent of an ordinary session are unaffected.
+    """
+    caller = _caller(payload)
+    if not caller["child"]:
+        return None
+    if caller["role"] is None and not caller["foreign"] and not _thaliris_typed(payload.get("agent_type")):
+        return None
+    reason = guards.mcp_denial(tool, caller["writes"])
+    return _deny(reason) if reason else None
+
+
 def pre_tool_use(payload: dict) -> dict | None:
     tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
+    if isinstance(tool, str) and tool.startswith("mcp__"):
+        return _mcp(payload, tool)
     if not isinstance(tool_input, dict):
         return None
     if tool == "SendMessage":
@@ -1227,6 +1262,10 @@ def _mode_preference() -> str:
 
 
 def session_start(payload: dict) -> dict | None:
+    foreign = store.foreign_signal()
+    if foreign:
+        # Never the Controller guidance: this session was spawned by another agent and is not bound to Thaliris.
+        return _context("SessionStart", "Thaliris is installed, but " + store.FOREIGN_NOTE.format(signal=foreign))
     text = (GLOBAL_GUIDANCE.format(runner=runner_command()) + _mode_preference() + _model_preference()
             + _controller_model_warning(payload.get("model")))
     # Name the code actually loaded: a fixed checkout is not proof of what a Host runs (H096).
@@ -1281,7 +1320,7 @@ def user_prompt_submit(payload: dict) -> dict | None:
     it changed since the session last saw it; an unchanged packet repeated every
     turn is noise, not continuity.
     """
-    if payload.get("agent_id") is not None:
+    if payload.get("agent_id") is not None or store.foreign_signal():
         return None
     association = store.resolve_session(payload.get("session_id"))
     if association is not None:

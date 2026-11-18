@@ -47,6 +47,35 @@ def home() -> Path:
     return Path(os.environ.get("THALIRIS_CLAUDE_HOME") or Path.home() / ".thaliris" / "claude")
 
 
+# A process spawned by another agent (an agent bridge, or a later Thaliris launcher) carries one of these in its
+# environment. Hook and runner subprocesses inherit the Claude process environment, so both read the same fact.
+# The environment may only LOWER authority: no value here ever grants anything.
+FOREIGN_MARKER = "THALIRIS_FOREIGN_CHILD"
+BRIDGE_DEPTH = "AGENT_BRIDGE_DEPTH"
+
+
+def foreign_signal() -> str | None:
+    """Why this session is an unmanaged foreign session (UNKNOWN, not Controller), or None for an ordinary one.
+
+    `THALIRIS_FOREIGN_CHILD=1`, or `AGENT_BRIDGE_DEPTH` set to an integer greater than 0 (the bridge increments it per
+    level). Anything else, including 0, empty and unparseable values, is the ordinary user session.
+    """
+    if os.environ.get(FOREIGN_MARKER, "").strip() == "1":
+        return f"{FOREIGN_MARKER}=1"
+    depth = os.environ.get(BRIDGE_DEPTH, "").strip()
+    try:
+        return f"{BRIDGE_DEPTH}={int(depth)}" if depth and int(depth) > 0 else None
+    except ValueError:
+        return None
+
+
+FOREIGN_NOTE = ("this session was spawned by another agent ({signal}) and has no Thaliris binding: it is an unmanaged foreign "
+                "session (UNKNOWN), not a Thaliris Controller. It cannot start, attach to, judge, observe on, change the mode "
+                "of, close or dispose a Thaliris task, and its subagents are read-only. Read-only views (`status`, `guidance`, "
+                "`catalog`, `roles`, `version`) stay available. Delegation goes through Thaliris dispatch, not through MCP "
+                "agent bridges.")
+
+
 def native_id(value: object) -> str | None:
     return value if isinstance(value, str) and _NATIVE_ID.fullmatch(value) else None
 

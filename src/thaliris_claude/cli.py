@@ -14,7 +14,7 @@ import sys
 
 from thaliris import authority as core_authority, core, identity, identity_basis
 
-from . import __version__, hooks, inputs, roles, store
+from . import __version__, guards, hooks, inputs, roles, store
 
 _IDENTITY_READS = frozenset({"identity-status", "identity-get", "identity-trace"})
 _IDENTITY_MUTATIONS = frozenset({"identity-amend", "identity-challenge", "identity-relate"})
@@ -389,6 +389,12 @@ def _render(check: bool) -> dict:
 
 def run(args) -> dict:
     name = args.command
+    foreign = store.foreign_signal()
+    if foreign and name not in guards.READ_ONLY_COMMANDS:
+        # The environment may only lower authority: a session spawned by another agent is UNKNOWN, never the Controller.
+        raise ValueError(f"FOREIGN_SESSION: `{name}` establishes or uses Thaliris authority, but this process belongs to an "
+                         f"unmanaged foreign session ({foreign}): UNKNOWN, not the Controller. Read-only views are available "
+                         "(status, guidance, catalog, roles, version).")
     if name == "version":
         import platform
         import thaliris  # the Core actually imported (the vendored, pinned copy), not an installed distribution
