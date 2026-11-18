@@ -32,6 +32,16 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/thaliris-hook\" PreToolUse --filter",
+            "timeout": 30
+          }
+        ]
       }
     ],
     "PostToolUse": [

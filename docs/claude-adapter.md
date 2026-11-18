@@ -299,6 +299,48 @@ Host 限制：若 Host 清理了旧版本缓存目录，仍加载它的会话里
 仍然保留的硬检查：锚点（安全配置与状态摘要）、已登记角色的 agent 文件摘要（child 不能自己铸造角色）、已派发 child 的派发时快照、
 已处置/已结束 child 的围栏。`claude_session_sha256` 只记录不比较。
 
+### MCP 守卫与外来会话降权（0.5.3）
+
+两个边界洞：Thaliris child 能经 MCP 工具（例如本机 agent bridge 的 `mcp__codex__codex_delegate`，它会以 `danger-full-access`
+或 `bypassPermissions` 启动不受管的 Codex/Claude 进程）绕出角色；由别的 agent 启动的 `claude -p` 会话没有绑定，却被当作 Controller。
+原则：**环境只能降低权限，不能授予权限。**
+
+**A. MCP 守卫。** `hooks.json` 为 PreToolUse 增加 `mcp__.*` 匹配（走 `--filter` 快路径：Thaliris child 的 `agent_type` 含 `thaliris`，
+外来会话见下）。判定只看工具名（`mcp__<server>__<tool>` 的 `<tool>` 部分），按单词（下划线、连字符、驼峰）切分，`guards.mcp_class`：
+
+| 类别 | 单词（前缀匹配，拒绝词优先） | 对 child 的结果 |
+| --- | --- | --- |
+| `spawn` | `delegate` `publish` `spawn` `exec` `run` `bash` `shell` `schedul` | 所有 child 一律拒绝，含可写角色：child 不得创建不受管的 agent 或在 Thaliris 管理之外执行命令 |
+| `mutating` | `task` `write` `edit` `create` `delete` `cancel` | 只读角色拒绝；可写角色放行 |
+| `read` | `read` `get` `list` `search` `fetch` `query` `status` `health` `wait` `output` | 放行 |
+| `unknown` | 其余 | 只读角色拒绝（白名单默认）；可写角色放行 |
+
+适用对象：Thaliris child（已绑定或已登记的角色、Thaliris 类型的 agent）和外来会话的所有子代理。Controller 主线程、外来会话的主线程、
+普通会话里的通用子代理不受影响。拒绝文案点名该工具，并说明委派必须走 Thaliris 派发（Controller 的 `Agent` 调用加 `thaliris:*` 类型）。
+`codex_task`/`codex_tasks` 因含 `task` 对只读角色同样拒绝，`bridge_health`、`codex_wait`、`codex_output` 放行。这是工具名启发式，不是沙箱：
+改名的工具、不含上述词的 spawn 类工具不在其声明范围内。
+
+**B. 外来会话降权。** 判定在 `store.foreign_signal()`：进程环境有 `AGENT_BRIDGE_DEPTH` 且为大于 0 的整数（agent bridge 每层加一），或
+`THALIRIS_FOREIGN_CHILD=1`（后续 Thaliris 启动器会设置）。0、空值、无法解析的值不是信号，普通用户会话完全不变。Hook 与 Runner
+子进程继承 Claude 进程的环境，所以两层读到同一事实（`bin/thaliris-hook` 的 `--filter` 在这两个变量有值时交给 Python 判断，
+因为外来会话的通用子代理无需任何 Thaliris 字样也要判定）。
+
+| 位置 | 外来会话（UNKNOWN）的行为 |
+| --- | --- |
+| SessionStart | 不给 Controller 引导，只给一段短说明：这是不受管的外来会话，不是 Controller；UserPromptSubmit 不再重放证据包 |
+| 主线程 Runner 命令 | 只允许只读视图（`guidance` `status` `get` `catalog` `document-get` `version` `roles` `identity-status` `identity-get` `identity-trace`）；`attach` `task-start` `bootstrap` `judge` `observe` `close` `dispose` `mode` `register` `check` `verify` 等一律拒绝。Hook 层拒绝（不附加身份），Runner 层再拒一次（`FOREIGN_SESSION`），因此绕过 Hook 直接 `python -m thaliris_claude ... --native-session` 也不行 |
+| `thaliris` skill、受管派发 | 主线程加载 `thaliris` skill 被拒；若该会话（例如被 `--resume`）解析到某个 ACTIVE 任务，受管 `Agent` 派发被拒，不预约 |
+| 通用子代理 | `writes=False`：Edit/Write/明显写入的 Shell 命令按只读角色拒绝；MCP 工具按只读角色白名单 |
+| 主线程自己的文件读写 | 不变（只降低权限，不另加限制） |
+
+同时修复 fail-open 默认值：外来会话的通用子代理原先 `writes=None`，而 `_file` 只在 `writes is False` 时拒绝。现在为 `False`。
+普通用户会话（无标记）的通用子代理、无任务时的 `task-start`/`attach` 行为不变（有测试）。已处置与已结束 child 的围栏不变。
+若误设了 `AGENT_BRIDGE_DEPTH`（例如从桥启动的终端里再手动开 Claude Code），在该终端 `unset AGENT_BRIDGE_DEPTH` 后新开会话即可。
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `tests/test_foreign_mcp.py` | reviewer → `codex_delegate` 拒绝、implementer → `codex_publish` 拒绝、child → `bridge_health` 放行、Controller → `codex_delegate` 放行；白名单与分类；外来标记下 Controller 命令与 `attach` 被拒、引导被抑制；无标记不变；外来会话的通用子代理 `writes=False`；`sh` 快路径对外来会话交给 Python |
+
 ### 已派发角色的身份连续性
 
 PreToolUse 预约时在 lifecycle 条目写入 `role_binding` 快照：角色、`subagent_type`、来源（builtin/registered）、
