@@ -318,7 +318,9 @@ def test_dispose_fences_child_and_releases_close(task):
 def test_authority_conflict_blocks_dispatch_and_recovers(task):
     state = task["root"] / ".context" / "tasks" / task["task_id"] / "state.json"
     original = state.read_bytes()
-    state.write_bytes(original.replace(b'"revision": ', b'"revision":  '))
+    changed = json.loads(original)
+    changed["revision"] += 1
+    state.write_bytes(json.dumps(changed, separators=(",", ":")).encode("utf-8"))
     denied = _dispatch(task)
     assert _decision(denied) == "deny" and "TASK_AUTHORITY_STATE_CHANGED" in _reason(denied)
     # H088: damaged authority restricts managed controls only; ordinary work continues.

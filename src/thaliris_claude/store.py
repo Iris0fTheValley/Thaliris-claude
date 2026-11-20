@@ -440,6 +440,51 @@ def write_lifecycle(root: Path, task_id: str, value: dict) -> None:
     core._atomic_write(lifecycle_path(root, task_id), (json.dumps(value, sort_keys=True, indent=2) + "\n").encode())
 
 
+def _transaction_paths(root: Path, task_id: str, authority_store: AuthorityStore) -> tuple[Path, ...]:
+    pins = core._pins_path(root, task_id)
+    return (core._state_path(root, task_id), authority_store.path(), lifecycle_path(root, task_id), pins,
+            pins.with_name("archive-pins-required"))
+
+
+def _transaction_snapshot(root: Path, task_id: str, authority_store: AuthorityStore) -> dict[Path, tuple[str, bytes | str | None, bool]]:
+    """Capture the exact files that make one Core/lifecycle commit readable."""
+    snapshot = {}
+    for path in _transaction_paths(root, task_id, authority_store):
+        if path.is_symlink():
+            snapshot[path] = ("symlink", os.readlink(path), path.is_dir())
+            continue
+        try:
+            snapshot[path] = ("file", path.read_bytes(), False)
+        except FileNotFoundError:
+            snapshot[path] = ("missing", None, False)
+    return snapshot
+
+
+def _restore_transaction(snapshot: dict[Path, tuple[str, bytes | str | None, bool]], cause: BaseException) -> None:
+    """Best-effort exact rollback; preserve the original write error and disclose a failed restore."""
+    failures = []
+    for path, (kind, content, target_is_directory) in reversed(tuple(snapshot.items())):
+        try:
+            if kind == "symlink":
+                if path.is_symlink() and os.readlink(path) == content:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    raise IsADirectoryError(path)
+                path.unlink(missing_ok=True)
+                path.symlink_to(content, target_is_directory=target_is_directory)
+            elif kind == "missing":
+                if path.is_symlink() or path.exists():
+                    if path.is_dir() and not path.is_symlink():
+                        raise IsADirectoryError(path)
+                    path.unlink()
+            elif (path.is_symlink() or not path.is_file() or path.read_bytes() != content):
+                core._atomic_write(path, content)
+        except BaseException as exc:  # keep trying to restore the remaining stores
+            failures.append(f"{path}: {type(exc).__name__}: {exc}")
+    if failures:
+        cause.add_note("Thaliris store rollback was incomplete: " + "; ".join(failures))
+
+
 @contextmanager
 def transaction(root: Path, task_id: str, *, observe_only: bool = False):
     """Hold Core's task lock over the authority check, ledger and lifecycle.
@@ -460,14 +505,24 @@ def transaction(root: Path, task_id: str, *, observe_only: bool = False):
         lifecycle, migrated = load_lifecycle(root, task_id)
         ctx = {"root": root, "task_id": task_id, "authority": record, "store": store, "state": state, "lifecycle": lifecycle,
                "state_changed": False, "lifecycle_changed": migrated}  # an older lifecycle is persisted in its new version
-        yield ctx
-        if ctx["state_changed"]:
-            if observe_only:
-                raise ValueError("OBSERVE_ONLY_TRANSACTION")
-            core._write_state(root, ctx["state"])
-            store.checkpoint()
-        if ctx["lifecycle_changed"]:
-            write_lifecycle(root, task_id, ctx["lifecycle"])
+        snapshot = None
+        try:
+            yield ctx
+            if ctx["state_changed"]:
+                if observe_only:
+                    raise ValueError("OBSERVE_ONLY_TRANSACTION")
+            if ctx["state_changed"] or ctx["lifecycle_changed"]:
+                snapshot = ctx.get("_rollback_snapshot") or _transaction_snapshot(root, task_id, store)
+            if ctx["state_changed"]:
+                core._write_state(root, ctx["state"])
+                store.checkpoint()
+            if ctx["lifecycle_changed"]:
+                write_lifecycle(root, task_id, ctx["lifecycle"])
+        except BaseException as exc:
+            snapshot = snapshot or ctx.get("_rollback_snapshot")
+            if snapshot is not None:
+                _restore_transaction(snapshot, exc)
+            raise
 
 
 @contextmanager
@@ -483,6 +538,10 @@ def critical(root: Path, task_id: str, *, checkpoint: bool = True):
     runs only on success.
     """
     with transaction(root, task_id) as ctx:
+        # Core mutators write the ledger themselves while this lock shim keeps the
+        # authority check, write and checkpoint inside the same task lock. Keep a
+        # pre-mutation snapshot so a failed Core checkpoint can restore all stores.
+        ctx["_rollback_snapshot"] = _transaction_snapshot(root, task_id, ctx["store"])
         target, original = root.resolve(), core._lock
 
         @contextmanager
@@ -621,7 +680,7 @@ def new_handoff_id() -> str:
 
 def reserve(ctx: dict, *, role: str, subagent_type: str, tool_use_id: str, parent: str,
             prompt: str, model: str | None, background: bool, association: dict | None,
-            effort: str | None = None, role_binding: dict | None = None) -> dict:
+            effort: str | None = None, role_binding: dict | None = None, foreign: dict | None = None) -> dict:
     """Record one native dispatch and, when associated, its Core handoff.
 
     ``parent`` is "controller" or the delegating child's native agent id.
@@ -650,9 +709,14 @@ def reserve(ctx: dict, *, role: str, subagent_type: str, tool_use_id: str, paren
         if association.get("durable_paths"):
             record["durable_paths"] = association["durable_paths"]
     if record is not None:
-        record["producer"] = f"handoff:{record['id']}"
-        core._register_evidence_handoff(state, record)
-        state["revision"] += 1
+        if foreign is None:
+            record["producer"] = f"handoff:{record['id']}"
+            core._register_evidence_handoff(state, record)
+            state["revision"] += 1
+        else:
+            core.check_revision(state, foreign["base_revision"])
+            core.reserve_foreign_handoff(state, {**record, "producer": role}, executor_host="codex", prompt=prompt,
+                                         root=ctx["root"])
         ctx["state_changed"] = True
     entry = {
         "tool_use_id": tool_use_id, "role": role, "subagent_type": subagent_type,
@@ -663,6 +727,8 @@ def reserve(ctx: dict, *, role: str, subagent_type: str, tool_use_id: str, paren
         "binding": "unbound", "native_status": "reserved", "disposed": False,
         "created_at": now(), "events": [],
     }
+    if foreign is not None:
+        entry["foreign"] = {key: foreign[key] for key in ("session_hash", "model", "effort")}
     lifecycle["dispatches"].append(entry)
     ctx["lifecycle_changed"] = True
     return entry

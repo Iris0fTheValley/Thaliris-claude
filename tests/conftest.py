@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -27,10 +28,12 @@ def thaliris_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
-    location = tmp_path / "home"
-    monkeypatch.setenv("THALIRIS_CLAUDE_HOME", str(location))
-    return location
+def home(monkeypatch):
+    # Recovery archives preserve the full workspace-relative path below this
+    # directory. Use a short isolated path so Windows does not hit MAX_PATH.
+    with tempfile.TemporaryDirectory(prefix="ch-", dir=tempfile.gettempdir()) as location:
+        monkeypatch.setenv("THALIRIS_CLAUDE_HOME", location)
+        yield Path(location)
 
 
 @pytest.fixture

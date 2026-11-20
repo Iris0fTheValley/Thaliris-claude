@@ -15,13 +15,13 @@ Claude Code 的 Thaliris Host 适配层。它直接复用共享的 [Thaliris Cor
 ```
 Thaliris-claude/
 ├── .claude-plugin/plugin.json     插件清单（插件名 thaliris → 子代理类型 thaliris:<role>）
-├── agents/*.md                    6 个角色子代理（由 roles.py 生成，勿手改）
+├── agents/*.md                    9 个内置角色子代理（由 roles.py 生成，勿手改）
 ├── skills/thaliris/SKILL.md       Controller 常驻指导（Claude 风格重写）
 ├── skills/thaliris/recovery.md    例外流程（按需检索：恢复、处置、Host 维护）
 ├── hooks/hooks.json               SessionStart / UserPromptSubmit / PreToolUse / PostToolUse(+Failure) / SubagentStart / SubagentStop
 ├── bin/thaliris-hook             Hook 入口（sh，与官方插件同一约定；命中缓存时只启动一个解释器）
 ├── bin/thaliris.py                Runner 启动器（兼容旧 Python，自动发现并缓存 ≥3.11 运行时）
-├── vendor/                        固定提交的 Thaliris Core（8e5cdce，Core 0.6.0）与 core.lock.json
+├── vendor/                        固定提交的 Thaliris Core 与 core.lock.json（最低支持 Core 0.6.2）
 ├── scripts/vendor_core.py         内置/校验 Core
 └── src/thaliris_claude/
     ├── roles.py    RoleSpec + ClaudeExecutionBinding；角色提示词唯一权威来源
@@ -340,6 +340,33 @@ Host 限制：若 Host 清理了旧版本缓存目录，仍加载它的会话里
 | 测试 | 覆盖 |
 | --- | --- |
 | `tests/test_foreign_mcp.py` | reviewer → `codex_delegate` 拒绝、implementer → `codex_publish` 拒绝、child → `bridge_health` 放行、Controller → `codex_delegate` 放行；白名单与分类；外来标记下 Controller 命令与 `attach` 被拒、引导被抑制；无标记不变；外来会话的通用子代理 `writes=False`；`sh` 快路径对外来会话交给 Python |
+
+### Claude Controller 派发受管 Codex 子代理（0.6.0）
+
+有 ACTIVE 任务的 Claude Controller 可用原生 Agent 工具选择 `thaliris:codex-investigator`、
+`thaliris:codex-reviewer` 或 `thaliris:codex-reasoning-specialist`。在选定的 handoff 原文中按以下形式传入
+证据选择，`codex_model` 和 `codex_effort` 可省略。保留 Agent 的原生 `model` 和 `effort` 为空，后台派发仍可用 `run_in_background`。
+
+```text
+thaliris-evidence: {"candidate":"C1","requirement_refs":["R1"],"codex_model":"gpt-6.2-sol","codex_effort":"medium"}
+```
+
+Haiku relay 只收到一次 `xhost-run --handoff` 的命令。PreToolUse 从 Claude 提供的精确身份和 `toolUseId`
+核对 relay。launcher 验证 Core 存储的 prompt 摘要，从 Codex `thread/start` 获取 `thread.id`，并在一个受检事务中注册、
+预绑定、写入并 checkpoint，然后发布共享降权 selector，最后才发送 `turn/start`。预绑定记录仍须用终态区分执行结果。
+收到原生完成通知后，Controller 用 `<runner> get foreign-result:<handoff-id>` 读取经摘要校验的完整报告。
+使用 `dispose` 取消在途派发。launcher 负责受限运行时、超时及进程树清理，并且只记录一次结果、claims 和 usage。
+
+Codex app-server 采用 read-only sandbox、`approvalPolicy: never`，禁用 shell、unified exec、apps、plugins 和 agents，
+逐个禁用有效配置中的 MCP server。`read_file`、`list_files` 和 `search_files` 是 launcher 处理的结构化源码读取工具。
+它们需要支持实验性 `dynamicTools` 的 Codex CLI，并保留默认 thread environment。实际 Windows CLI 短探针已经返回
+源码随机标记、一次动态工具调用以及 `thread/tokenUsage/updated` 统计。接收端是否启用了对应 Thaliris 版本，仍须在目标 Host 核对。
+
+从 Codex 启动的 Claude 会话按 hook payload 的 session ID 查共享 selector，精确验证任务、handoff、session hash、
+目标 Host 和已预绑定状态。Read、Grep、Glob 还要满足 hook cwd 与选定项目根一致；Read 的 `file_path`、Grep/Glob 的 `path`
+必须留在项目根内，拒绝路径穿越和符号链接/reparse point。Grep/Glob 未提供 `path` 时只在已验证的项目根内搜索。
+标记存在但绑定不可用时，所有工具均拒绝，Controller 接管也不可用。已结算的 selector 保留降权。接收端只读 Core 账本，
+无需读写对方 Host 的 authority store。
 
 ### 已派发角色的身份连续性
 

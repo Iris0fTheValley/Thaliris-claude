@@ -27,6 +27,9 @@ CONTINUITY_ID_COLLISION = "CONTINUITY_ID_COLLISION"
 REVISION_DELTA_INVALID = "REVISION_DELTA_INVALID"
 # A bounded ledger list, the routing page or the whole state file is full; the write is refused unchanged.
 TASK_STATE_CAPACITY_EXCEEDED = "TASK_STATE_CAPACITY_EXCEEDED"
+# An archived ledger item's body lives in a segment file that is missing, unreadable or does not match its
+# sha256. Only explicit retrieval (task-get, promotion of an archived source) needs it; gates and status do not.
+TASK_ARCHIVE_UNAVAILABLE = "TASK_ARCHIVE_UNAVAILABLE"
 # The external authority anchor exists but cannot be read as a Core authority record.
 TASK_AUTHORITY_INVALID = "TASK_AUTHORITY_INVALID"
 # Identity formation (basis notes and suggestion preferences; stored outside the repository).
@@ -45,6 +48,12 @@ CHECK_NOT_FOUND = "CHECK_NOT_FOUND"
 HANDOFF_NOT_FOUND = "HANDOFF_NOT_FOUND"
 HANDOFF_USAGE_INVALID = "HANDOFF_USAGE_INVALID"
 LANE_COUNTER_INVALID = "LANE_COUNTER_INVALID"
+# Cross-host managed children (schema 12): a foreign-runner handoff's launch, binding, result or
+# cancellation was malformed, came out of run-state order, or a foreign child tried to delegate.
+FOREIGN_RUN_INVALID = "FOREIGN_RUN_INVALID"
+FOREIGN_RUN_STATE_CONFLICT = "FOREIGN_RUN_STATE_CONFLICT"
+FOREIGN_DELEGATION_REFUSED = "FOREIGN_DELEGATION_REFUSED"
+FOREIGN_BODY_UNAVAILABLE = "FOREIGN_BODY_UNAVAILABLE"
 
 
 class ThalirisError(ValueError):

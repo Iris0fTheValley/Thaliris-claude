@@ -14,7 +14,7 @@ import sys
 
 from thaliris import authority as core_authority, core, identity, identity_basis
 
-from . import __version__, guards, hooks, inputs, roles, store
+from . import __version__, guards, hooks, inputs, roles, store, xhost
 
 _IDENTITY_READS = frozenset({"identity-status", "identity-get", "identity-trace"})
 _IDENTITY_MUTATIONS = frozenset({"identity-amend", "identity-challenge", "identity-relate"})
@@ -125,6 +125,8 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("--handoff-id")
     command.add_argument("--tool-use-id")
     command.add_argument("--reason", required=True)
+    command = add('xhost-run', 'start the exact managed launcher reserved for a native Codex relay')
+    command.add_argument('--handoff', required=True)
     command = add("artifact", "register a task Artifact")
     command.add_argument("--base-revision", type=int, required=True)
     command.add_argument("--id", required=True)
@@ -389,12 +391,22 @@ def _render(check: bool) -> dict:
 
 def run(args) -> dict:
     name = args.command
+    if xhost.is_incoming(args.native_session):
+        raise ValueError('FOREIGN_CHILD: this Claude session has no Thaliris runner capability')
     foreign = store.foreign_signal()
     if foreign and name not in guards.READ_ONLY_COMMANDS:
         # The environment may only lower authority: a session spawned by another agent is UNKNOWN, never the Controller.
         raise ValueError(f"FOREIGN_SESSION: `{name}` establishes or uses Thaliris authority, but this process belongs to an "
                          f"unmanaged foreign session ({foreign}): UNKNOWN, not the Controller. Read-only views are available "
                          "(status, guidance, catalog, roles, version).")
+    if name == 'xhost-run':
+        session, agent = _session(args), store.native_id(args.native_agent)
+        if agent is None or args.root is not None:
+            raise ValueError('FOREIGN_RUN_INVALID: an exact native Codex relay is required')
+        root, task_id = _task(args)
+        if args.task_id != task_id:
+            raise ValueError('FOREIGN_RUN_INVALID: launcher task does not match the dispatching association')
+        return xhost.launch(root, task_id, args.handoff, session, agent)
     if name == "version":
         import platform
         import thaliris  # the Core actually imported (the vendored, pinned copy), not an installed distribution
@@ -478,6 +490,13 @@ def run(args) -> dict:
             result["Project Identity"] = summary
         return result
     if name in {"status", "get"}:
+        if name == 'get' and args.id.startswith('foreign-result:'):
+            _controller(args)
+            if foreign:
+                raise ValueError('FOREIGN_SESSION: the report belongs to the dispatching Controller')
+            root, task_id = _task(args)
+            core.select_task(root, task_id)
+            return core.task_foreign_body(root, args.id.removeprefix('foreign-result:'), 'result')
         root, task_id = _read_task(args)
         if name == "status":
             return _status(root, task_id, args.evidence_offset, view=args.view, since_revision=args.since_revision)
@@ -611,9 +630,11 @@ def run(args) -> dict:
             entry["disposed"] = True
             store.note(entry, "disposed", reason=args.reason[:500])
             ctx["lifecycle_changed"] = True
+            cancelled = xhost.cancel_entry(ctx, entry, 'Controller disposed the Codex dispatch')
         # Disposal ends management and fences grants; it proves nothing about native termination.
         return {"ok": True, "handoff_id": entry["handoff_id"], "native_status": entry["native_status"], "native_termination": "UNKNOWN"
-                if entry["native_status"] in store.UNRESOLVED_STATUSES else entry["native_status"]}
+                if entry["native_status"] in store.UNRESOLVED_STATUSES else entry["native_status"],
+                **({'run_state': cancelled['run_state']} if cancelled else {})}
     if name == "mode":
         with store.critical(root, task_id, checkpoint=False) as ctx:  # Core's switch re-anchors the authority itself
             unresolved = store.unresolved(ctx["lifecycle"])
@@ -653,6 +674,9 @@ def run(args) -> dict:
             result["identity_offer"] = offer
         return result
     if name == "detach":
+        digest = core.foreign_session_hash(_session(args))
+        xhost.cancel_runs((root, task_id), lambda item: (item.get('foreign') or {}).get('session_hash') == digest,
+                          'Dispatching Claude session detached')
         store.clear_session(args.native_session)  # also removes the adaptive lane marker
         return {"ok": True, "task_id": task_id, "status": "ACTIVE", "note": "Session association removed; authority and ledger are unchanged."}
     if name == "recover-authority":

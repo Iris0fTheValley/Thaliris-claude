@@ -286,6 +286,68 @@ def _relative(root: Path, name: str) -> str:
     return name
 
 
+# Anchor record versions. Reading promotes an older record forward in memory (it is written in the
+# current shape on the next anchor write, like task state); only a newer version is refused, with a
+# recovery that names the upgrade. Promotion never invents tamper evidence: ``state_sha256`` and the
+# identity fields stay required, and every digest the record holds is compared exactly.
+ANCHOR_VERSION = 1
+_ANCHOR_REQUIRED_FIELDS = ("project", "task_id", "goal", "contract", "status", "state_sha256")
+# Fields an older writer may not have recorded, and the value that means "nothing recorded".
+_ANCHOR_DEFAULTS: dict[str, Callable[[], object]] = {"security": dict, "snapshots": dict, "history": list}
+
+
+def _promote_anchor_0_to_1(record: dict) -> dict:
+    """An unversioned anchor predates the version field; its shape is version 1 without the marker."""
+    return {**record, "version": 1}
+
+
+# Prior anchor version -> step that lifts it by one version (absent ``version`` reads as 0).
+_ANCHOR_PROMOTIONS: dict[int, Callable[[dict], dict]] = {0: _promote_anchor_0_to_1}
+
+
+def _anchor_invalid(name: str, reason: str, **details: object) -> core.ThalirisError:
+    return core.ThalirisError(
+        core.errors.TASK_AUTHORITY_INVALID, "TASK_AUTHORITY_INVALID",
+        recovery=("the external authority anchor is not a readable Core authority record; Core does not repair or "
+                  "replace it; restore its exact bytes from a copy or use the adapter's recovery procedure"),
+        details={"reason": reason, "anchor": name, **details})
+
+
+def _promoted_anchor(record: object, name: str) -> dict:
+    """The current-version, defaults-filled form of a stored anchor record (in memory only)."""
+    if not isinstance(record, dict):
+        raise _anchor_invalid(name, "anchor is not a JSON object")
+    version = record.get("version", 0)
+    if type(version) is not int or version < 0:
+        raise _anchor_invalid(name, "anchor version is not a non-negative integer")
+    if version > ANCHOR_VERSION:
+        raise core.ThalirisError(
+            core.errors.TASK_AUTHORITY_INVALID, "TASK_AUTHORITY_INVALID",
+            recovery=(f"the anchor was written by a newer Thaliris (anchor version {version}; this Core reads up to "
+                      f"{ANCHOR_VERSION}); upgrade Thaliris Core and its adapter; the anchor is unchanged"),
+            details={"reason": "anchor version is newer than this Core", "anchor": name, "version": version,
+                     "supported_version": ANCHOR_VERSION, "upgrade_required": True})
+    for step in range(version, ANCHOR_VERSION):
+        if step not in _ANCHOR_PROMOTIONS:
+            raise _anchor_invalid(name, "anchor version has no promotion path", version=version)
+        record = _ANCHOR_PROMOTIONS[step](record)
+    missing = [field for field in _ANCHOR_REQUIRED_FIELDS if field not in record]
+    if missing:
+        raise _anchor_invalid(name, "anchor lacks required fields", missing_fields=missing)
+    if not isinstance(record["contract"], dict) or not isinstance(record["state_sha256"], str):
+        raise _anchor_invalid(name, "anchor contract or state digest has the wrong type")
+    promoted = dict(record)
+    for field, default in _ANCHOR_DEFAULTS.items():
+        if field not in promoted:
+            promoted[field] = default()
+        elif not isinstance(promoted[field], type(default())):
+            raise _anchor_invalid(name, f"anchor {field} has the wrong type")
+    if "execution_mode" not in promoted["contract"]:
+        # Contracts recorded before execution modes are delegated (validate_contract's default).
+        promoted["contract"] = {**promoted["contract"], "execution_mode": "delegated"}
+    return promoted
+
+
 class AuthorityStore:
     """Task ID scoped external anchors, with exact legacy-byte preservation.
 
@@ -346,8 +408,8 @@ class AuthorityStore:
                 recovery=("the external authority anchor is not readable JSON; Core does not repair or replace it; "
                           "restore its exact bytes from a copy or use the adapter's recovery procedure"),
                 details={"reason": "anchor is not valid UTF-8 JSON", "anchor": target.name}) from exc
-        if (not isinstance(record, dict) or record.get("version") != 1 or not isinstance(record.get("project"), str)
-                or Path(record["project"]).resolve() != self.root.resolve()):
+        record = _promoted_anchor(record, target.name)
+        if not isinstance(record.get("project"), str) or Path(record["project"]).resolve() != self.root.resolve():
             raise ValueError("TASK_AUTHORITY_INVALID")
         selected = self.task_id or core.selected_task(self.root)
         if selected is not None and record.get("task_id") != selected:
@@ -361,6 +423,44 @@ class AuthorityStore:
         """Persist an adapter-authorized record; this is not an authority grant."""
         core._atomic_write(self.path(), (json.dumps(record, sort_keys=True, indent=2) + "\n").encode())
 
+    def _state_snapshot(self, record: dict) -> bytes | None:
+        name = core._state_path(self.root, record["task_id"]).relative_to(self.root).as_posix()
+        encoded = record["snapshots"].get(name)
+        return None if encoded is None else base64.b64decode(encoded, validate=True)
+
+    def _capture_state(self, record: dict) -> bytes | None:
+        """Use the same ledger bytes for the snapshot, the digest and the identity check."""
+        path = core._state_path(self.root, record["task_id"])
+        if path.is_symlink() or path.exists() and not path.is_file():
+            raise ValueError("TASK_AUTHORITY_UNSAFE_PATH")
+        try:
+            raw = core.read_state_bytes(path)
+        except FileNotFoundError:
+            raw = None
+        self._set_state_snapshot(record, path, raw)
+        return raw
+
+    def _set_state_snapshot(self, record: dict, path: Path, raw: bytes | None) -> None:
+        record["state_sha256"] = "ABSENT" if raw is None else hashlib.sha256(raw).hexdigest()
+        record["snapshots"][path.relative_to(self.root).as_posix()] = None if raw is None else base64.b64encode(raw).decode()
+
+    def _anchor_pin_key(self) -> str:
+        location = str(self.path().resolve())
+        return "anchor-" + hashlib.sha256(os.path.normcase(location).encode("utf-8")).hexdigest()[:32]
+
+    def _trim_anchor_pins(self, record: dict, key: str, current: bytes | None) -> None:
+        try:
+            core.pin_anchor_segments(self.root, record["task_id"], key, [current] if record["status"] == "ACTIVE" else [])
+        except (OSError, ValueError):
+            pass  # The previous and current snapshot segments are still pinned.
+
+    def _write_with_pins(self, record: dict, previous: bytes | None, current: bytes | None) -> None:
+        """Called under the archive lock. A failure can leave extra pins, never a new unpinned anchor."""
+        key = self._anchor_pin_key()
+        core.pin_anchor_segments(self.root, record["task_id"], key, [previous, current])
+        self.write(record)
+        self._trim_anchor_pins(record, key, current)
+
     def establish(self, state: dict, intent: dict, *, adapter_fields: dict | None = None) -> dict:
         intent = validate_contract(intent)
         fields = adapter_fields or {}
@@ -369,25 +469,22 @@ class AuthorityStore:
         # Only an existing ACTIVE Core ledger can be anchored. No second task
         # state or host-specific task identity is created here.
         self.task_id = state["task_id"]
-        current = json.loads(core._state_path(self.root, self.task_id).read_text(encoding="utf-8"))
-        if current.get("task_id") != state["task_id"] or current.get("goal") != state["goal"] or current.get("status") != "ACTIVE":
-            raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
-        prior = self.read()
-        if prior is not None:
-            raise ValueError("TASK_AUTHORITY_ALREADY_ACTIVE" if prior["status"] == "ACTIVE" else "TASK_AUTHORITY_RETIRED_NO_REESTABLISH")
-        if prior is not None:
-            core._atomic_write(self.directory / "history" / f"{self.path().stem}-{prior['task_id']}.json", self.path().read_bytes())
-        record = {"version": 1, "project": str(self.root.resolve()), "task_id": state["task_id"],
-                  "goal": state["goal"], "contract": intent, "status": "ACTIVE",
-                  "provenance": "SELECTED_TASK_INTENT",
-                  "state_sha256": digest(core._state_path(self.root, self.task_id)),
-                  "security": {name: digest(self.root / name) for name in self.protected_paths},
-                  "history": prior.get("history", []) + [{"task_id": prior["task_id"], "goal": prior["goal"],
-                      "status": prior["status"], "contract": prior["contract"]}] if prior else [], **fields}
-        record["snapshots"] = {name: base64.b64encode((self.root / name).read_bytes()).decode()
-                               if digest(self.root / name) != "ABSENT" else None
-                               for name in (*self.protected_paths, core._state_path(self.root, self.task_id).relative_to(self.root).as_posix())}
-        self.write(record)
+        with core._archive_gc_lock(self.root, self.task_id):
+            record = {"version": 1, "project": str(self.root.resolve()), "task_id": self.task_id,
+                      "goal": state["goal"], "contract": intent, "status": "ACTIVE",
+                      "provenance": "SELECTED_TASK_INTENT",
+                      "security": {name: digest(self.root / name) for name in self.protected_paths},
+                      "history": [], **fields}
+            record["snapshots"] = {name: base64.b64encode((self.root / name).read_bytes()).decode()
+                                   if record["security"][name] != "ABSENT" else None for name in self.protected_paths}
+            raw = self._capture_state(record)
+            current = {} if raw is None else json.loads(raw)
+            if current.get("task_id") != self.task_id or current.get("goal") != state["goal"] or current.get("status") != "ACTIVE":
+                raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
+            prior = self.read()
+            if prior is not None:
+                raise ValueError("TASK_AUTHORITY_ALREADY_ACTIVE" if prior["status"] == "ACTIVE" else "TASK_AUTHORITY_RETIRED_NO_REESTABLISH")
+            self._write_with_pins(record, None, raw)
         return record
 
     def check(self, *, evidence: Mapping[str, tuple[Path, str]] | None = None) -> dict | None:
@@ -406,7 +503,9 @@ class AuthorityStore:
         if state.get("task_id") != record["task_id"] or state.get("goal") != record["goal"] or state.get("status") != "ACTIVE":
             raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
         for field, (target, error) in (evidence or {}).items():
-            if digest(target) != record[field]:
+            # An adapter evidence digest that an older adapter or Core never recorded has nothing
+            # to compare against; every digest the anchor does hold is compared exactly.
+            if field in record and digest(target) != record[field]:
                 raise ValueError(error)
         return record
 
@@ -416,19 +515,26 @@ class AuthorityStore:
         The task identity and selected contract are never changed. Deletion
         retires authority as ABANDONED; it does not prove task completion.
         """
-        record = self.read()
-        if record is None or record["status"] != "ACTIVE":
+        task_id = self.task_id or core.selected_task(self.root)
+        if task_id is None:
+            self.read()  # exact legacy anchor, if present
+            task_id = self.task_id
+        if task_id is None:
             return
-        record["state_sha256"] = digest(core._state_path(self.root, self.task_id))
-        record["snapshots"][core._state_path(self.root, self.task_id).relative_to(self.root).as_posix()] = base64.b64encode(core._state_path(self.root, self.task_id).read_bytes()).decode() if record["state_sha256"] != "ABSENT" else None
-        if record["state_sha256"] == "ABSENT":
-            record["status"] = "ABANDONED"
-        else:
-            state = json.loads(core._state_path(self.root, self.task_id).read_text(encoding="utf-8"))
-            if state["task_id"] != record["task_id"] or state["goal"] != record["goal"]:
-                raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
-            record["status"] = state["status"]
-        self.write(record)
+        with core._archive_gc_lock(self.root, task_id):
+            record = self.read()
+            if record is None or record["status"] != "ACTIVE":
+                return
+            previous = self._state_snapshot(record)
+            current = self._capture_state(record)
+            if current is None:
+                record["status"] = "ABANDONED"
+            else:
+                state = json.loads(current)
+                if state["task_id"] != task_id or state["goal"] != record["goal"]:
+                    raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
+                record["status"] = state["status"]
+            self._write_with_pins(record, previous, current)
 
     def switch_mode(self, expected: str, base_revision: int, mode: str, human_instruction: str) -> dict:
         """Apply an adapter-authorized selection; all other intent stays frozen.
@@ -453,11 +559,27 @@ class AuthorityStore:
                 "human_instruction": human_instruction, "revision": base_revision})
             record["contract"] = {**record["contract"], "execution_mode": mode}
             state["revision"] += 1
-            core._write_state(self.root, state)
-            state_path = core._state_path(self.root, record["task_id"])
-            record["state_sha256"] = digest(state_path)
-            record["snapshots"][state_path.relative_to(self.root).as_posix()] = base64.b64encode(state_path.read_bytes()).decode()
-            self.write(record)
+
+            def publish(path: Path, current: bytes) -> None:
+                if digest(self.path()) != expected:
+                    raise ValueError("TASK_AUTHORITY_CHANGED")
+                previous = core.read_state_bytes(path)
+                if hashlib.sha256(previous).hexdigest() != record["state_sha256"]:
+                    raise ValueError("TASK_AUTHORITY_STATE_CHANGED")
+                self._set_state_snapshot(record, path, current)
+                key = self._anchor_pin_key()
+                core.pin_anchor_segments(self.root, record["task_id"], key, [previous, current])
+                core._atomic_write(path, current)
+                try:
+                    self.write(record)
+                except BaseException as exc:
+                    if digest(path) != record["state_sha256"]:
+                        raise ValueError("TASK_AUTHORITY_STATE_CHANGED") from exc
+                    core._atomic_write(path, previous)
+                    raise
+                self._trim_anchor_pins(record, key, current)
+
+            core._write_state(self.root, state, publish=publish)
         return {"ok": True, "task_id": record["task_id"], "revision": state["revision"], "execution_mode": mode}
 
     def recover(self, expected: str, reason: str, *,
@@ -498,31 +620,54 @@ class AuthorityStore:
                 _relative(self.directory, name)
                 if name in {"authority.json", *restored}:
                     raise ValueError("TASK_AUTHORITY_ARCHIVE_PATH_CONFLICT")
-            archive = self.directory / "recovery" / (expected + "-" + uuid.uuid4().hex)
-            archive.mkdir(parents=True, exist_ok=False)
-            core._atomic_write(archive / "authority.json", self.path().read_bytes())
-            for name in restored:
-                if digest(self.root / name) != "ABSENT":
-                    core._atomic_write(archive / name, (self.root / name).read_bytes())
-            for name, target in paths.items():
-                if digest(target) != "ABSENT":
-                    core._atomic_write(archive / name, target.read_bytes())
-            record.setdefault("recoveries", []).append({"reason": reason, "archive": str(archive)})
-            for name, content in restored.items():
-                target = self.root / name
-                if content is None:
-                    if target.is_file():
-                        target.unlink()
-                else:
-                    core._atomic_write(target, content)
-            if restore_adapter is not None:
-                restore_adapter(record)
+            task_id = record["task_id"]
+            recovery_id = uuid.uuid4().hex
+            archive = self.directory / "recovery" / (expected + "-" + recovery_id)
+            if _is_link(archive.parent):
+                raise ValueError("TASK_AUTHORITY_EXTERNAL_LOCATION_UNSAFE")
+            with core._archive_gc_lock(self.root, task_id):
+                anchor_bytes = self.path().read_bytes()
+                if hashlib.sha256(anchor_bytes).hexdigest() != expected:
+                    raise ValueError("TASK_AUTHORITY_CHANGED")
+                state_name = core._state_path(self.root, task_id).relative_to(self.root).as_posix()
+                previous = None
+                if state_name in restored and digest(self.root / state_name) != "ABSENT":
+                    previous = (self.root / state_name).read_bytes()
+                snapshot = restored.get(state_name)
+                # The archived anchor and the displaced ledger have their own lifetime. Preserve
+                # malformed conflict bytes too, but only use this task's recognized index as a pin.
+                displaced = previous if core._state_bytes_refs(previous, task_id) is not None else None
+                core._pin_archive_snapshots(self.root, task_id, {
+                    self._anchor_pin_key(): [snapshot],
+                    "recovery-" + recovery_id: [snapshot, displaced],
+                })
+                archive.mkdir(parents=True, exist_ok=False)
+                core._atomic_write(archive / "authority.json", anchor_bytes)
+                for name in restored:
+                    if name == state_name:
+                        if previous is not None:
+                            core._atomic_write(archive / name, previous)
+                    elif digest(self.root / name) != "ABSENT":
+                        core._atomic_write(archive / name, (self.root / name).read_bytes())
+                for name, target in paths.items():
+                    if digest(target) != "ABSENT":
+                        core._atomic_write(archive / name, target.read_bytes())
+                record.setdefault("recoveries", []).append({"reason": reason, "archive": str(archive)})
+                for name, content in restored.items():
+                    target = self.root / name
+                    if content is None:
+                        if target.is_file():
+                            target.unlink()
+                    else:
+                        core._atomic_write(target, content)
+                if restore_adapter is not None:
+                    restore_adapter(record)
+                    if json.dumps(_truth(record), sort_keys=True) != truth:
+                        raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
+                checks = evidence(record) if callable(evidence) else evidence
                 if json.dumps(_truth(record), sort_keys=True) != truth:
                     raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
-            checks = evidence(record) if callable(evidence) else evidence
-            if json.dumps(_truth(record), sort_keys=True) != truth:
-                raise ValueError("TASK_AUTHORITY_IDENTITY_CHANGED")
-            self.write(record)
+                self.write(record)
             self.check(evidence=checks)
         return {"ok": True, "status": "TASK_AUTHORITY_RECOVERED", "task_id": record["task_id"],
-                "authority_provenance": record["provenance"]}
+                "authority_provenance": record.get("provenance")}

@@ -118,6 +118,9 @@ Workstream's shape; there is no ladder, size threshold or mandatory pipeline.
 | Implementer | `thaliris:implementer` | `sonnet` | yes | investigator |
 | Focused implementer | `thaliris:focused-implementer` | `sonnet` or `opus`, by difficulty | yes | investigator |
 | Reviewer | `thaliris:reviewer` | `inherit` | no | investigator |
+| Codex Investigator | `thaliris:codex-investigator` | Codex default (`haiku` relay) | no | — |
+| Codex Reviewer | `thaliris:codex-reviewer` | Codex default (`haiku` relay) | no | — |
+| Codex Reasoning specialist | `thaliris:codex-reasoning-specialist` | Codex default (`haiku` relay) | no | — |
 <!-- thaliris-roles:end -->
 
 - **Investigator** gathers broad facts with exact sources and covered/uncovered
@@ -269,6 +272,18 @@ candidate and starts with no requirement refs; only you connect its evidence to
 requirements.
 
 ## 5. Delegating and waiting in Claude Code
+
+To use a Codex model for read-only work, choose `thaliris:codex-investigator`,
+`thaliris:codex-reviewer`, or `thaliris:codex-reasoning-specialist` in the native
+Agent tool. Use the same selected handoff and include an evidence marker with
+`candidate` and `requirement_refs`. You can add `codex_model` and `codex_effort`
+to the marker. Leave the Agent tool's native `model` and `effort` fields unset.
+The task's frozen mode and model constraints still apply.
+
+The native relay returns a short execution summary and handoff ID. Read the
+verified child report with `<runner> get foreign-result:<handoff-id>`. The
+launcher records the result, claims and usage together. Subagent completion is
+a notification to open the result. Use `dispose` to cancel a pending foreign run.
 
 - **Foreground** Agent calls can return the child's final report directly, but
   the Host may run any call in the background, especially when you dispatch
