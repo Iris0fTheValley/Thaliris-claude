@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 import base64
 import copy
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Callable
 import uuid
 
 if os.name == "nt":
@@ -429,27 +431,66 @@ def stale(root: Path) -> dict[str, object]:
 # Task state is a mechanical ledger. Models author record labels and interpret
 # them; Core validates only shape, identity, references, bounds, and CAS.
 _STATE_NAME = ".context/state.json"
-_STATE_SCHEMA_VERSION = 7
-# Opt-in format for Controller-local provenance. Keep legacy-only tasks on 7;
-# the first local observation upgrades the ledger in its normal transaction.
-# Old readers refuse 8 as newer, rather than treating local facts as handoffs.
+# Schema history. 7 is the oldest on-disk shape this Core reads as-is; 8 added Controller-local
+# provenance, 9 the verification-first ledger (declared checks and their run results, requirement
+# kinds, typed claims, handoff usage and gate overrides), 10 compact serialization with hot/cold
+# archive segments (``archive`` index and ``archived`` stubs), and 11 full eviction of settled objects
+# (eviction entries in ``archive`` and the ``settled`` table), and 12 cross-host managed children
+# (foreign-runner handoff fields, ``foreign-runner`` claim provenance and a usage ``cost_basis``).
+# Every earlier supported schema is a
+# valid subset of the next one, so promotion is a forward chain (``_COMPATIBLE_PRIOR_SCHEMAS``): a
+# state is read as the current schema in memory and is written as the current schema on its next
+# write. Only a schema newer than this code is refused (``STATE_SCHEMA_INCOMPATIBLE``: upgrade Core).
+_BASE_SCHEMA_VERSION = 7
 _CONTROLLER_LOCAL_SCHEMA_VERSION = 8
-# Opt-in format for the verification-first ledger: declared checks and their run
-# results, requirement kinds, typed claims, handoff usage and gate overrides. A
-# state moves to 9 in the transaction that first writes one of them; tasks that
-# use none stay on 7/8 and remain readable by older Cores. Older Cores refuse 9
-# as newer and are not expected to read it.
 _VERIFICATION_SCHEMA_VERSION = 9
-_SUPPORTED_SCHEMAS = (_STATE_SCHEMA_VERSION, _CONTROLLER_LOCAL_SCHEMA_VERSION, _VERIFICATION_SCHEMA_VERSION)
+_ARCHIVE_SCHEMA_VERSION = 10
+_EVICTION_SCHEMA_VERSION = 11
+_CROSS_HOST_SCHEMA_VERSION = 12
+_STATE_SCHEMA_VERSION = _CROSS_HOST_SCHEMA_VERSION  # the current schema; every write produces it
+_SUPPORTED_SCHEMAS = (_BASE_SCHEMA_VERSION, _CONTROLLER_LOCAL_SCHEMA_VERSION, _VERIFICATION_SCHEMA_VERSION,
+                      _ARCHIVE_SCHEMA_VERSION, _EVICTION_SCHEMA_VERSION, _CROSS_HOST_SCHEMA_VERSION)
 _SCHEMA9_STATE_FIELDS = {"checks", "closure"}
+_SCHEMA10_STATE_FIELDS = {"archive"}
+_SCHEMA11_STATE_FIELDS = {"settled"}
 _SCHEMA9_CONTINUITY_FIELDS = {
     "requirements": {"kind", "surface"},
     "handoffs": {"claims", "usage"},
     "observations": {"claim", "mechanism"},
     "judgments": {"override_reason", "overridden_checks"},
 }
+# Cross-host managed children (schema 12). A handoff carrying any of these fields is run by a
+# foreign Host's model in a separate process that the dispatching adapter's launcher starts; every
+# field is assigned by Core (see "Cross-host managed children" below). None of them grants authority.
+FOREIGN_HANDOFF_FIELDS = {"executor_host", "foreign_session_hash", "transport_agent_id_hash", "prompt_sha256",
+                          "run_state", "result_sha256", "result_source", "cancel_reason"}
+FOREIGN_HOSTS = ("claude", "codex")
+FOREIGN_READONLY_ROLES = ("investigator", "reviewer", "reasoning-specialist")
+# One-way: reserved -> launched -> bound -> completed | failed | cancelled, and reserved -> cancelled
+# (launched -> cancelled and bound -> cancelled too: cancel-on-dispose may come before the bind).
+FOREIGN_RUN_STATES = ("reserved", "launched", "bound", "completed", "failed", "cancelled")
+FOREIGN_LIVE_RUN_STATES = ("reserved", "launched", "bound")
+FOREIGN_RESULT_SOURCE = "foreign-runner"
+FOREIGN_RUNNER_PROVENANCE = "foreign-runner"
+FOREIGN_BODY_MAX_BYTES = 1024 * 1024
+FOREIGN_CANCEL_REASON_MAX = 512
 ROUTING_STATE_MAX_BYTES = 8 * 1024
+# The hot ledger file (``state.json``) never exceeds this many bytes. Adapters read the bound from
+# ``task_state_capacity()`` / ``read_state_bytes()`` instead of hard-coding it.
 STATE_MAX_BYTES = 512 * 1024
+# Eviction (see "Hot/cold archive" below) runs inside a write whose serialized hot state would exceed
+# this high-water mark (70% of the cap), or whose hot list would exceed or approach its item cap.
+STATE_ARCHIVE_HIGH_WATER_BYTES = (STATE_MAX_BYTES * 7) // 10
+# Below the cap, an eviction pass is committed only when it frees at least this much, so a ledger whose
+# hot part is mostly open evidence does not write a tiny segment on every write. At or over the cap any
+# saving counts.
+STATE_ARCHIVE_MIN_SAVINGS_BYTES = 16 * 1024
+# Item caps of ledger lists. Hot items count against ``STATE_LIST_MAX``; a schema-10 archived stub does
+# not, but a list holds at most ``STATE_ARCHIVED_LIST_MAX`` items in total (the byte cap binds first).
+# Requirements are never evicted, so their list is capped at ``STATE_ARCHIVED_LIST_MAX``. Evicted
+# objects (ids in the archive index) count toward no list cap.
+STATE_LIST_MAX = 512
+STATE_ARCHIVED_LIST_MAX = 8192
 EXPLICIT_DOCUMENT_MAX_BYTES = 64 * 1024
 DURABLE_INDEX_RECOMMENDED_BYTES = 3 * 1024
 DURABLE_INDEX_HARD_MAX_BYTES = 16 * 1024
@@ -470,29 +511,55 @@ def _promote_state_6_to_7(raw: dict[str, object]) -> dict[str, object]:
     return {**raw, "schema_version": 7}
 
 
+def _promote_by_version(target: int):
+    """A step whose new schema only adds optional content: the old shape is valid as it is."""
+    def step(raw: dict[str, object]) -> dict[str, object]:
+        return {**raw, "schema_version": target}
+    step.__name__ = f"_promote_state_to_{target}"
+    return step
+
+
 # Earlier on-disk schema versions this Core reads, mapped to the step that lifts a state by one
-# version. A listed version is read as the current schema in memory only and becomes the current
-# version on its next write. Add an entry only when the old shape is valid under the current
-# rules (or the step makes it so); versions below the first key, newer versions and states that do
-# not validate once lifted stay refused with the schema-mismatch diagnostic. The disk is never
-# touched by reading, so external byte digests (authority anchors) are unaffected.
-_COMPATIBLE_PRIOR_SCHEMAS = {6: _promote_state_6_to_7}
+# version. The chain runs up to the current schema, so every listed version is read as the current
+# schema in memory only and becomes the current version on its next write. Add an entry only when the
+# old shape is valid under the next version's rules (or the step makes it so); versions below the
+# first key and states that do not validate stay refused with the schema-mismatch diagnostic. The
+# disk is never touched by reading, so external byte digests (authority anchors) are unaffected.
+_COMPATIBLE_PRIOR_SCHEMAS = {
+    6: _promote_state_6_to_7,
+    _BASE_SCHEMA_VERSION: _promote_by_version(_CONTROLLER_LOCAL_SCHEMA_VERSION),
+    _CONTROLLER_LOCAL_SCHEMA_VERSION: _promote_by_version(_VERIFICATION_SCHEMA_VERSION),
+    _VERIFICATION_SCHEMA_VERSION: _promote_by_version(_ARCHIVE_SCHEMA_VERSION),
+    _ARCHIVE_SCHEMA_VERSION: _promote_by_version(_EVICTION_SCHEMA_VERSION),
+    _EVICTION_SCHEMA_VERSION: _promote_by_version(_CROSS_HOST_SCHEMA_VERSION),
+}
 
 
 def _promoted_prior_state(root: Path, raw: object) -> dict[str, object] | None:
-    """The validated current-schema form of a compatible older state, else None (refuse as before)."""
+    """The validated current-schema form of a compatible older state, else None (refuse as before).
+
+    The state is validated once, at the first supported version the chain reaches (its own version
+    for 7-9, so version-specific rules still hold for the bytes on disk), then lifted to the current
+    schema. Lifting only changes ``schema_version``.
+    """
     if not isinstance(raw, dict) or type(raw.get("schema_version")) is not int:
         return None
     version = raw["schema_version"]
     if version >= _STATE_SCHEMA_VERSION or any(step not in _COMPATIBLE_PRIOR_SCHEMAS for step in range(version, _STATE_SCHEMA_VERSION)):
         return None
     lifted: dict[str, object] = raw
-    for step in range(version, _STATE_SCHEMA_VERSION):
-        lifted = _COMPATIBLE_PRIOR_SCHEMAS[step](lifted)
+    validated = False
     try:
-        return _validate_state(root, lifted)
+        for step in range(version, _STATE_SCHEMA_VERSION):
+            if not validated and step in _SUPPORTED_SCHEMAS:
+                _validate_state(root, lifted)
+                validated = True
+            lifted = _COMPATIBLE_PRIOR_SCHEMAS[step](lifted)
+        if not validated:
+            _validate_state(root, lifted)
     except ValueError:
         return None
+    return lifted
 
 
 class TaskStateSchemaIncompatible(ValueError):
@@ -579,12 +646,16 @@ def _task_state_schema_diagnostic(raw: object, raw_bytes: bytes) -> dict[str, ob
     except (ValueError, AttributeError, TypeError):
         valid_task_id = False
     status = raw.get("status")
-    older_supported_for_archive = 0 < version < _STATE_SCHEMA_VERSION
+    older_supported_for_archive = 0 < version < _BASE_SCHEMA_VERSION
     recoverable = older_supported_for_archive and valid_task_id and (status == "ACTIVE" or status == "DONE")
+    newer = version > _STATE_SCHEMA_VERSION
     digest = hashlib.sha256(raw_bytes).hexdigest()
     action = "NONE"
     if recoverable:
         action = f"use the adapter's task-state recovery procedure with expected sha256 {digest}"
+    elif newer:
+        action = (f"upgrade Thaliris Core (and the adapter that bundles it) to a release that reads task state schema "
+                  f"{version}; this Core reads schemas up to {_STATE_SCHEMA_VERSION}; the state is unchanged")
     return {
         "ok": False,
         "status": "STATE_SCHEMA_INCOMPATIBLE",
@@ -594,6 +665,7 @@ def _task_state_schema_diagnostic(raw: object, raw_bytes: bytes) -> dict[str, ob
         "state_sha256": digest,
         "recoverable": recoverable,
         "abandon_active_confirmation_required": status == "ACTIVE" and recoverable,
+        "upgrade_required": newer,
         "recovery_action": action,
     }
 
@@ -604,12 +676,12 @@ def task_state_schema_diagnostic(root: Path) -> dict[str, object] | None:
     if (root / _STATE_NAME).is_symlink():
         return None
     path = _state_path(root)
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 512 * 1024:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > STATE_MAX_BYTES:
         return None
     try:
         with path.open("rb") as stream:
-            raw_bytes = stream.read(512 * 1024 + 1)
-        if len(raw_bytes) > 512 * 1024:
+            raw_bytes = stream.read(STATE_MAX_BYTES + 1)
+        if len(raw_bytes) > STATE_MAX_BYTES:
             return None
         raw = json.loads(raw_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -640,14 +712,27 @@ def _capacity_error(field: str, limit: int, count: int, *, unit: str = "entries"
     )
 
 
+# Control characters other than tab and newline (refused in ledger text), and all of them.
+_CONTROL_CHARACTERS = re.compile("[\x00-\x08\x0b-\x1f]")
+_ALL_CONTROL_CHARACTERS = re.compile("[\x00-\x1f]")
+
+
 def _check_json(value: object, field: str = "state") -> None:
     """Shape and size check; ``field`` is the nearest enclosing object key, named in capacity errors."""
     if isinstance(value, str):
-        if len(value) > 16_384 or any(ord(char) < 32 and char not in "\n\t" for char in value):
+        if len(value) > 16_384 or _CONTROL_CHARACTERS.search(value):
             raise ValueError("state contains control characters or oversized text")
     elif isinstance(value, list):
-        if len(value) > 512:
-            raise _capacity_error(field, 512, len(value))
+        # An archived stub (a Core-written object carrying ``archived``) does not count toward the
+        # hot item cap; the whole list stays bounded by STATE_ARCHIVED_LIST_MAX. Requirements are
+        # never evicted and are capped at STATE_ARCHIVED_LIST_MAX.
+        if len(value) > STATE_LIST_MAX:
+            hot = sum(not (isinstance(item, dict) and "archived" in item) for item in value)
+            limit = STATE_ARCHIVED_LIST_MAX if field == "requirements" else STATE_LIST_MAX
+            if hot > limit:
+                raise _capacity_error(field, limit, hot)
+            if len(value) > STATE_ARCHIVED_LIST_MAX:
+                raise _capacity_error(field, STATE_ARCHIVED_LIST_MAX, len(value), unit="entries including archived stubs")
         for item in value:
             _check_json(item, field)
     elif isinstance(value, dict):
@@ -759,8 +844,8 @@ def _git_head(root: Path) -> str | None:
     return value if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
 
 
-def _record(value: object, source_ids: set[str], record_ids: set[str]) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != _RECORD_FIELDS:
+def _record(value: object, source_ids: set[str], record_ids: set[str], *, stored: bool = False) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) - ({"archived"} if stored else set()) != _RECORD_FIELDS:
         raise ValueError("invalid task record")
     identifier = _bounded_label(value.get("id"), "record id")
     if identifier in record_ids:
@@ -782,10 +867,10 @@ def _record(value: object, source_ids: set[str], record_ids: set[str]) -> dict[s
     return value
 
 
-def _evidence_ref(value: object, ids: set[str]) -> dict[str, object]:
+def _evidence_ref(value: object, ids: set[str], *, stored: bool = False) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("invalid source reference")
-    allowed = {"id", "kind", "locator", "summary", "confidence", "source_refs"}
+    allowed = {"id", "kind", "locator", "summary", "confidence", "source_refs"} | ({"archived"} if stored else set())
     if set(value) - allowed or not {"id", "kind", "locator", "summary"} <= set(value):
         raise ValueError("invalid source reference")
     identifier = _bounded_label(value.get("id"), "source id")
@@ -863,11 +948,12 @@ def _artifact_activity(artifacts: list[dict[str, object]]) -> set[str]:
     return ids - inactive
 
 
-def _verification_result(value: object, source_ids: set[str] | None = None) -> dict[str, object]:
+def _verification_result(value: object, source_ids: set[str] | None = None, *, stored: bool = False) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("invalid verification observation")
     required = {"id", "kind", "outcome", "summary", "source_refs", "observed_by", "observed_at", "observed_at_revision", "candidate_identity", "observed_files", "result_hash"}
-    if set(value) != required and set(value) != required | _CHECK_RESULT_FIELDS:
+    present = set(value) - ({"archived"} if stored else set())
+    if present != required and present != required | _CHECK_RESULT_FIELDS:
         raise ValueError("invalid verification observation")
     if "check_id" in value:
         _check_run_fields(value)
@@ -896,11 +982,34 @@ def _verification_result(value: object, source_ids: set[str] | None = None) -> d
     return value
 
 
+def _check_archive_json(value: object) -> None:
+    """JSON shape check for the archive index and settled table (their sizes are bounded by their own
+    validators and the hot file cap, not by the generic list cap)."""
+    if isinstance(value, str):
+        if len(value) > 16_384 or _ALL_CONTROL_CHARACTERS.search(value):
+            raise ValueError("state contains control characters or oversized text")
+    elif isinstance(value, list):
+        for item in value:
+            _check_archive_json(item)
+    elif isinstance(value, dict):
+        if len(value) > 64 or not all(isinstance(key, str) for key in value):
+            raise ValueError("state object exceeds limit")
+        for item in value.values():
+            _check_archive_json(item)
+    elif value is not None and type(value) not in {int, bool, float}:
+        raise ValueError("state contains unsupported JSON value")
+
+
 def _validate_state(root: Path, state: object) -> dict[str, object]:
-    _check_json(state)
+    if isinstance(state, dict):
+        _check_json({key: value for key, value in state.items() if key not in ("archive", "settled")})
+        _check_archive_json([state.get("archive"), state.get("settled")])
+    else:
+        _check_json(state)
     if not isinstance(state, dict):
         raise ValueError("invalid task state schema")
-    if set(state) - {"evidence_continuity"} - _SCHEMA9_STATE_FIELDS != _STATE_FIELDS or state.get("schema_version") not in _SUPPORTED_SCHEMAS:
+    if (set(state) - {"evidence_continuity"} - _SCHEMA9_STATE_FIELDS - _SCHEMA10_STATE_FIELDS - _SCHEMA11_STATE_FIELDS != _STATE_FIELDS
+            or state.get("schema_version") not in _SUPPORTED_SCHEMAS):
         raise ValueError("invalid task state schema")
     if type(state.get("revision")) is not int or state["revision"] < 1:
         raise ValueError("invalid task state revision")
@@ -935,12 +1044,14 @@ def _validate_state(root: Path, state: object) -> dict[str, object]:
                       "or move long content into a Record or Artifact"),
         )
 
+    # Evicted ids (archive index) are present for every reference and reserved for uniqueness.
+    index_map = _validate_archive_index(state)
     sources = state.get("evidence_refs")
     if not isinstance(sources, list):
         raise ValueError("invalid source references")
-    source_ids: set[str] = set()
+    source_ids: set[str] = set(index_map["evidence_refs"])
     for source in sources:
-        _evidence_ref(source, source_ids)
+        _evidence_ref(source, source_ids, stored=True)
         source_ids.add(str(source["id"]))
     if any(any(ref not in source_ids for ref in source.get("source_refs", [])) for source in sources):
         raise ValueError("source reference points to an unknown source")
@@ -948,9 +1059,9 @@ def _validate_state(root: Path, state: object) -> dict[str, object]:
     records = state.get("records")
     if not isinstance(records, list):
         raise ValueError("invalid task records")
-    record_ids: set[str] = set()
+    record_ids: set[str] = set(index_map["records"])
     for item in records:
-        _record(item, source_ids, record_ids)
+        _record(item, source_ids, record_ids, stored=True)
         record_ids.add(str(item["id"]))
 
     artifacts = state.get("artifact_refs")
@@ -970,13 +1081,16 @@ def _validate_state(root: Path, state: object) -> dict[str, object]:
     _artifact_activity(artifacts)
 
     results = state.get("verification_results")
-    if isinstance(results, list) and len(results) > 256:
-        raise _capacity_error("verification_results", 256, len(results))
+    if isinstance(results, list) and _hot_count(results) > 256:
+        raise _capacity_error("verification_results", 256, _hot_count(results))
     if not isinstance(results, list):
         raise ValueError("invalid verification observations")
-    result_ids: set[str] = set()
+    result_ids: set[str] = set(index_map["verification_results"]) | set(index_map["check_runs"])
+    if len(result_ids) != len(index_map["verification_results"]) + len(index_map["check_runs"]):
+        raise ThalirisError(_errors.TASK_OBJECT_ID_COLLISION, "task object id collision",
+                            details={"ids": sorted(set(index_map["verification_results"]) & set(index_map["check_runs"]))[:8]})
     for result in results:
-        _verification_result(result, source_ids)
+        _verification_result(result, source_ids, stored=True)
         if result["id"] in result_ids:
             raise ValueError("duplicate verification observation id")
         result_ids.add(str(result["id"]))
@@ -1000,23 +1114,1704 @@ def _validate_state(root: Path, state: object) -> dict[str, object]:
     base_head = state.get("task_base_head")
     if base_head is not None and (not isinstance(base_head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", base_head)):
         raise ValueError("invalid task base head")
-    _validate_continuity(state)
+    _validate_continuity(state, index_map)
     _validate_verification_state(state)
+    _validate_archive_totals(state, index_map)
     return state
 
 
+def _serialize_state(state: dict[str, object]) -> bytes:
+    """The exact bytes Core writes for a state: compact, key-sorted UTF-8 JSON plus a newline.
+
+    Schema 10 dropped the indented form (about a fifth of the file). Loading accepts both forms;
+    digests (authority anchors) are always over the exact bytes written.
+    """
+    return (json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _state_capacity_error(size: int, state: dict[str, object] | None = None, *, archived: bool = False) -> ThalirisError:
+    details_extra: dict[str, object] = {}
+    reason = ""
+    if state is not None:
+        try:
+            pending, unresolved, _ = _continuity_open(state, latest=False)
+            evicted = len(_indexed_ids(state))
+        except (KeyError, TypeError, AttributeError, ValueError):
+            pending, unresolved, evicted = [], [], 0
+        details_extra = {"open_observation_edges": len(pending), "unresolved_judgments": len(unresolved),
+                         "archived_items": sum(1 for _ in _archived_items(state)) + evicted}
+        reason = (f"Core already evicted every settled object into archive segments{' in this write' if archived else ''}; "
+                  f"what stays hot is open evidence ({len(pending)} unincorporated observation edges, {len(unresolved)} "
+                  "unresolved judgments, the observations and handoffs they need), current records and the sources they "
+                  "cite, requirements, check declarations, the archive index and the task surface; ")
+    error = _capacity_error(
+        "state_file", STATE_MAX_BYTES, size, unit="bytes", message="task state exceeds 512 KiB",
+        recovery=("the task state is unchanged; " + reason + "judge the open observations or resolve the unresolved "
+                  "judgments so they can be evicted, shorten current records, or close this task (task-close still "
+                  "works) and start a new one that cites this Task ID"))
+    if error.details is not None:
+        error.details.update(details_extra)
+    return error
+
+
 def _state_payload(root: Path, state: dict[str, object]) -> bytes:
+    """Validate and serialize a state as the current schema; no eviction (see ``_write_state``)."""
+    state["schema_version"] = _STATE_SCHEMA_VERSION
     state = _validate_state(root, state)
-    payload = (json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    payload = _serialize_state(state)
     if len(payload) > STATE_MAX_BYTES:
-        raise _capacity_error("state_file", STATE_MAX_BYTES, len(payload), unit="bytes", message="task state exceeds 512 KiB",
-                              recovery=("the task state is unchanged; task-close still works; to keep recording, "
-                                        "close this task and start a new one that cites this Task ID"))
+        raise _state_capacity_error(len(payload), state)
     return payload
 
 
-def _write_state(root: Path, state: dict[str, object]) -> None:
-    _atomic_write(_state_path(root), _state_payload(root, state))
+def _write_state(root: Path, state: dict[str, object], *, publish: Callable[[Path, bytes], None] | None = None) -> None:
+    """Write a state as the current schema, evicting settled objects when the hot ledger is under pressure.
+
+    Pressure is a serialized size above ``STATE_ARCHIVE_HIGH_WATER_BYTES`` or a hot list above its
+    item cap (or close to it). Evicted sources that hot objects cite again are re-hydrated first
+    (best effort). The eviction pass works on a copy: the segment file is written first, then the
+    state that references it. Any refusal leaves the disk state and ``state`` unchanged; a segment
+    written before a failed state write is an unreferenced orphan, which is harmless. After a
+    compaction write, unreferenced segments are collected (see "segment garbage collection").
+    An authority publisher receives the final bytes in place of the ordinary ledger write,
+    under the archive lock and before collection. The caller still owns the task lock.
+    """
+    path = _state_path(root)
+    _register_archive_root(root, state)
+    state["schema_version"] = _STATE_SCHEMA_VERSION
+    working = state
+    if _cited_evicted_sources(state):
+        working = copy.deepcopy(state)
+        if not _rehydrate_cited_sources(root, working):
+            working = state
+    pressure: ThalirisError | None = None
+    try:
+        _validate_state(root, working)
+    except ThalirisError as exc:
+        if exc.code != _errors.TASK_STATE_CAPACITY_EXCEEDED or (exc.details or {}).get("field") not in _ARCHIVE_COLLECTIONS:
+            raise
+        pressure = exc
+    payload = _serialize_state(working)
+    crowded = _crowded_collections(working)
+
+    def commit(candidate: dict[str, object], content: bytes, *, collect: bool = False) -> None:
+        if publish is not None or collect:
+            task_id = str(candidate["task_id"])
+            with _archive_gc_lock(root, task_id):
+                prior_refs = _durable_refs(path, task_id) if collect else None
+                (_atomic_write if publish is None else publish)(path, content)
+                if prior_refs is not None:
+                    try:
+                        _collect_archive_segments(root, task_id, _segment_refs(candidate) | prior_refs)
+                    except (OSError, ValueError):
+                        pass
+        else:
+            _atomic_write(path, content)
+        if candidate is not state:
+            state.clear()
+            state.update(candidate)
+
+    if pressure is None and len(payload) <= STATE_ARCHIVE_HIGH_WATER_BYTES and not crowded:
+        commit(working, payload)
+        return
+    required = pressure is not None or len(payload) > STATE_MAX_BYTES
+    try:
+        keep = _hot_keep(working)
+        if not required and not crowded and _evictable_bytes(working, keep) < STATE_ARCHIVE_MIN_SAVINGS_BYTES:
+            # Mostly open evidence, current objects and aggregates: nothing worth a segment yet.
+            evicted = None
+        else:
+            evicted = _evict_settled(working, keep)
+    except (KeyError, TypeError, AttributeError):
+        if pressure is not None:
+            raise pressure from None
+        evicted = None
+    if evicted is not None:
+        candidate, segment = evicted
+        segments = [segment]
+        compacted = _compact_archive(root, candidate)
+        if compacted is not None:
+            candidate, merged = compacted
+            segments.append(merged)
+        _validate_state(root, candidate)
+        candidate_payload = _serialize_state(candidate)
+        worthwhile = (required or bool(crowded)
+                      or len(payload) - len(candidate_payload) >= STATE_ARCHIVE_MIN_SAVINGS_BYTES)
+        if worthwhile and len(candidate_payload) <= STATE_MAX_BYTES:
+            task_id = str(candidate["task_id"])
+            for raw in segments:
+                _write_archive_segment(root, task_id, raw)
+            commit(candidate, candidate_payload, collect=compacted is not None)
+            return
+        if required and len(candidate_payload) > STATE_MAX_BYTES:
+            raise _state_capacity_error(len(candidate_payload), candidate, archived=True)
+    if pressure is not None:
+        raise pressure
+    if len(payload) > STATE_MAX_BYTES:
+        raise _state_capacity_error(len(payload), working)
+    commit(working, payload)
+
+
+# --- Hot/cold archive: eviction segments (schema 11) and schema-10 stubs ---------------------------
+#
+# The hot ledger (``state.json``) holds what gates, status views and validators read about current
+# and open work. When a write would leave it under pressure (see ``_write_state``), Core *evicts*
+# every settled object (see ``_hot_keep``): the object leaves its hot list and moves, whole, into an
+# immutable, content-addressed segment ``.context/tasks/<task id>/archive/<sha256>.json`` that is
+# written temp-then-rename before the state that references it. The state's ``archive`` index keeps,
+# per segment,
+#
+# - ``ids``: the ids it holds per collection, compactly encoded (``_encode_ids``) together with the
+#   list position of every continuity object, so ledger order stays exact and the ids stay reserved:
+#   the validator treats them as present for every reference and for uniqueness, and they count
+#   toward no list cap;
+# - ``totals``: pre-aggregated facts about what it evicted (counts, dispatch usage, claims, judgment
+#   overrides, tamper and support dedupe keys).
+#
+# ``settled.latest`` keeps, per (requirement, candidate), the latest and the first evicted judgment
+# (id, outcome, override flag, observation count, positions). Hot readers combine hot objects with
+# these aggregates, so the close and withholding gates, evidence summaries, continuity status,
+# usage, claims and dedupes answer exactly as before the eviction. Segments are read only for
+# explicit retrieval (task-get, promotion of an evicted source) and for re-hydration: an evicted
+# object that new evidence needs again (a source it cites, a handoff that receives late usage,
+# claims, observations or a child, a judgment a new judgment addresses) returns to its exact hot
+# position.
+#
+# Schema 10 (Core 3ed67e1) left full-field stubs carrying ``archived: <sha256>`` in the hot lists,
+# with ``{sha256, revision, items, collections}`` index entries and version-1 segments. Such states
+# load unchanged; their stubs are evicted, as stubs, on the next pressured write, and retrieval
+# follows the chain from the eviction segment to the version-1 segment.
+
+ARCHIVE_SEGMENT_FORMAT = "thaliris-task-archive"
+ARCHIVE_SEGMENT_VERSION = 3  # first generation written with anchor pinning and eligible for GC
+_ARCHIVE_SEGMENT_VERSIONS = (1, 2, ARCHIVE_SEGMENT_VERSION)
+ARCHIVE_SEGMENT_MAX_BYTES = 16 * 1024 * 1024
+# The archive index holds at most this many segment entries, and all entries together at most
+# ``ARCHIVE_IDS_MAX`` reserved ids.
+ARCHIVE_INDEX_MAX = STATE_LIST_MAX
+ARCHIVE_IDS_MAX = 1_000_000
+# Above this many eviction entries, small segments are merged (see ``_compact_archive``).
+ARCHIVE_COMPACT_ENTRIES = 12
+ARCHIVE_COMPACT_SEGMENT_BYTES = 2 * 1024 * 1024
+ARCHIVE_COMPACT_MAX_BYTES = 8 * 1024 * 1024
+_ARCHIVE_INDEX_FIELDS = {"sha256", "revision", "items", "collections"}  # schema-10 stub segments
+_EVICTION_INDEX_FIELDS = {"sha256", "revision", "ids", "totals"}       # schema-11 eviction segments
+_ARCHIVE_COLLECTIONS = ("evidence_refs", "records", "verification_results", "handoffs", "observations", "judgments")
+_ARCHIVE_TOP_LEVEL = ("evidence_refs", "records", "verification_results")
+# Continuity lists are ordered; their evicted ids carry list positions.
+_POSITIONED = ("handoffs", "observations", "judgments")
+# Index collections: check-run results are indexed apart from other verification results because
+# ``record_check_run`` drops a check's results beyond its history, evicted or not.
+_INDEX_COLLECTIONS = ("evidence_refs", "records", "verification_results", "check_runs", "handoffs", "observations", "judgments")
+_OBJECT_TYPES = {"evidence_refs": "source", "records": "record", "verification_results": "verification",
+                 "check_runs": "verification"}
+_ARCHIVE_LIST_CAPS = {"verification_results": 256}
+# A hot list above 7/8 of its cap is crowded and forces an eviction pass.
+_ARCHIVE_CROWDED_FRACTION = (7, 8)
+# Verification results kept hot per check (or per kind for other results).
+_ARCHIVE_KEEP_RUNS = 2
+# Status lists show the last 8 overrides, handoffs without typed claims and truncated claim blocks;
+# those objects stay hot.
+_ARCHIVE_KEEP_LISTED = 8
+_SUPPORT_KEY_BYTES = 6
+_SUPPORT_KEYS_PER_STRING = 2040
+_ID_LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_ID_PARTS = re.compile(r"([A-Za-z0-9_.:-]*?)(0|[1-9][0-9]*)([A-Za-z_.:-]*)")
+_FRACTION = re.compile(r"(0|[1-9][0-9]{0,400})/([1-9][0-9]{0,400})")
+_USAGE_SUM_FIELDS = ("input_tokens", "output_tokens", "total_tokens", "cost_usd", "duration_ms", "tool_uses")
+_USAGE_GROUP_FIELDS = ("total_tokens", "cost_usd")
+_CLAIM_TALLIES = ("ingested", "missing", "malformed", "truncated")
+# The project root each loaded task's segments live under, so in-memory transactions (adapter-owned
+# locked writes) can re-hydrate evicted objects. Set by ``_load_state`` and ``_write_state``.
+_archive_roots: ContextVar[dict[str, Path]] = ContextVar("thaliris_archive_roots", default={})
+
+
+def _register_archive_root(root: Path, state: dict[str, object]) -> None:
+    task_id = state.get("task_id") if isinstance(state, dict) else None
+    if isinstance(task_id, str) and _archive_roots.get().get(task_id) != root:
+        roots = dict(_archive_roots.get())
+        roots[task_id] = root
+        _archive_roots.set(roots)
+
+
+def _hot_count(values: list[object]) -> int:
+    return sum(not (isinstance(item, dict) and "archived" in item) for item in values)
+
+
+def _archive_collection(state: dict[str, object], name: str) -> list[dict[str, object]]:
+    if name == "check_runs":
+        name = "verification_results"
+    if name in _ARCHIVE_TOP_LEVEL:
+        values = state.get(name)
+    else:
+        values = (state.get("evidence_continuity") or {}).get(name)
+    return values if isinstance(values, list) else []
+
+
+def _archived_items(state: dict[str, object]):
+    """Schema-10 stubs still in the hot lists."""
+    for name in _ARCHIVE_COLLECTIONS:
+        for item in _archive_collection(state, name):
+            if isinstance(item, dict) and "archived" in item:
+                yield name, item
+
+
+def _crowded_collections(state: dict[str, object]) -> set[str]:
+    crowded: set[str] = set()
+    numerator, denominator = _ARCHIVE_CROWDED_FRACTION
+    for name in _ARCHIVE_COLLECTIONS:
+        values = _archive_collection(state, name)
+        cap = _ARCHIVE_LIST_CAPS.get(name, STATE_LIST_MAX)
+        if len(values) * denominator > cap * numerator and _hot_count(values) * denominator > cap * numerator:
+            crowded.add(name)
+    return crowded
+
+
+def _eviction_entries(state: dict[str, object]) -> list[dict[str, object]]:
+    return [entry for entry in state.get("archive") or [] if isinstance(entry, dict) and "ids" in entry]
+
+
+# --- compact id encoding ---
+
+def _id_parts(identifier: str) -> tuple[str, int, str] | None:
+    """(prefix, number, suffix) around the last canonical digit run of an id, or None."""
+    match = _ID_PARTS.fullmatch(identifier)
+    return (match.group(1), int(match.group(2)), match.group(3)) if match else None
+
+
+def _id_sort_key(identifier: str) -> tuple[str, str, int, str]:
+    parts = _id_parts(identifier)
+    return (identifier, "", -1, identifier) if parts is None else (parts[0], parts[2], parts[1], identifier)
+
+
+def _id_run(prefix: str, start: int, count: int, suffix: str, step: int) -> list[object]:
+    run: list[object] = [prefix, start, count]
+    if suffix or step != 1:
+        run.append(suffix)
+    if step != 1:
+        run.append(step)
+    return run
+
+
+def _run_fields(element: list[object]) -> tuple[str, int, int, str, int]:
+    """(prefix, start, count, suffix, step) of an id run."""
+    return (element[0], element[1], element[2], element[3] if len(element) > 3 else "", element[4] if len(element) > 4 else 1)
+
+
+def _encode_ids(pairs: list[tuple[str, int | None]], positioned: bool) -> list[object]:
+    """Encode ids (with list positions when ``positioned``) as a compact list.
+
+    Elements: an id string occupies the next position; a run ``[prefix, start, count]``,
+    ``[prefix, start, count, suffix]`` or ``[prefix, start, count, suffix, step]`` stands for
+    ``count`` ids ``prefix + str(start + k * step) + suffix`` at consecutive positions; an integer
+    sets the position of the next id (positions start at 0). ``pairs`` are in position order when
+    positioned; otherwise they are sorted so numbered ids form runs.
+    """
+    if not positioned:
+        pairs = sorted(pairs, key=lambda pair: _id_sort_key(pair[0]))
+    encoded: list[object] = []
+    cursor = 0
+    previous: tuple[str, int, str] | None = None
+    for identifier, position in pairs:
+        if positioned and position != cursor:
+            encoded.append(position)
+            previous = None
+        parts = _id_parts(identifier)
+        extended = False
+        if previous is not None and parts is not None and parts[0] == previous[0] and parts[2] == previous[2]:
+            last = encoded[-1]
+            if isinstance(last, list):
+                step = _run_fields(last)[4]
+                if parts[1] == previous[1] + step:
+                    last[2] += 1
+                    extended = True
+            elif isinstance(last, str) and parts[1] > previous[1]:
+                encoded[-1] = _id_run(previous[0], previous[1], 2, previous[2], parts[1] - previous[1])
+                extended = True
+        if not extended:
+            encoded.append(identifier)
+        previous = parts
+        if positioned:
+            cursor = int(position) + 1
+    # A two-id run is longer than the two ids unless it is a plain consecutive pair.
+    compact: list[object] = []
+    for element in encoded:
+        if isinstance(element, list) and element[2] == 2 and len(element) > 3:
+            prefix, start, _, suffix, step = _run_fields(element)
+            compact += [f"{prefix}{start}{suffix}", f"{prefix}{start + step}{suffix}"]
+        else:
+            compact.append(element)
+    return compact
+
+
+def _decode_ids(encoded: list[object], positioned: bool):
+    """Yield (id, position or None) from ``_encode_ids`` output."""
+    cursor = 0
+    for element in encoded:
+        if type(element) is int:
+            cursor = element
+        elif isinstance(element, str):
+            yield element, (cursor if positioned else None)
+            cursor += 1
+        else:
+            prefix, start, count, suffix, step = _run_fields(element)
+            for offset in range(count):
+                yield f"{prefix}{start + offset * step}{suffix}", (cursor if positioned else None)
+                cursor += 1
+
+
+def _encoded_ids_problem(encoded: object, positioned: bool) -> tuple[str | None, int]:
+    """(problem, number of ids) for an encoded id list."""
+    if not isinstance(encoded, list) or not encoded:
+        return "a non-empty encoded id list", 0
+    cursor, total, after_position = 0, 0, False
+    for element in encoded:
+        if type(element) is int:
+            if not positioned or element < cursor or after_position:
+                return "increasing positions only in continuity collections, each followed by an id", total
+            cursor, after_position = element, True
+            continue
+        after_position = False
+        if isinstance(element, str):
+            if not _ID_LABEL.fullmatch(element):
+                return "task object ids", total
+            count = 1
+        elif isinstance(element, list) and len(element) in (3, 4, 5):
+            prefix, start, count, suffix, step = _run_fields(element)
+            if (not isinstance(prefix, str) or type(start) is not int or start < 0 or type(count) is not int or count < 2
+                    or not isinstance(suffix, str) or type(step) is not int or step < 1
+                    or (len(element) == 4 and not suffix) or (len(element) == 5 and step == 1)):
+                return "id runs [prefix, start, count >= 2, suffix?, step >= 2?]", total
+            end = start + (count - 1) * step
+            first, last = f"{prefix}{start}{suffix}", f"{prefix}{end}{suffix}"
+            if (not _ID_LABEL.fullmatch(first) or not _ID_LABEL.fullmatch(last) or _id_parts(first) != (prefix, start, suffix)
+                    or _id_parts(last) != (prefix, end, suffix)):
+                return "canonical id runs of task object ids", total
+        else:
+            return "id strings, id runs and positions", total
+        total += count
+        cursor += count
+        if total > ARCHIVE_IDS_MAX:
+            return f"at most {ARCHIVE_IDS_MAX} ids", total
+    if after_position:
+        return "a position followed by an id", total
+    return None, total
+
+
+# What the index decodes to is a pure function of the ``archive`` list, so it is cached by the
+# digest of its compact serialization (a few hundred microseconds) instead of decoding every
+# reserved id on every read and validation. Cached values are shared: callers must not mutate them.
+_ARCHIVE_DERIVED: dict[str, dict[str, object]] = {}
+_ARCHIVE_DERIVED_MAX = 8
+
+
+def _archive_derived(state: dict[str, object]) -> dict[str, object]:
+    """Decoded eviction index: ``map`` (collection -> id -> (entry number, position)), ``ids`` (all
+    evicted ids), sorted evicted ``positions`` and ``at`` (position -> id) per continuity list,
+    per-entry ``counts`` and ``observations``, and ``problem`` (code, message, details) or None."""
+    archive = state.get("archive") or []
+    key = hashlib.sha256(json.dumps(archive, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+    derived = _ARCHIVE_DERIVED.get(key)
+    if derived is not None:
+        return derived
+    result: dict[str, dict[str, tuple[int, int | None]]] = {name: {} for name in _INDEX_COLLECTIONS}
+    counts: dict[int, dict[str, int]] = {}
+    observations: dict[int, set[str]] = {}
+    problem: tuple[str, str, dict[str, object]] | None = None
+    total = 0
+    for number, entry in enumerate(archive):
+        if not isinstance(entry, dict) or not isinstance(entry.get("ids"), dict):
+            continue
+        for name, encoded in entry["ids"].items():
+            bucket = result.get(name)
+            found, count = _encoded_ids_problem(encoded, name in _POSITIONED) if bucket is not None else ("a known collection", 0)
+            total += count
+            if found or total > ARCHIVE_IDS_MAX:
+                problem = problem or (_errors.TASK_STATE_INVALID, "invalid archive index ids",
+                                      {"segment": entry.get("sha256"), "collection": name,
+                                       "expected": found or f"at most {ARCHIVE_IDS_MAX} evicted ids"})
+                continue
+            tally = counts.setdefault(number, {})
+            for identifier, position in _decode_ids(encoded, name in _POSITIONED):
+                if identifier in bucket:
+                    problem = problem or (_errors.TASK_OBJECT_ID_COLLISION, "task object id collision",
+                                          {"ids": [identifier], "collection": name})
+                bucket[identifier] = (number, position)
+                tally[name] = tally.get(name, 0) + 1
+                if name == "observations":
+                    observations.setdefault(number, set()).add(identifier)
+    ids: set[str] = set()
+    for name, bucket in result.items():
+        ids.update(bucket)
+    if problem is None and len(ids) != sum(len(bucket) for bucket in result.values()):
+        seen: set[str] = set()
+        duplicates = sorted({identifier for bucket in result.values() for identifier in bucket if identifier in seen or seen.add(identifier)})
+        problem = (_errors.TASK_OBJECT_ID_COLLISION, "task object id collision", {"ids": duplicates[:8]})
+    positions: dict[str, list[int]] = {}
+    at: dict[str, dict[int, str]] = {}
+    for name in _POSITIONED:
+        at[name] = {position: identifier for identifier, (_, position) in result[name].items()}
+        positions[name] = sorted(at[name])
+        if problem is None and len(at[name]) != len(result[name]):
+            problem = (_errors.TASK_STATE_INVALID, "invalid archive index ids",
+                       {"collection": name, "expected": "one evicted object per list position"})
+    derived = {"map": result, "ids": ids, "positions": positions, "at": at, "counts": counts,
+               "observations": observations, "problem": problem}
+    if len(_ARCHIVE_DERIVED) >= _ARCHIVE_DERIVED_MAX:
+        _ARCHIVE_DERIVED.pop(next(iter(_ARCHIVE_DERIVED)))
+    _ARCHIVE_DERIVED[key] = derived
+    return derived
+
+
+_EMPTY_INDEX_MAP: dict[str, dict[str, tuple[int, int | None]]] = {name: {} for name in _INDEX_COLLECTIONS}
+
+
+def _index_map(state: dict[str, object]) -> dict[str, dict[str, tuple[int, int | None]]]:
+    """Evicted ids per index collection: id -> (archive entry number, list position or None). Read-only."""
+    if not _eviction_entries(state):
+        return _EMPTY_INDEX_MAP
+    return _archive_derived(state)["map"]  # type: ignore[return-value]
+
+
+def _indexed_ids(state: dict[str, object], index_map: dict[str, dict[str, tuple[int, int | None]]] | None = None) -> set[str]:
+    """Every evicted id (a copy)."""
+    if not _eviction_entries(state):
+        return set()
+    if index_map is None:
+        return set(_archive_derived(state)["ids"])  # type: ignore[arg-type]
+    return {identifier for bucket in index_map.values() for identifier in bucket}
+
+
+def _known_ids(state: dict[str, object], name: str) -> set[str]:
+    """Hot and evicted ids of one top-level collection (``verification_results`` includes check runs)."""
+    ids = {str(item["id"]) for item in _archive_collection(state, name)}
+    if _eviction_entries(state):
+        index_map = _index_map(state)
+        ids.update(index_map[name])
+        if name == "verification_results":
+            ids.update(index_map["check_runs"])
+    return ids
+
+
+def _hot_positions(state: dict[str, object], name: str,
+                   index_map: dict[str, dict[str, tuple[int, int | None]]] | None = None) -> list[int]:
+    """Ledger positions of the hot objects of a continuity list (evicted positions are skipped)."""
+    hot = _archive_collection(state, name)
+    if not _eviction_entries(state):
+        return list(range(len(hot)))
+    if index_map is None:
+        evicted: list[int] = _archive_derived(state)["positions"][name]  # type: ignore[index]
+    else:
+        evicted = sorted(position for _, position in index_map[name].values())
+    positions: list[int] = []
+    cursor, skip = 0, 0
+    while len(positions) < len(hot):
+        if skip < len(evicted) and evicted[skip] == cursor:
+            skip += 1
+        else:
+            positions.append(cursor)
+        cursor += 1
+    return positions
+
+
+def _collection_totals(state: dict[str, object]) -> dict[str, int]:
+    """Hot plus evicted object counts per archivable collection (check runs count as verification results)."""
+    totals = {name: len(_archive_collection(state, name)) for name in _ARCHIVE_COLLECTIONS}
+    for entry in _eviction_entries(state):
+        for name, count in entry["totals"].get("counts", {}).items():
+            target = "verification_results" if name == "check_runs" else name
+            totals[target] = totals.get(target, 0) + count
+    return totals
+
+
+# --- pre-aggregated totals ---
+
+def _fraction_text(value: Fraction) -> str:
+    return f"{value.numerator}/{value.denominator}"
+
+
+def _usage_value(usage: dict[str, object], field: str) -> object:
+    value = usage[field]
+    if value is None and field == "total_tokens" and usage["input_tokens"] is not None and usage["output_tokens"] is not None:
+        value = usage["input_tokens"] + usage["output_tokens"]
+    return value
+
+
+class _UsageSum:
+    """Exact usage sums: integer token/duration sums and an exact rational cost sum.
+
+    ``view`` gives the shape ``usage_summary`` reports. Cost is summed exactly and rounded once,
+    so the total does not depend on the order (or the segments) the values come from.
+    """
+
+    def __init__(self, fields: tuple[str, ...] = _USAGE_SUM_FIELDS) -> None:
+        self.fields = fields
+        self.handoffs = 0
+        self.present = {field: 0 for field in fields}
+        self.sums: dict[str, object] = {field: (Fraction(0) if field == "cost_usd" else 0) for field in fields}
+        self.floats = 0
+
+    def add(self, usage: dict[str, object], sign: int = 1) -> None:
+        self.handoffs += sign
+        for field in self.fields:
+            value = _usage_value(usage, field)
+            if value is None:
+                continue
+            self.present[field] += sign
+            if field == "cost_usd":
+                self.sums[field] += sign * Fraction(value)
+                self.floats += sign * (type(value) is float)
+            else:
+                self.sums[field] += sign * value
+
+    def merge(self, other: "_UsageSum", sign: int = 1) -> None:
+        self.handoffs += sign * other.handoffs
+        for field in self.fields:
+            self.present[field] += sign * other.present[field]
+            self.sums[field] += sign * other.sums[field]
+        self.floats += sign * other.floats
+
+    def view(self) -> dict[str, object]:
+        result: dict[str, object] = {"handoffs": self.handoffs}
+        for field in self.fields:
+            if not self.present[field]:
+                result[field] = None
+            elif field == "cost_usd":
+                total = self.sums[field]
+                result[field] = round(float(total), 6) if self.floats else round(int(total), 6)
+            else:
+                result[field] = self.sums[field]
+        return result
+
+    def export(self) -> list[object]:
+        values: list[object] = [self.handoffs]
+        for field in self.fields:
+            values += [self.present[field], _fraction_text(self.sums[field]) if field == "cost_usd" else self.sums[field]]
+        return values + [self.floats]
+
+    @classmethod
+    def load(cls, values: list[object], fields: tuple[str, ...] = _USAGE_SUM_FIELDS) -> "_UsageSum":
+        total = cls(fields)
+        total.handoffs = values[0]
+        for offset, field in enumerate(fields):
+            present, value = values[1 + 2 * offset], values[2 + 2 * offset]
+            total.present[field] = present
+            if field == "cost_usd":
+                numerator, denominator = _FRACTION.fullmatch(value).groups()
+                total.sums[field] = Fraction(int(numerator), int(denominator))
+            else:
+                total.sums[field] = value
+        total.floats = values[-1]
+        return total
+
+    def problem(self) -> str | None:
+        if self.handoffs < 1 or not 0 <= self.floats <= self.present.get("cost_usd", 0):
+            return "usage totals with at least one handoff"
+        for field in self.fields:
+            if not 0 <= self.present[field] <= self.handoffs or self.sums[field] < 0 or (not self.present[field] and self.sums[field]):
+                return "usage totals with non-negative sums of at most one value per handoff"
+        return None
+
+
+def _usage_sum_problem(values: object, fields: tuple[str, ...]) -> str | None:
+    if not isinstance(values, list) or len(values) != 2 + 2 * len(fields):
+        return "usage totals [handoffs, present, sum, ..., floats]"
+    if not all(type(value) is int for index, value in enumerate(values) if index != 2 + 2 * fields.index("cost_usd")):
+        return "integer usage totals"
+    cost = values[2 + 2 * fields.index("cost_usd")]
+    if not isinstance(cost, str) or not _FRACTION.fullmatch(cost):
+        return "an exact cost sum `numerator/denominator`"
+    return _UsageSum.load(values, fields).problem()
+
+
+def _support_key(candidate: object, requirement: object, evidence: object) -> bytes:
+    return hashlib.sha256(json.dumps([candidate, requirement, evidence], ensure_ascii=False).encode("utf-8")).digest()[:_SUPPORT_KEY_BYTES]
+
+
+class _Totals:
+    """Aggregates of evicted objects; ``export`` is the index entry ``totals`` form."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+        self.usage = _UsageSum()
+        self.by_role: dict[str, _UsageSum] = {}
+        self.by_model: dict[str, _UsageSum] = {}
+        self.outcomes: dict[str, int] = {}
+        self.claims = dict.fromkeys(_CLAIM_TALLIES, 0)
+        self.supports: dict[str, int] = {}
+        self.support_keys: dict[str, set[bytes]] = {}
+        self.overrides = 0
+        self.mechanism: dict[tuple[str, str], str] = {}
+
+    def add(self, name: str, item: dict[str, object], sign: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + sign
+        if name == "handoffs":
+            usage = item.get("usage")
+            if isinstance(usage, dict):
+                self.usage.add(usage, sign)
+                for groups, key in ((self.by_role, str(item["producer"])), (self.by_model, str(usage["model"] or "unknown"))):
+                    groups.setdefault(key, _UsageSum(_USAGE_GROUP_FIELDS)).add(usage, sign)
+                outcome = str(usage["outcome"] or "unknown")
+                self.outcomes[outcome] = self.outcomes.get(outcome, 0) + sign
+            claims = item.get("claims")
+            if isinstance(claims, dict):
+                self.claims["ingested"] += sign
+                self.claims["missing"] += sign * (claims["status"] == "missing")
+                self.claims["malformed"] += sign * (claims["status"] == "malformed")
+                self.claims["truncated"] += sign * bool(claims.get("truncated"))
+                for support in claims.get("supports", []):
+                    self.supports[str(support["requirement"])] = self.supports.get(str(support["requirement"]), 0) + sign
+                    if sign > 0 and claims["status"] == "present":
+                        self.support_keys.setdefault(str(item["candidate"]), set()).add(
+                            _support_key(item["candidate"], support["requirement"], support["evidence"]))
+        elif name == "observations" and isinstance(item.get("mechanism"), dict):
+            key = (str(item["mechanism"]["check_id"]), str(item["mechanism"]["files_digest"]))
+            if sign > 0:
+                self.mechanism[key] = str(item["id"])
+            elif self.mechanism.get(key) == item["id"]:
+                del self.mechanism[key]
+        elif name == "judgments" and "override_reason" in item:
+            self.overrides += sign
+
+    def merge(self, other: "_Totals") -> None:
+        for name, count in other.counts.items():
+            self.counts[name] = self.counts.get(name, 0) + count
+        self.usage.merge(other.usage)
+        for mine, theirs, fields in ((self.by_role, other.by_role, _USAGE_GROUP_FIELDS), (self.by_model, other.by_model, _USAGE_GROUP_FIELDS)):
+            for key, value in theirs.items():
+                mine.setdefault(key, _UsageSum(fields)).merge(value)
+        for key, count in other.outcomes.items():
+            self.outcomes[key] = self.outcomes.get(key, 0) + count
+        for key in _CLAIM_TALLIES:
+            self.claims[key] += other.claims[key]
+        for key, count in other.supports.items():
+            self.supports[key] = self.supports.get(key, 0) + count
+        for key, values in other.support_keys.items():
+            self.support_keys.setdefault(key, set()).update(values)
+        self.overrides += other.overrides
+        self.mechanism.update(other.mechanism)
+
+    def export(self) -> dict[str, object]:
+        totals: dict[str, object] = {"counts": {name: count for name, count in sorted(self.counts.items()) if count}}
+        if self.usage.handoffs:
+            totals["usage"] = {
+                "all": self.usage.export(),
+                "by_role": [[key, *value.export()] for key, value in sorted(self.by_role.items()) if value.handoffs],
+                "by_model": [[key, *value.export()] for key, value in sorted(self.by_model.items()) if value.handoffs],
+                "outcomes": [[key, count] for key, count in sorted(self.outcomes.items()) if count],
+            }
+        if self.claims["ingested"]:
+            totals["claims"] = [self.claims[key] for key in _CLAIM_TALLIES]
+        ones = [(key, None) for key, count in self.supports.items() if count == 1]
+        more = [[key, count] for key, count in sorted(self.supports.items()) if count > 1]
+        if ones or more:
+            totals["supports"] = [_encode_ids(ones, False) if ones else [], more]
+        keys: list[list[str]] = []
+        for candidate, values in sorted(self.support_keys.items()):
+            ordered = sorted(values)
+            for start in range(0, len(ordered), _SUPPORT_KEYS_PER_STRING):
+                chunk = b"".join(ordered[start:start + _SUPPORT_KEYS_PER_STRING])
+                keys.append([candidate, base64.urlsafe_b64encode(chunk).decode("ascii").rstrip("=")])
+        if keys:
+            totals["support_keys"] = keys
+        if self.overrides:
+            totals["overrides"] = self.overrides
+        if self.mechanism:
+            totals["mechanism"] = [[check, digest, identifier] for (check, digest), identifier in sorted(self.mechanism.items())]
+        return totals
+
+    @classmethod
+    def load(cls, totals: dict[str, object]) -> "_Totals":
+        result = cls()
+        result.counts = dict(totals.get("counts", {}))
+        usage = totals.get("usage")
+        if usage:
+            result.usage = _UsageSum.load(usage["all"])
+            result.by_role = {row[0]: _UsageSum.load(row[1:], _USAGE_GROUP_FIELDS) for row in usage["by_role"]}
+            result.by_model = {row[0]: _UsageSum.load(row[1:], _USAGE_GROUP_FIELDS) for row in usage["by_model"]}
+            result.outcomes = {row[0]: row[1] for row in usage["outcomes"]}
+        if "claims" in totals:
+            result.claims = dict(zip(_CLAIM_TALLIES, totals["claims"]))
+        if "supports" in totals:
+            ones, more = totals["supports"]
+            result.supports = {identifier: 1 for identifier, _ in _decode_ids(ones, False)}
+            result.supports.update((row[0], row[1]) for row in more)
+        for candidate, text in totals.get("support_keys", []):
+            raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+            result.support_keys.setdefault(candidate, set()).update(
+                raw[start:start + _SUPPORT_KEY_BYTES] for start in range(0, len(raw), _SUPPORT_KEY_BYTES))
+        result.overrides = totals.get("overrides", 0)
+        result.mechanism = {(row[0], row[1]): row[2] for row in totals.get("mechanism", [])}
+        return result
+
+
+def _archive_totals(state: dict[str, object]) -> _Totals:
+    """All eviction entries' totals combined (a fresh object the caller may extend)."""
+    combined = _Totals()
+    entries = _eviction_entries(state)
+    if not entries:
+        return combined
+    derived = _archive_derived(state)
+    cached = derived.get("totals")
+    if cached is None:
+        cached = _Totals()
+        for entry in entries:
+            cached.merge(_Totals.load(entry["totals"]))
+        derived["totals"] = cached
+    combined.merge(cached)  # type: ignore[arg-type]
+    return combined
+
+
+def _totals_problem(totals: object, counts: dict[str, int], entry_observations: set[str],
+                    requirements: set[str]) -> str | None:
+    """Check what is checkable in one entry's totals against its decoded ids."""
+    allowed = {"counts", "usage", "claims", "supports", "support_keys", "overrides", "mechanism"}
+    if not isinstance(totals, dict) or set(totals) - allowed or totals.get("counts") != counts:
+        return "totals whose counts match the entry's ids"
+    handoffs = counts.get("handoffs", 0)
+    usage = totals.get("usage")
+    if usage is not None:
+        if not isinstance(usage, dict) or set(usage) != {"all", "by_role", "by_model", "outcomes"}:
+            return "usage totals {all, by_role, by_model, outcomes}"
+        problem = _usage_sum_problem(usage["all"], _USAGE_SUM_FIELDS)
+        if problem:
+            return problem
+        all_handoffs = usage["all"][0]
+        if all_handoffs > handoffs:
+            return "usage totals for at most the evicted handoffs"
+        for field in ("by_role", "by_model"):
+            rows = usage[field]
+            if not isinstance(rows, list) or not rows or not all(isinstance(row, list) and row and isinstance(row[0], str) and 0 < len(row[0]) <= 128 for row in rows):
+                return f"usage {field} rows [name, ...totals]"
+            if len({row[0] for row in rows}) != len(rows):
+                return f"unique usage {field} names"
+            for row in rows:
+                problem = _usage_sum_problem(row[1:], _USAGE_GROUP_FIELDS)
+                if problem:
+                    return problem
+            if sum(row[1] for row in rows) != all_handoffs:
+                return f"usage {field} rows that add up to the usage total"
+        rows = usage["outcomes"]
+        if (not isinstance(rows, list) or not all(isinstance(row, list) and len(row) == 2 and isinstance(row[0], str)
+                                                   and type(row[1]) is int and row[1] >= 1 for row in rows)
+                or len({row[0] for row in rows}) != len(rows) or sum(row[1] for row in rows) != all_handoffs):
+            return "usage outcome counts that add up to the usage total"
+    claims = totals.get("claims")
+    if claims is not None:
+        if (not isinstance(claims, list) or len(claims) != len(_CLAIM_TALLIES) or not all(type(value) is int and value >= 0 for value in claims)
+                or not 1 <= claims[0] <= handoffs or claims[1] + claims[2] > claims[0] or claims[3] > claims[0]):
+            return "claims tallies [ingested, missing, malformed, truncated] for at most the evicted handoffs"
+    supports = totals.get("supports")
+    if supports is not None:
+        if not isinstance(supports, list) or len(supports) != 2 or not isinstance(supports[1], list) or claims is None:
+            return "support counts [requirements with one support, [[requirement, count >= 2], ...]]"
+        ones: list[str] = []
+        if supports[0]:
+            problem, _ = _encoded_ids_problem(supports[0], False)
+            if problem:
+                return "support counts: " + problem
+            ones = [identifier for identifier, _ in _decode_ids(supports[0], False)]
+        more = supports[1]
+        if not all(isinstance(row, list) and len(row) == 2 and type(row[1]) is int and row[1] >= 2 for row in more):
+            return "support counts [[requirement, count >= 2], ...]"
+        named = ones + [row[0] for row in more]
+        if not named or len(set(named)) != len(named) or not set(named) <= requirements:
+            return "support counts per registered requirement"
+    keys = totals.get("support_keys", [])
+    if not isinstance(keys, list):
+        return "support dedupe keys"
+    for row in keys:
+        if not isinstance(row, list) or len(row) != 2 or not isinstance(row[0], str) or not _ID_LABEL.fullmatch(row[0]) or not isinstance(row[1], str):
+            return "support dedupe keys [candidate, base64]"
+        try:
+            raw = base64.urlsafe_b64decode(row[1] + "=" * (-len(row[1]) % 4))
+        except (ValueError, TypeError):
+            return "support dedupe keys [candidate, base64]"
+        if not raw or len(raw) % _SUPPORT_KEY_BYTES:
+            return f"support dedupe keys of {_SUPPORT_KEY_BYTES} bytes each"
+    overrides = totals.get("overrides", 0)
+    if type(overrides) is not int or overrides < 0 or overrides > counts.get("judgments", 0) or ("overrides" in totals and not overrides):
+        return "an override count of at most the evicted judgments"
+    mechanism = totals.get("mechanism", [])
+    if (not isinstance(mechanism, list) or not all(
+            isinstance(row, list) and len(row) == 3 and isinstance(row[0], str) and _CHECK_ID.fullmatch(row[0])
+            and _is_hex64(row[1]) and row[2] in entry_observations for row in mechanism)
+            or len({(row[0], row[1]) for row in mechanism}) != len(mechanism)):
+        return "tamper dedupe keys [check id, files digest, evicted observation id]"
+    return None
+
+
+# --- the latest evicted judgment per (requirement, candidate) ---
+
+def _outcome_code(item: dict[str, object]) -> int:
+    return _JUDGMENT_OUTCOMES.index(item["outcome"]) + (4 if "override_reason" in item else 0)
+
+
+def _judgment_at(state: dict[str, object], positions: list[int] | None = None) -> dict[int, str]:
+    """Judgment id per ledger position (evicted and hot)."""
+    if not _eviction_entries(state):
+        return {}
+    at = dict(_archive_derived(state)["at"]["judgments"])  # type: ignore[index]
+    judgments = (state.get("evidence_continuity") or {}).get("judgments", [])
+    at.update(zip(_hot_positions(state, "judgments") if positions is None else positions, (item["id"] for item in judgments)))
+    return at
+
+
+def _settled_latest_rows(state: dict[str, object], at: dict[int, str] | None = None):
+    """Yield (requirement, candidate, [first, last, id, code, observation count]) from ``settled.latest``.
+
+    A row is ``[requirement, outcome code, last position, first position?, observation count?]``
+    (first defaults to last, the count to 1); the latest id is the judgment at the last position.
+    """
+    settled = state.get("settled")
+    if not settled:
+        return
+    at = _judgment_at(state) if at is None else at
+    for candidate, rows in settled.get("latest", []):
+        for row in rows:
+            first = row[3] if len(row) > 3 else row[2]
+            count = row[4] if len(row) > 4 else 1
+            yield row[0], candidate, [first, row[2], at.get(row[2]), row[1], count]
+
+
+def _judgment_keys(state: dict[str, object]) -> list[tuple[tuple[str, str], list[object]]]:
+    """Every (requirement, candidate) judged in this task with [first position, last position, latest id,
+    outcome code, observation count], in order of first judgment (hot and evicted combined)."""
+    keys: dict[tuple[str, str], list[object]] = {}
+    judgments = (state.get("evidence_continuity") or {}).get("judgments", [])
+    positions = _hot_positions(state, "judgments")
+    if state.get("settled"):
+        for requirement, candidate, row in _settled_latest_rows(state, _judgment_at(state, positions)):
+            keys[(requirement, candidate)] = row
+    for item, position in zip(judgments, positions):
+        key = (item["requirement_ref"], item["candidate"])
+        row = keys.get(key)
+        latest = [position, item["id"], _outcome_code(item), len(item["observation_refs"])]
+        if row is None:
+            keys[key] = [position, *latest]
+        else:
+            row[0] = min(row[0], position)
+            if position >= row[1]:
+                row[1:] = latest
+    return sorted(keys.items(), key=lambda pair: pair[1][0])
+
+
+def _latest_rows_problem(state: dict[str, object], index_map: dict[str, dict[str, tuple[int, int | None]]],
+                         requirements: set[str]) -> str | None:
+    settled = state.get("settled")
+    if settled is None:
+        return None
+    if not isinstance(settled, dict) or set(settled) != {"latest"} or not isinstance(settled["latest"], list):
+        return "a settled table {latest: [[candidate, rows], ...]}"
+    judgments = (state.get("evidence_continuity") or {}).get("judgments", [])
+    total = len(judgments) + len(index_map["judgments"])
+    at = _judgment_at(state)
+    seen: set[tuple[str, str]] = set()
+    for group in settled["latest"]:
+        if (not isinstance(group, list) or len(group) != 2 or not isinstance(group[0], str) or not _ID_LABEL.fullmatch(group[0])
+                or not isinstance(group[1], list) or not group[1]):
+            return "latest judgment groups [candidate, rows]"
+        for row in group[1]:
+            if (not isinstance(row, list) or not 3 <= len(row) <= 5 or not all(type(value) is int for value in row[1:])
+                    or row[0] not in requirements or (group[0], row[0]) in seen):
+                return "latest judgment rows [requirement, outcome code, last, first?, observations?] per registered requirement"
+            seen.add((group[0], row[0]))
+            code, last = row[1], row[2]
+            first = row[3] if len(row) > 3 else last
+            count = row[4] if len(row) > 4 else 1
+            if code not in range(5) or not 0 <= first <= last < total or not 1 <= count <= 64 or last not in at:
+                return "latest judgment rows whose positions name judgments of this task"
+    return None
+
+
+def _merge_latest(state: dict[str, object], evicted: list[tuple[dict[str, object], int]]) -> None:
+    """Fold evicted judgments (with their positions) into ``settled.latest``."""
+    keys = {(requirement, candidate): row for requirement, candidate, row in _settled_latest_rows(state, {})}
+    for item, position in evicted:
+        key = (item["requirement_ref"], item["candidate"])
+        latest = [position, item["id"], _outcome_code(item), len(item["observation_refs"])]
+        row = keys.get(key)
+        if row is None:
+            keys[key] = [position, *latest]
+        else:
+            row[0] = min(row[0], position)
+            if position >= row[1]:
+                row[1:] = latest
+    groups: dict[str, list[list[object]]] = {}
+    for (requirement, candidate), (first, last, _, code, count) in sorted(keys.items(), key=lambda pair: (pair[0][1], pair[1][0])):
+        row: list[object] = [requirement, code, last]
+        if first != last or count != 1:
+            row.append(first)
+        if count != 1:
+            row.append(count)
+        groups.setdefault(candidate, []).append(row)
+    if groups:
+        state["settled"] = {"latest": [[candidate, rows] for candidate, rows in groups.items()]}
+
+
+# --- what stays hot ---
+
+def _hot_keep(state: dict[str, object]) -> dict[str, set[str]]:
+    """Ids of hot objects that must stay hot; every other object of an archivable list may be evicted.
+
+    Hot: open evidence (unincorporated observations, unresolved judgments and the observations they
+    cite, handoffs with open observations or no returned result yet), every judgment that cites a hot
+    observation (incorporation and citation of hot observations are computed from hot judgments) and
+    every judgment that resolves a hot repair/unknown judgment, the handoff of every hot observation,
+    the last ``CHANGES_SINCE_RECENT_MAX`` handoffs, observations and judgments (``changes_since``),
+    the last 8 overridden judgments, handoffs without typed claims and handoffs with truncated claims
+    (status lists), current records and records written in the last ``CHANGES_SINCE_RECENT_MAX``
+    revisions, the last two runs of every declared check (and of every other verification kind), and
+    every source a hot object, an artifact or a hot source cites. A foreign-runner handoff stays hot
+    while its run is live (reserved, launched or bound). Requirements, checks, artifacts, authority
+    and closure are never evicted.
+    """
+    tail = CHANGES_SINCE_RECENT_MAX
+    data = state.get("evidence_continuity") or {}
+    observations = data.get("observations", [])
+    judgments = data.get("judgments", [])
+    handoffs = data.get("handoffs", [])
+    pending, unresolved, _ = _continuity_open(state, latest=False)
+    unresolved_ids = {item["id"] for item in unresolved}
+    by_id = {item["id"]: item for item in judgments}
+    keep_obs = {item["observation_id"] for item in pending}
+    for identifier in unresolved_ids:
+        keep_obs.update(by_id[identifier]["observation_refs"])
+    open_obs = set(keep_obs)
+    keep_obs.update(item["id"] for item in observations[-tail:])
+    keep_obs &= {item["id"] for item in observations}
+    keep_j = set(unresolved_ids) | {item["id"] for item in judgments[-tail:]}
+    keep_j.update([item["id"] for item in judgments if "override_reason" in item][-_ARCHIVE_KEEP_LISTED:])
+    keep_j.update(item["id"] for item in judgments if any(ref in keep_obs for ref in item["observation_refs"]))
+    order = {item["id"]: index for index, item in enumerate(judgments)}
+    frontier = list(keep_j)
+    while frontier:
+        identifier = frontier.pop()
+        judgment = by_id[identifier]
+        if judgment["outcome"] not in ("repair", "unknown") or identifier in unresolved_ids:
+            continue
+        basis = set(judgment["observation_refs"])
+        for later in judgments[order[identifier] + 1:]:
+            if later["id"] not in keep_j and (identifier in later.get("judgment_refs", []) or (
+                    later["requirement_ref"] == judgment["requirement_ref"] and basis <= set(later["observation_refs"]))):
+                keep_j.add(later["id"])
+                frontier.append(later["id"])
+    returned = {item["handoff_id"] for item in observations if item.get("handoff_id")}
+    # A foreign-runner handoff is unsettled exactly while its run is live; a settled run (completed,
+    # failed or cancelled) counts as returned.
+    keep_h = {item["id"] for item in handoffs if item.get("run_state") in FOREIGN_LIVE_RUN_STATES or ("run_state" not in item and not (
+        item["id"] in returned or "claims" in item or (isinstance(item.get("usage"), dict) and item["usage"].get("outcome"))))}
+    keep_h.update(item["handoff_id"] for item in observations
+                  if (item["id"] in keep_obs or item["id"] in open_obs) and item.get("handoff_id"))
+    keep_h.update(item["id"] for item in handoffs[-tail:])
+    keep_h.update([item["id"] for item in handoffs if "claims" in item and item["claims"]["status"] != "present"][-_ARCHIVE_KEEP_LISTED:])
+    keep_h.update([item["id"] for item in handoffs if "claims" in item and item["claims"].get("truncated")][-_ARCHIVE_KEEP_LISTED:])
+    records = state.get("records", [])
+    superseded = {ref for item in records for ref in item.get("supersedes", [])}
+    keep_r = {item["id"] for item in records if item["id"] not in superseded or item["revision"] > state["revision"] - tail}
+    runs: dict[tuple[str, str], list[str]] = {}
+    for item in state.get("verification_results", []):
+        key = ("check", str(item["check_id"])) if "check_id" in item else ("kind", str(item.get("kind")))
+        runs.setdefault(key, []).append(item["id"])
+    keep_v = {identifier for ids in runs.values() for identifier in ids[-_ARCHIVE_KEEP_RUNS:]}
+    cited: set[str] = set()
+    for item in observations:
+        if item["id"] in keep_obs:
+            cited.update(item.get("source_refs", []))
+    for item in records:
+        if item["id"] in keep_r:
+            cited.update(item.get("source_refs", []))
+    for item in state.get("artifact_refs", []):
+        cited.update(item.get("source_refs", []))
+    for item in state.get("verification_results", []):
+        if item["id"] in keep_v:
+            cited.update(item.get("source_refs", []))
+    sources = {item["id"]: item for item in state.get("evidence_refs", [])}
+    frontier = [ref for ref in cited if ref in sources]
+    keep_s = set(frontier)
+    while frontier:
+        for parent in sources[frontier.pop()].get("source_refs", []):
+            if parent not in keep_s and parent in sources:
+                keep_s.add(parent)
+                frontier.append(parent)
+    return {"evidence_refs": keep_s, "records": keep_r, "verification_results": keep_v, "handoffs": keep_h,
+            "observations": keep_obs, "judgments": keep_j}
+
+
+# --- the eviction pass ---
+
+def _segment_bytes(task_id: str, revision: int, items: list[dict[str, object]]) -> bytes:
+    segment = {"format": ARCHIVE_SEGMENT_FORMAT, "version": ARCHIVE_SEGMENT_VERSION, "task_id": task_id,
+               "revision": revision, "items": items}
+    return (json.dumps(segment, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _evictable_bytes(state: dict[str, object], keep: dict[str, set[str]]) -> int:
+    """Serialized bytes an eviction pass would remove (an estimate that ignores the index entry it adds)."""
+    return sum(_compact_size(item) + 1 for name in _ARCHIVE_COLLECTIONS for item in _archive_collection(state, name)
+               if item["id"] not in keep[name])
+
+
+def _evict_settled(state: dict[str, object], keep: dict[str, set[str]] | None = None) -> tuple[dict[str, object], bytes] | None:
+    """Build (state with every settled object evicted, segment bytes), or None when nothing is settled.
+
+    Pure: nothing is written. Evicted objects (schema-10 stubs included, as they are) leave their
+    hot lists; the new index entry lists their ids and positions and carries their totals, and
+    evicted judgments are folded into ``settled.latest``.
+    """
+    archive = state.get("archive") or []
+    if len(archive) >= ARCHIVE_INDEX_MAX:
+        return None
+    keep = _hot_keep(state) if keep is None else keep
+    candidate = copy.deepcopy(state)
+    index_map = _index_map(candidate)
+    items: list[dict[str, object]] = []
+    pairs: dict[str, list[tuple[str, int | None]]] = {}
+    totals = _Totals()
+    judgments: list[tuple[dict[str, object], int]] = []
+    for name in _ARCHIVE_COLLECTIONS:
+        values = _archive_collection(candidate, name)
+        positions = _hot_positions(candidate, name, index_map) if name in _POSITIONED else [None] * len(values)
+        kept: list[dict[str, object]] = []
+        for item, position in zip(values, positions):
+            if item["id"] in keep[name]:
+                kept.append(item)
+                continue
+            index_name = "check_runs" if name == "verification_results" and "check_id" in item else name
+            record: dict[str, object] = {"collection": index_name, "id": item["id"], "object": item}
+            if position is not None:
+                record["position"] = position
+            items.append(record)
+            pairs.setdefault(index_name, []).append((str(item["id"]), position))
+            totals.add(index_name, item)
+            if name == "judgments":
+                judgments.append((item, int(position)))
+        values[:] = kept
+    if not items:
+        return None
+    raw = _segment_bytes(str(candidate["task_id"]), int(candidate["revision"]), items)
+    entry = {"sha256": hashlib.sha256(raw).hexdigest(), "revision": candidate["revision"],
+             "ids": {name: _encode_ids(values, name in _POSITIONED) for name, values in sorted(pairs.items())},
+             "totals": totals.export()}
+    candidate["archive"] = [*archive, entry]
+    _merge_latest(candidate, judgments)
+    return candidate, raw
+
+
+def _compact_archive(root: Path, state: dict[str, object]) -> tuple[dict[str, object], bytes] | None:
+    """Merge small eviction segments into one when the index holds many of them.
+
+    Above ``ARCHIVE_COMPACT_ENTRIES`` eviction entries, the entries whose segment files are below
+    ``ARCHIVE_COMPACT_SEGMENT_BYTES`` (up to ``ARCHIVE_COMPACT_MAX_BYTES`` in all) are read,
+    verified and merged into one new segment holding exactly the objects they still claim; their
+    index entries become one entry with the merged ids and the summed totals. Pure apart from
+    reading segments: returns (new state, new segment bytes), or None when nothing qualifies or a
+    segment cannot be read (the index then stays as it is).
+    """
+    archive = state.get("archive") or []
+    entries = [(number, entry) for number, entry in enumerate(archive) if isinstance(entry, dict) and "ids" in entry]
+    if len(entries) <= ARCHIVE_COMPACT_ENTRIES:
+        return None
+    task_id = str(state["task_id"])
+    chosen: list[tuple[int, dict[str, object]]] = []
+    total = 0
+    for number, entry in entries:
+        try:
+            size = _archive_segment_path(root, task_id, str(entry["sha256"])).stat().st_size
+        except (OSError, ValueError):
+            continue
+        if size < ARCHIVE_COMPACT_SEGMENT_BYTES and total + size <= ARCHIVE_COMPACT_MAX_BYTES:
+            chosen.append((number, entry))
+            total += size
+    if len(chosen) < 2:
+        return None
+    items: list[dict[str, object]] = []
+    pairs: dict[str, list[tuple[str, int | None]]] = {}
+    totals = _Totals()
+    for _, entry in chosen:
+        try:
+            segment = _read_archive_segment(root, task_id, str(entry["sha256"]))
+        except ThalirisError:
+            return None
+        claimed: dict[tuple[str, str], int | None] = {}
+        for name, encoded in entry["ids"].items():
+            for identifier, position in _decode_ids(encoded, name in _POSITIONED):
+                claimed[(name, identifier)] = position
+                pairs.setdefault(name, []).append((identifier, position))
+        held = [item for item in segment["items"] if isinstance(item, dict)
+                and claimed.get((item.get("collection"), item.get("id")), "absent") == item.get("position")]
+        if len(held) != len(claimed):
+            return None
+        items.extend(held)
+        totals.merge(_Totals.load(entry["totals"]))
+    raw = _segment_bytes(task_id, int(state["revision"]), items)
+    merged = {"sha256": hashlib.sha256(raw).hexdigest(), "revision": state["revision"],
+              "ids": {name: _encode_ids(sorted(values, key=lambda pair: pair[1]) if name in _POSITIONED else values, name in _POSITIONED)
+                      for name, values in sorted(pairs.items())},
+              "totals": totals.export()}
+    numbers = {number for number, _ in chosen}
+    first = min(numbers)
+    candidate = {**state, "archive": [merged if number == first else entry for number, entry in enumerate(archive)
+                                      if number == first or number not in numbers]}
+    return candidate, raw
+
+
+# --- segments ---
+
+def _archive_segment_path(root: Path, task_id: str, sha256: str) -> Path:
+    if str(uuid.UUID(task_id)) != task_id or not _is_hex64(sha256):
+        raise ValueError("invalid archive segment identity")
+    return _safe_without_final_symlink(root, f".context/tasks/{task_id}/archive/{sha256}.json")
+
+
+def _write_archive_segment(root: Path, task_id: str, raw: bytes) -> None:
+    """Write a segment atomically. An existing segment with the same name and digest is kept as is."""
+    sha = hashlib.sha256(raw).hexdigest()
+    target = _archive_segment_path(root, task_id, sha)
+    if target.is_file():
+        try:
+            if _file_digest(target) == sha:
+                return
+        except OSError:
+            pass
+    # A file under this name with other bytes is not this segment (damage); the content-addressed
+    # bytes replace it, which restores what every referencing state expects.
+    _atomic_write(target, raw)
+
+
+# --- segment garbage collection ---
+#
+# Compaction (and re-hydration) drop index entries; their segment files become unreferenced. After a
+# successful compaction write (the state that drops them is durably on disk), ``_collect_archive_segments``
+# deletes only verified version-3 segment files of the task that none of these references:
+#
+# - the state just written;
+# - the state it replaced (read from disk before the write): a one-write grace window for readers that
+#   loaded the prior state and for an authority anchor whose snapshot is that prior state;
+# - every snapshot pinned in the task's ``archive-pins.json``: live authority anchors and
+#   retained authority recovery backups.
+#
+# A pins file that cannot be read, or a prior state that cannot be read as this task's ledger, skips
+# collection. Earlier segment versions may be referenced by pre-pinning external anchors, whose
+# locations Core does not know. Keep those files even when the hot index no longer names them.
+
+ARCHIVE_PINS_FORMAT = "thaliris-archive-pins"
+ARCHIVE_PINS_VERSION = 1
+ARCHIVE_PINS_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _segment_refs(state: dict[str, object]) -> set[str]:
+    """Segment digests a state's archive index references (eviction and schema-10 entries)."""
+    archive = state.get("archive")
+    return {entry["sha256"] for entry in archive if isinstance(entry, dict) and _is_hex64(entry.get("sha256"))} if isinstance(archive, list) else set()
+
+
+def _state_bytes_refs(raw: bytes | None, task_id: str) -> set[str] | None:
+    """Segment digests the ledger bytes ``raw`` reference; None when they are not this task's ledger."""
+    if raw is None:
+        return set()
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(value, dict) or value.get("task_id") != task_id:
+        return None
+    archive = value.get("archive", [])
+    if not isinstance(archive, list) or not all(isinstance(entry, dict) and _is_hex64(entry.get("sha256")) for entry in archive):
+        return None
+    return _segment_refs(value)
+
+
+def _durable_refs(path: Path, task_id: str) -> set[str] | None:
+    try:
+        if not path.exists():
+            return set()
+        return _state_bytes_refs(read_state_bytes(path), task_id)
+    except (OSError, ValueError):
+        return None
+
+
+def _pins_path(root: Path, task_id: str) -> Path:
+    if str(uuid.UUID(task_id)) != task_id:
+        raise ValueError("invalid task id")
+    return _safe_without_final_symlink(root, f"{_CONTEXT_DIR}/tasks/{task_id}/archive-pins.json")
+
+
+def _archive_gc_lock(root: Path, task_id: str):
+    """Serialize collection with anchor snapshot capture and pin writes, inside any Core task lock."""
+    if str(uuid.UUID(task_id)) != task_id:
+        raise ValueError("invalid task id")
+    return _file_lock(_safe_without_final_symlink(root, f"{_CONTEXT_DIR}/tasks/{task_id}/archive-gc.lock"))
+
+
+def _read_pins(root: Path, task_id: str) -> dict[str, list[str]] | None:
+    """Anchor key -> pinned digests; None when an established registry is missing or unreadable."""
+    path = _pins_path(root, task_id)
+    if not path.exists():
+        marker = path.with_name("archive-pins-required")
+        return None if marker.exists() or marker.is_symlink() else {}
+    try:
+        if path.stat().st_size > ARCHIVE_PINS_MAX_BYTES:
+            return None
+        value = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if (not isinstance(value, dict) or value.get("format") != ARCHIVE_PINS_FORMAT or value.get("version") != ARCHIVE_PINS_VERSION
+            or value.get("task_id") != task_id or not isinstance(value.get("anchors"), dict)):
+        return None
+    anchors = value["anchors"]
+    if not all(isinstance(key, str) and isinstance(shas, list) and all(_is_hex64(sha) for sha in shas) for key, shas in anchors.items()):
+        return None
+    return {key: list(shas) for key, shas in anchors.items()}
+
+
+def pin_anchor_segments(root: Path, task_id: str, anchor_key: str, snapshots: list[bytes | None]) -> None:
+    """Replace the segments one authority anchor pins with those its ``snapshots`` (ledger bytes) reference.
+
+    Pass both the old and the new snapshot while the anchor record changes, then only the new one
+    (or none, when the anchor retires). A damaged registry is left intact and disables collection.
+    Nothing is written for a task that never archived.
+    """
+    _pin_archive_snapshots(root, task_id, {anchor_key: snapshots})
+
+
+def _pin_archive_snapshots(root: Path, task_id: str, snapshots_by_key: dict[str, list[bytes | None]]) -> None:
+    """Publish one registry update for the given snapshot owners under the archive lock."""
+    pins = _read_pins(root, task_id)
+    if pins is None:
+        raise ValueError("archive pin registry is missing or unreadable")
+    current = dict(pins)
+    for key, snapshots in snapshots_by_key.items():
+        if not isinstance(key, str) or not _ID_LABEL.fullmatch(key):
+            raise ValueError("invalid archive pin key")
+        refs: set[str] = set()
+        for raw in snapshots:
+            snapshot_refs = _state_bytes_refs(raw, task_id)
+            if snapshot_refs is None:
+                raise ValueError("cannot pin an unreadable archive snapshot")
+            refs |= snapshot_refs
+        if refs:
+            current[key] = sorted(refs)
+        else:
+            current.pop(key, None)
+    if not current and not pins:
+        return
+    path = _pins_path(root, task_id)
+    marker = path.with_name("archive-pins-required")
+    if marker.is_symlink():
+        raise ValueError("unsafe archive pin registry marker")
+    if current != pins:
+        record = {"format": ARCHIVE_PINS_FORMAT, "version": ARCHIVE_PINS_VERSION, "task_id": task_id, "anchors": current}
+        payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > ARCHIVE_PINS_MAX_BYTES:
+            raise ValueError("archive pin registry exceeds its readable size limit")
+        _atomic_write(path, payload)
+    if not marker.exists():
+        # Publish the registry expectation before the first archived anchor. Keep the expectation
+        # and an empty registry after retirement, so loss does not masquerade as having no anchors.
+        _atomic_write(marker, b"thaliris-archive-pins\n")
+
+
+def _collect_archive_segments(root: Path, task_id: str, keep: set[str]) -> list[str]:
+    """Delete verified managed segments outside ``keep`` and all pins; return the deleted digests."""
+    pins = _read_pins(root, task_id)
+    if pins is None:
+        return []
+    keep = set(keep).union(*pins.values()) if pins else set(keep)
+    directory = _archive_segment_path(root, task_id, "0" * 64).parent
+    if directory != root.resolve() / ".context" / "tasks" / task_id / "archive" or not directory.is_dir():
+        return []
+    deleted: list[str] = []
+    for path in sorted(directory.iterdir()):
+        name = path.name
+        sha = name.removesuffix(".json")
+        if sha == name or not _is_hex64(sha) or sha in keep:
+            continue
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                continue
+            segment = _read_archive_segment(root, task_id, sha)
+            after = path.lstat()
+            identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if segment["version"] != ARCHIVE_SEGMENT_VERSION or any(getattr(after, key) != getattr(info, key) for key in identity_fields):
+                continue
+            path.unlink()
+            deleted.append(sha)
+        except (OSError, ThalirisError):
+            continue
+    return deleted
+
+def _archive_unavailable(identifier: str, sha: object, reason: str, object_type: str | None = None) -> ThalirisError:
+    return ThalirisError(
+        _errors.TASK_ARCHIVE_UNAVAILABLE, "archived task object body is unavailable",
+        recovery=("restore the segment file with its exact bytes (its sha256 is its name) from a copy; the hot "
+                  "ledger and its archive index are intact, and gates, task-status and every write that does not "
+                  "need this object keep working"),
+        details={"id": identifier, "segment": sha if isinstance(sha, str) else None, "reason": reason,
+                 **({"object_type": object_type} if object_type else {})})
+
+
+def _read_archive_segment(root: Path, task_id: str, sha: str, identifier: str = "") -> dict[str, object]:
+    """Read and verify one segment; TASK_ARCHIVE_UNAVAILABLE when missing, damaged or foreign."""
+    try:
+        target = _archive_segment_path(root, task_id, sha)
+    except ValueError as exc:
+        raise _archive_unavailable(identifier, sha, "invalid segment location") from exc
+    if not target.is_file():
+        raise _archive_unavailable(identifier, sha, "missing")
+    try:
+        with target.open("rb") as stream:
+            raw = stream.read(ARCHIVE_SEGMENT_MAX_BYTES + 1)
+    except OSError as exc:
+        raise _archive_unavailable(identifier, sha, "unreadable") from exc
+    if len(raw) > ARCHIVE_SEGMENT_MAX_BYTES:
+        raise _archive_unavailable(identifier, sha, "oversized")
+    if hashlib.sha256(raw).hexdigest() != sha:
+        raise _archive_unavailable(identifier, sha, "sha256 mismatch")
+    try:
+        segment = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise _archive_unavailable(identifier, sha, "invalid JSON") from exc
+    if (not isinstance(segment, dict) or segment.get("format") != ARCHIVE_SEGMENT_FORMAT
+            or segment.get("version") not in _ARCHIVE_SEGMENT_VERSIONS or segment.get("task_id") != task_id
+            or not isinstance(segment.get("items"), list)):
+        raise _archive_unavailable(identifier, sha, "not a segment of this task")
+    return segment
+
+
+def hydrate_archived(root: Path, state: dict[str, object], collection: str, item: dict[str, object]) -> dict[str, object]:
+    """The full object for a schema-10 stub (the item itself when it carries no ``archived`` marker).
+
+    Reads the referenced version-1 segment and verifies its sha256; raises TASK_ARCHIVE_UNAVAILABLE
+    when it is missing, damaged or does not hold this object. Stub fields win over segment fields (a
+    handoff stub may gain usage or claims after archiving); the segment supplies only moved bodies.
+    """
+    sha = item.get("archived")
+    if sha is None:
+        return item
+    identifier = str(item.get("id"))
+    segment = _read_archive_segment(root, str(state["task_id"]), str(sha), identifier)
+    for entry in segment["items"]:
+        if isinstance(entry, dict) and entry.get("collection") == collection and entry.get("id") == item.get("id"):
+            fields = entry.get("fields")
+            if not isinstance(fields, dict):
+                break
+            full = {key: value for key, value in item.items() if key != "archived"}
+            full.update(fields)
+            return full
+    raise _archive_unavailable(identifier, sha, "segment does not hold this object")
+
+
+def _evicted_object(root: Path, state: dict[str, object], name: str, identifier: str,
+                    located: tuple[int, int | None]) -> tuple[dict[str, object], str]:
+    """(object exactly as it was evicted, segment sha) for an indexed id; a schema-10 stub stays a stub."""
+    entry = state["archive"][located[0]]
+    sha = str(entry["sha256"])
+    segment = _read_archive_segment(root, str(state["task_id"]), sha, identifier)
+    for item in segment["items"]:
+        if (isinstance(item, dict) and item.get("collection") == name and item.get("id") == identifier
+                and item.get("position") == located[1] and isinstance(item.get("object"), dict)
+                and item["object"].get("id") == identifier):
+            return item["object"], sha
+    raise _archive_unavailable(identifier, sha, "segment does not hold this object")
+
+
+def archived_object(root: Path, state: dict[str, object], identifier: str) -> tuple[str, dict[str, object], str] | None:
+    """(index collection, full object, segment sha) of an evicted id, or None when it is not evicted."""
+    if not _eviction_entries(state):
+        return None
+    index_map = _index_map(state)
+    for name in _INDEX_COLLECTIONS:
+        located = index_map[name].get(identifier)
+        if located is not None:
+            item, sha = _evicted_object(root, state, name, identifier, located)
+            hot_name = "verification_results" if name == "check_runs" else name
+            return name, hydrate_archived(root, state, hot_name, item), sha
+    return None
+
+
+def _remove_from_index(state: dict[str, object], removed: list[tuple[str, str, dict[str, object] | None]]) -> None:
+    """Drop ids from their entries and subtract what those objects contributed to the entry totals.
+
+    ``removed`` holds (index collection, id, object or None for count-only objects). An entry left
+    without ids is dropped; ``settled.latest`` keeps naming a re-hydrated judgment (now hot at the
+    same position), which keeps every latest/first answer unchanged.
+    """
+    if not removed:
+        return
+    index_map = _index_map(state)
+    by_entry: dict[int, list[tuple[str, str, dict[str, object] | None]]] = {}
+    for name, identifier, item in removed:
+        by_entry.setdefault(index_map[name][identifier][0], []).append((name, identifier, item))
+    archive = list(state["archive"])
+    for number, members in by_entry.items():
+        entry = archive[number]
+        gone = {(name, identifier) for name, identifier, _ in members}
+        ids: dict[str, list[object]] = {}
+        for name, encoded in entry["ids"].items():
+            remaining = [(identifier, position) for identifier, position in _decode_ids(encoded, name in _POSITIONED)
+                         if (name, identifier) not in gone]
+            if remaining:
+                ids[name] = _encode_ids(remaining, name in _POSITIONED)
+        totals = _Totals.load(entry["totals"])
+        for name, identifier, item in members:
+            if item is None:
+                totals.counts[name] -= 1
+            else:
+                totals.add(name, item, -1)
+        archive[number] = {**entry, "ids": ids, "totals": totals.export()} if ids else None
+    remaining_entries = [entry for entry in archive if entry is not None]
+    if remaining_entries:
+        state["archive"] = remaining_entries
+    else:
+        state.pop("archive", None)
+    if not _eviction_entries(state):
+        # Every evicted object is hot again, so hot judgments alone answer every latest/first question.
+        state.pop("settled", None)
+
+
+def _rehydrate(root: Path, state: dict[str, object], wanted: list[tuple[str, str]]) -> None:
+    """Return evicted objects to their hot lists, at their exact positions, all or nothing.
+
+    ``wanted`` holds (index collection, id). Raises TASK_ARCHIVE_UNAVAILABLE (state unchanged) when
+    a segment cannot be read.
+    """
+    index_map = _index_map(state)
+    restored: list[tuple[str, str, dict[str, object], int | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for name, identifier in wanted:
+        if (name, identifier) in seen or identifier not in index_map[name]:
+            continue
+        seen.add((name, identifier))
+        located = index_map[name][identifier]
+        item, _ = _evicted_object(root, state, name, identifier, located)
+        restored.append((name, identifier, copy.deepcopy(item), located[1]))
+    if not restored:
+        return
+    for hot_name in {("verification_results" if name == "check_runs" else name) for name, _, _, _ in restored}:
+        values = _archive_collection(state, hot_name)
+        returning = [(position, item) for name, _, item, position in restored
+                     if ("verification_results" if name == "check_runs" else name) == hot_name]
+        if hot_name in _POSITIONED:
+            merged = sorted([*zip(_hot_positions(state, hot_name, index_map), values), *returning], key=lambda pair: pair[0])
+            values[:] = [item for _, item in merged]
+        else:
+            values.extend(item for _, item in returning)
+    _remove_from_index(state, [(name, identifier, item) for name, identifier, item, _ in restored])
+
+
+def _rehydrate_from_state(state: dict[str, object], wanted: list[tuple[str, str]]) -> None:
+    """``_rehydrate`` for in-memory transactions: the segments are read under the root ``_load_state`` saw."""
+    if not wanted:
+        return
+    root = _archive_roots.get().get(str(state.get("task_id")))
+    if root is None:
+        raise ThalirisError(_errors.TASK_ARCHIVE_UNAVAILABLE, "archived task object body is unavailable",
+                            recovery="load the task through Core so its archive segments can be read; nothing was recorded",
+                            details={"ids": [identifier for _, identifier in wanted][:8], "reason": "no project root is known for this task"})
+    _rehydrate(root, state, wanted)
+
+
+def _cited_evicted_sources(state: dict[str, object]) -> list[str]:
+    """Evicted source ids that hot objects (observations, records, artifacts, results, sources) cite."""
+    if not _eviction_entries(state):
+        return []
+    indexed = _index_map(state)["evidence_refs"]
+    if not indexed:
+        return []
+    cited: set[str] = set()
+    for item in (state.get("evidence_continuity") or {}).get("observations", []):
+        cited.update(item.get("source_refs", []))
+    for name in ("records", "artifact_refs", "verification_results", "evidence_refs"):
+        for item in state.get(name, []):
+            if isinstance(item, dict):
+                cited.update(item.get("source_refs", []))
+    return sorted(cited & indexed.keys())
+
+
+def _rehydrate_cited_sources(root: Path, state: dict[str, object]) -> bool:
+    """Best effort: bring back evicted sources that hot objects cite again; an unreadable segment
+    leaves them evicted (they stay valid references). Returns whether anything came back."""
+    changed = False
+    unavailable: set[str] = set()
+    wanted = _cited_evicted_sources(state)
+    while wanted:
+        try:
+            _rehydrate(root, state, [("evidence_refs", identifier) for identifier in wanted])
+            changed = True
+        except ThalirisError as exc:
+            if exc.code != _errors.TASK_ARCHIVE_UNAVAILABLE:
+                raise
+            for identifier in wanted:
+                try:
+                    _rehydrate(root, state, [("evidence_refs", identifier)])
+                    changed = True
+                except ThalirisError as single:
+                    if single.code != _errors.TASK_ARCHIVE_UNAVAILABLE:
+                        raise
+                    unavailable.add(identifier)
+        wanted = [identifier for identifier in _cited_evicted_sources(state) if identifier not in unavailable]
+    return changed
+
+
+def _forget_check_runs(state: dict[str, object], check_id: str, below: int) -> None:
+    """Drop evicted results of one check with a run number below ``below`` (``record_check_run`` history)."""
+    if not _eviction_entries(state):
+        return
+    prefix = f"{check_id}.r"
+    dropped = []
+    for identifier in _index_map(state)["check_runs"]:
+        number = identifier[len(prefix):]
+        if identifier.startswith(prefix) and number.isdigit() and str(int(number)) == number and int(number) < below:
+            dropped.append(("check_runs", identifier, None))
+    _remove_from_index(state, dropped)
+
+
+# --- validation ---
+
+def _validate_archive_index(state: dict[str, object]) -> dict[str, dict[str, tuple[int, int | None]]]:
+    """Validate the ``archive`` index and ``settled`` table shapes; returns the evicted-id map.
+
+    Segment contents are never read here. Cross-checks that need the hot lists (references,
+    uniqueness against hot ids, totals and latest rows) run in ``_validate_archive_totals``.
+    """
+    index = state.get("archive")
+    stubs = list(_archived_items(state))
+    empty: dict[str, dict[str, tuple[int, int | None]]] = {name: {} for name in _INDEX_COLLECTIONS}
+    if index is None:
+        if stubs:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "archived stub without an archive index",
+                                details={"id": str(stubs[0][1].get("id"))})
+        if "settled" in state:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "settled table without an archive index")
+        return empty
+    if state.get("schema_version") < _ARCHIVE_SCHEMA_VERSION:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "archive segments require task schema 10",
+                            recovery="preserve the state and use a compatible reader")
+    if not isinstance(index, list) or not 1 <= len(index) <= ARCHIVE_INDEX_MAX:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index",
+                            details={"expected": f"a list of 1 to {ARCHIVE_INDEX_MAX} segment entries"})
+    legacy: dict[str, dict[str, object]] = {}
+    shas: set[str] = set()
+    evicting = False
+    for entry in index:
+        if isinstance(entry, dict) and set(entry) == _ARCHIVE_INDEX_FIELDS:
+            if (not _is_hex64(entry["sha256"]) or type(entry["revision"]) is not int or not 1 <= entry["revision"] <= state["revision"]
+                    or type(entry["items"]) is not int or entry["items"] < 1
+                    or not isinstance(entry["collections"], dict) or not entry["collections"]
+                    or set(entry["collections"]) - set(_ARCHIVE_COLLECTIONS)
+                    or not all(type(count) is int and count >= 1 for count in entry["collections"].values())
+                    or sum(entry["collections"].values()) != entry["items"]):
+                raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index",
+                                    details={"expected": "unique {sha256, revision, items, collections} entries"})
+            legacy[entry["sha256"]] = entry
+        elif isinstance(entry, dict) and set(entry) == _EVICTION_INDEX_FIELDS:
+            evicting = True
+            ids = entry["ids"]
+            if (not _is_hex64(entry["sha256"]) or type(entry["revision"]) is not int or not 1 <= entry["revision"] <= state["revision"]
+                    or not isinstance(ids, dict) or not ids or set(ids) - set(_INDEX_COLLECTIONS)):
+                raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index",
+                                    details={"expected": "unique {sha256, revision, ids, totals} entries"})
+        else:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index",
+                                details={"expected": "{sha256, revision, ids, totals} or schema-10 {sha256, revision, items, collections} entries"})
+        if entry["sha256"] in shas:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index", details={"expected": "unique segment digests"})
+        shas.add(entry["sha256"])
+    if (evicting or "settled" in state) and state.get("schema_version") < _EVICTION_SCHEMA_VERSION:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "evicted ledger objects require task schema 11",
+                            recovery="preserve the state and use a compatible reader")
+    if "settled" in state and not evicting:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "settled table without eviction segments")
+    result = empty
+    if evicting:
+        derived = _archive_derived(state)
+        if derived["problem"] is not None:
+            code, message, details = derived["problem"]  # type: ignore[misc]
+            raise ThalirisError(code, message, details=dict(details))
+        result = derived["map"]  # type: ignore[assignment]
+    seen: dict[tuple[str, str], int] = {}
+    for name, item in stubs:
+        sha = item["archived"]
+        if not isinstance(sha, str) or sha not in legacy:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "archived stub names an unknown segment",
+                                details={"id": str(item.get("id")), "collection": name})
+        key = (sha, name)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > legacy[sha]["collections"].get(name, 0):
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "archived stubs exceed their segment entry",
+                                details={"segment": sha, "collection": name})
+    return result
+
+
+def _validate_archive_totals(state: dict[str, object], index_map: dict[str, dict[str, tuple[int, int | None]]]) -> None:
+    """Cross-check eviction totals and ``settled.latest`` against the ids and hot lists (what is checkable)."""
+    entries = state.get("archive") or []
+    if not _eviction_entries(state):
+        return
+    requirements = {item["id"] for item in (state.get("evidence_continuity") or {}).get("requirements", [])}
+    for name in _POSITIONED:
+        total = len(_archive_collection(state, name)) + len(index_map[name])
+        evicted_positions = _archive_derived(state)["positions"][name]  # type: ignore[index]
+        if evicted_positions and evicted_positions[-1] >= total:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive index ids",
+                                details={"collection": name, "expected": f"positions below {total}, the list length"})
+    derived = _archive_derived(state)
+    counts_by_entry: dict[int, dict[str, int]] = derived["counts"]  # type: ignore[assignment]
+    observations_by_entry: dict[int, set[str]] = derived["observations"]  # type: ignore[assignment]
+    for number, entry in enumerate(entries):
+        if "ids" not in entry:
+            continue
+        problem = _totals_problem(entry["totals"], counts_by_entry.get(number, {}), observations_by_entry.get(number, set()),
+                                  requirements)
+        if problem:
+            raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid archive totals",
+                                details={"segment": entry["sha256"], "expected": problem})
+    problem = _latest_rows_problem(state, index_map, requirements)
+    if problem:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "invalid settled latest judgments", details={"expected": problem})
+
+
+def archive_summary(state: dict[str, object]) -> dict[str, object] | None:
+    """Counts of archived objects and segments, or None for a task that never archived."""
+    index = state.get("archive")
+    if not index:
+        return None
+    by_collection: dict[str, int] = {}
+    for name, _ in _archived_items(state):
+        by_collection[name] = by_collection.get(name, 0) + 1
+    for entry in _eviction_entries(state):
+        for name, count in entry["totals"]["counts"].items():
+            target = "verification_results" if name == "check_runs" else name
+            by_collection[target] = by_collection.get(target, 0) + count
+    by_collection = dict(sorted(by_collection.items()))
+    return {"segments": len(index), "archived_items": sum(by_collection.values()), "by_collection": by_collection,
+            "last_revision": index[-1]["revision"],
+            "retrieval": "task-get <id> returns the full object from its segment"}
+
+
+def task_state_capacity() -> dict[str, int]:
+    """The task-state bounds adapters must use instead of hard-coding them.
+
+    ``max_bytes`` bounds the hot ledger file on disk (every read and write); archive segments are
+    separate files. ``list_max`` bounds the hot objects of a ledger list (requirements:
+    ``archived_list_max``); evicted objects count toward no list cap.
+    """
+    return {"max_bytes": STATE_MAX_BYTES, "archive_high_water_bytes": STATE_ARCHIVE_HIGH_WATER_BYTES,
+            "list_max": STATE_LIST_MAX, "archived_list_max": STATE_ARCHIVED_LIST_MAX,
+            "requirements_max": STATE_ARCHIVED_LIST_MAX, "archive_index_max": ARCHIVE_INDEX_MAX,
+            "schema_version": _STATE_SCHEMA_VERSION, "supported_schemas": list(_SUPPORTED_SCHEMAS)}
+
+
+def read_state_bytes(path: Path) -> bytes:
+    """Read a ledger file's exact bytes within the Core bound; TASK_STATE_INVALID when it is larger."""
+    with Path(path).open("rb") as stream:
+        raw = stream.read(STATE_MAX_BYTES + 1)
+    if len(raw) > STATE_MAX_BYTES:
+        raise ThalirisError(_errors.TASK_STATE_INVALID, "task state exceeds 512 KiB",
+                            details={"limit": STATE_MAX_BYTES})
+    return raw
 
 
 def _load_state(root: Path, *, active: bool = False) -> dict[str, object]:
@@ -1054,17 +2849,18 @@ def _load_state(root: Path, *, active: bool = False) -> dict[str, object]:
         raise ThalirisError(_errors.TASK_NOT_ACTIVE, "current task is not ACTIVE",
                             recovery="start a new task; a DONE task accepts no writes",
                             details={"task_id": state["task_id"], "status": state["status"]})
+    _register_archive_root(root, state)
     return state
 
 
 def _task_object_ids(state: dict[str, object]) -> set[str]:
-    """Return the single task-wide identity set for addressable objects."""
+    """Return the single task-wide identity set for addressable objects (evicted ids stay reserved)."""
     return {
         str(item["id"])
         for field in ("evidence_refs", "records", "artifact_refs", "verification_results")
         for item in state[field]
     } | {str(item["id"]) for item in state.get("checks", [])} | {
-        str(item["id"]) for values in state.get("evidence_continuity", {}).values() for item in values}
+        str(item["id"]) for values in state.get("evidence_continuity", {}).values() for item in values} | _indexed_ids(state)
 
 
 INPUT_ENCODINGS = ("UTF-8", "UTF-8 with BOM", "UTF-16 with BOM")
@@ -1263,7 +3059,7 @@ def task_update(root: Path, actor: str, base_revision: int, input_file: str | No
             additions = partial["evidence_refs"]
             if not isinstance(additions, list):
                 raise ValueError("evidence_refs must be append-only additions")
-            known_source_ids = {str(item["id"]) for item in state["evidence_refs"]}
+            known_source_ids = _known_ids(state, "evidence_refs")
             for item in additions:
                 _evidence_ref(item, known_source_ids)
                 if any(ref not in known_source_ids for ref in item.get("source_refs", [])):
@@ -1275,8 +3071,8 @@ def task_update(root: Path, actor: str, base_revision: int, input_file: str | No
             additions = partial["records"]
             if not isinstance(additions, list) or not additions:
                 raise ValueError("records must be append-only additions")
-            known_sources = {str(item["id"]) for item in state["evidence_refs"]}
-            known_records = {str(item["id"]) for item in state["records"]}
+            known_sources = _known_ids(state, "evidence_refs")
+            known_records = _known_ids(state, "records")
             for item in additions:
                 record = _normalize_new_record(item, producer=actor, revision=base_revision + 1, known_sources=known_sources, known_records=known_records)
                 state["records"].append(record)
@@ -1302,19 +3098,19 @@ _CONTINUITY_SCHEMAS = {
 # facts have explicit provenance and no invented native handoff or actor.
 _CONTINUITY_OPTIONAL = {
     "requirements": {"kind", "surface"},
-    "handoffs": {"durable_paths", "claims", "usage"},
+    "handoffs": {"durable_paths", "claims", "usage", "archived", *sorted(FOREIGN_HANDOFF_FIELDS)},
     "observations": {"native_actor", "submitted_by", "native_status", "native_status_conflict", "observed_state", "provenance",
-                     "claim", "mechanism"},
-    "judgments": {"judgment_refs", "override_reason", "overridden_checks"},
+                     "claim", "mechanism", "archived"},
+    "judgments": {"judgment_refs", "override_reason", "overridden_checks", "archived"},
 }
 # Fields Core alone assigns: a model-authored register/observe payload may not carry them.
 # ``override_reason`` is model-authored but enters through the judgment gate, which records
 # what it overrode.
 _CORE_ASSIGNED_CONTINUITY_FIELDS = {
     "requirements": set(),
-    "handoffs": {"claims", "usage"},
-    "observations": {"claim", "mechanism"},
-    "judgments": {"override_reason", "overridden_checks"},
+    "handoffs": {"claims", "usage", "archived", *sorted(FOREIGN_HANDOFF_FIELDS)},
+    "observations": {"claim", "mechanism", "archived"},
+    "judgments": {"override_reason", "overridden_checks", "archived"},
 }
 # A requirement's kind says how far declared checks can decide it. Unspecified (and every
 # requirement written before Core 0.6.0) is judgment-only, which changes no behaviour.
@@ -1367,20 +3163,29 @@ def _continuity_error(code: str, message: str, kind: str | None = None, index: i
     return ThalirisError(code, text, recovery=recovery, details=details)
 
 
-def _validate_continuity(state: dict[str, object]) -> None:
+def _validate_continuity(state: dict[str, object],
+                         index_map: dict[str, dict[str, tuple[int, int | None]]] | None = None) -> None:
     data = state.get("evidence_continuity")
     if "evidence_continuity" not in state:
         return
     if not isinstance(data, dict) or set(data) != set(_CONTINUITY_KINDS):
         raise ThalirisError(_errors.CONTINUITY_INVALID, "invalid evidence continuity",
                             details={"expected": list(_CONTINUITY_KINDS)})
-    owners: dict[str, tuple[str, dict[str, object]]] = {}
+    if index_map is None:
+        index_map = _index_map(state)
+    owners: dict[str, tuple[str, dict[str, object] | None]] = {}
+    indexed_all: set[str] = _archive_derived(state)["ids"] if _eviction_entries(state) else set()  # type: ignore[assignment]
     for field in ("records", "evidence_refs", "artifact_refs", "verification_results", "checks"):
         for item in state.get(field, []):
             if isinstance(item, dict):
                 owners[str(item.get("id"))] = (field, item)
     requirements, handoffs, observations = {}, {}, {}
-    sources = {item["id"] for item in state["evidence_refs"]}
+    live_sessions: dict[str, str] = {}
+    # Evicted handoffs, observations and judgments are present for references; their fields were
+    # checked when they were appended, so checks that read a referent's fields skip evicted ones.
+    evicted_handoffs, evicted_observations, evicted_judgments = (
+        index_map["handoffs"], index_map["observations"], index_map["judgments"])
+    sources = {item["id"] for item in state["evidence_refs"]} | set(index_map["evidence_refs"])
 
     def label(kind, index, item, field, text):
         value = item[field]
@@ -1433,11 +3238,12 @@ def _validate_continuity(state: dict[str, object]) -> None:
                     got={"missing": missing, "unexpected": unexpected} if isinstance(item, dict) else item)
             label(kind, index, item, "id", "continuity id")
             identifier = item["id"]
-            if identifier in owners:
-                owner_kind, owner = owners[identifier]
+            if identifier in owners or identifier in indexed_all:
+                owner_kind, owner = owners.get(identifier) or (
+                    next(name for name, bucket in index_map.items() if identifier in bucket), None)
                 extra = {"existing_collection": owner_kind}
                 recovery = "choose an id that is unused in this task; nothing was recorded"
-                if kind == "observations" and owner_kind == "observations":
+                if kind == "observations" and owner_kind == "observations" and owner is not None:
                     extra["existing_handoff_id"] = owner.get("handoff_id")
                     extra["handoff_id"] = item.get("handoff_id")
                     qualified = f"{item.get('handoff_id')}.{identifier}"
@@ -1449,10 +3255,14 @@ def _validate_continuity(state: dict[str, object]) -> None:
                                         field="id", expected="unique among all task objects", extra=extra, recovery=recovery)
             owners[identifier] = (kind, item)
             if ((_SCHEMA9_CONTINUITY_FIELDS[kind] & item.keys() or (kind == "observations" and item.get("provenance") == MECHANISM_PRODUCER))
-                    and state.get("schema_version") != _VERIFICATION_SCHEMA_VERSION):
+                    and state.get("schema_version") < _VERIFICATION_SCHEMA_VERSION):
                 raise _continuity_error(_errors.CONTINUITY_INVALID, "verification-first continuity fields require task schema 9", kind, index, item,
                                         expected="schema 9; preserve the state and use a compatible reader",
                                         got=sorted(_SCHEMA9_CONTINUITY_FIELDS[kind] & item.keys()))
+            if state.get("schema_version") < _CROSS_HOST_SCHEMA_VERSION and _cross_host_fields(kind, item):
+                raise _continuity_error(_errors.CONTINUITY_INVALID, "cross-host continuity fields require task schema 12", kind, index, item,
+                                        expected="schema 12; preserve the state and use a compatible reader",
+                                        got=_cross_host_fields(kind, item))
             for field in sorted(fields - {"id", "parent_handoff_id", "requirement_refs", "source_refs", "observation_refs", "text", "reasoning"}
                                 - ({"handoff_id"} if kind == "observations" and item.get("provenance") in {"controller-local", MECHANISM_PRODUCER} else set())):
                 label(kind, index, item, field, field)
@@ -1478,8 +3288,23 @@ def _validate_continuity(state: dict[str, object]) -> None:
                 if not item["requirement_refs"] and item["parent_handoff_id"] is None:
                     raise _continuity_error(_errors.CONTINUITY_REFERENCE_INVALID, "handoff requires requirement refs", kind, index, item,
                                             field="requirement_refs", expected="non-empty for a root handoff (parent_handoff_id null)")
+                problem = _foreign_handoff_problem(item)
+                if problem:
+                    raise _continuity_error(_errors.CONTINUITY_INVALID, "invalid foreign-runner handoff", kind, index, item,
+                                            field="run_state", expected=problem)
+                if item.get("run_state") in FOREIGN_LIVE_RUN_STATES and "foreign_session_hash" in item:
+                    if item["foreign_session_hash"] in live_sessions:
+                        raise _continuity_error(_errors.FOREIGN_RUN_INVALID, "foreign session is already bound to a live handoff", kind, index, item,
+                                                field="foreign_session_hash", expected="a session hash no other live foreign-runner handoff holds",
+                                                extra={"existing_handoff_id": live_sessions[item["foreign_session_hash"]]})
+                    live_sessions[item["foreign_session_hash"]] = identifier
                 parent = item["parent_handoff_id"]
-                if parent is not None:
+                if isinstance(parent, str) and parent in handoffs and "executor_host" in handoffs[parent]:
+                    # Foreign children run read-only and cannot delegate further (first version).
+                    raise _continuity_error(_errors.FOREIGN_DELEGATION_REFUSED, "a foreign-runner handoff cannot delegate", kind, index, item,
+                                            field="parent_handoff_id", expected="a parent handoff that is not run by a foreign Host",
+                                            got=parent, recovery="dispatch the work from the Controller's own Host instead; nothing was recorded")
+                if parent is not None and not (isinstance(parent, str) and parent in evicted_handoffs and parent not in handoffs):
                     if not isinstance(parent, str) or parent not in handoffs:
                         raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "invalid parent handoff provenance", kind, index, item,
                                                 field="parent_handoff_id", expected="null or the id of an earlier registered handoff", got=parent)
@@ -1498,12 +3323,20 @@ def _validate_continuity(state: dict[str, object]) -> None:
                                             field="native_status_conflict", expected="a boolean", got=item["native_status_conflict"])
                 local = item.get("provenance") == "controller-local"
                 mechanical = item.get("provenance") == MECHANISM_PRODUCER
-                if local and state.get("schema_version") not in (_CONTROLLER_LOCAL_SCHEMA_VERSION, _VERIFICATION_SCHEMA_VERSION):
+                foreign = item.get("provenance") == FOREIGN_RUNNER_PROVENANCE
+                claim_handoff = handoffs.get(item["handoff_id"]) if isinstance(item["handoff_id"], str) else None
+                if local and state.get("schema_version") < _CONTROLLER_LOCAL_SCHEMA_VERSION:
                     raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "Controller local provenance requires task schema 8", kind, index, item,
                                             expected="schema 8; preserve the state and use a compatible reader")
-                if "provenance" in item and not (local or mechanical):
+                if "provenance" in item and not (local or mechanical or foreign):
                     raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "invalid observation provenance", kind, index, item,
                                             field="provenance", expected="controller-local or omitted")
+                if (foreign and ("claim" not in item or not isinstance(item["handoff_id"], str)
+                                 or {"native_actor", "submitted_by", "native_status", "native_status_conflict", "observed_state"} & item.keys()
+                                 or (claim_handoff is not None and claim_handoff.get("result_source") != FOREIGN_RESULT_SOURCE))
+                        or (not foreign and "claim" in item and claim_handoff is not None and "executor_host" in claim_handoff)):
+                    raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "foreign-runner observation provenance conflict", kind, index, item,
+                                            field="provenance", expected="a typed claim of a handoff whose result the foreign runner recorded")
                 if local and (item["producer"] != "controller" or item["handoff_id"] is not None
                               or {"native_actor", "submitted_by", "native_status", "native_status_conflict"} & item.keys()):
                     raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "Controller local observation provenance conflict", kind, index, item,
@@ -1521,17 +3354,23 @@ def _validate_continuity(state: dict[str, object]) -> None:
                                                 field="claim", expected=problem)
                 local = local or mechanical  # both are detached from any native handoff
                 handoff = handoffs.get(item["handoff_id"]) if not local else None
-                if handoff is None and not local:
+                if handoff is None and not local and item["handoff_id"] in evicted_handoffs:
+                    # The handoff was evicted after this observation was checked against it (a new
+                    # observation re-hydrates its handoff first, see ``_append_continuity_items``):
+                    # only the registered-requirement and source checks below can run.
+                    refs(kind, index, item, "requirement_refs", requirements, "registered task requirement ids")
+                elif handoff is None and not local:
                     raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "observation handoff provenance conflict", kind, index, item,
                                             field="handoff_id", expected="the id of a registered handoff", got=item["handoff_id"])
-                for field in (() if local else ("producer", "candidate")):
+                for field in (() if local or handoff is None else ("producer", "candidate")):
                     if item[field] != handoff[field]:
                         raise _continuity_error(_errors.CONTINUITY_PROVENANCE_CONFLICT, "observation handoff provenance conflict", kind, index, item,
                                                 field=field, expected=f"{handoff[field]!r} as registered on handoff {handoff['id']}", got=item[field])
-                selected_refs = requirements if local else handoff["requirement_refs"]
-                refs(kind, index, item, "requirement_refs", selected_refs,
-                     "registered task requirement ids" if local else f"a subset of handoff {handoff['id']}'s requirement_refs {handoff['requirement_refs']}")
-                if not item["requirement_refs"] and (local or handoff["requirement_refs"]) and "claim" not in item:
+                if local or handoff is not None:
+                    selected_refs = requirements if local else handoff["requirement_refs"]
+                    refs(kind, index, item, "requirement_refs", selected_refs,
+                         "registered task requirement ids" if local else f"a subset of handoff {handoff['id']}'s requirement_refs {handoff['requirement_refs']}")
+                if (local or handoff is not None) and not item["requirement_refs"] and (local or handoff["requirement_refs"]) and "claim" not in item:
                     raise _continuity_error(_errors.CONTINUITY_REFERENCE_INVALID, "observation requires requirement refs", kind, index, item,
                                             field="requirement_refs", expected="non-empty registered requirement ids" if local else f"non-empty; handoff {handoff['id']} carries {handoff['requirement_refs']}")
                 source_refs = item["source_refs"]
@@ -1559,13 +3398,15 @@ def _validate_continuity(state: dict[str, object]) -> None:
                     if problem or item["outcome"] != "satisfied":
                         raise _continuity_error(_errors.CONTINUITY_INVALID, "invalid judgment override", kind, index, item,
                                                 field="override_reason", expected=problem or "an override only on a satisfied judgment")
-                refs(kind, index, item, "observation_refs", observations,
+                refs(kind, index, item, "observation_refs", observations.keys() | evicted_observations.keys() if evicted_observations else observations,
                      "exact ids of observations registered in this task (as stored, e.g. adapter handoff-qualified ids)",
                      suggest=similar_observations)
                 prior = {j["id"]: j for j in data["judgments"][:index]}
-                refs(kind, index, item, "judgment_refs", prior,
+                refs(kind, index, item, "judgment_refs", prior.keys() | evicted_judgments.keys() if evicted_judgments else prior,
                      "ids of judgments that precede this one in list order (earlier items of the same batch count)")
-                foreign = [ref for ref in item.get("judgment_refs", []) if prior[ref]["requirement_ref"] != item["requirement_ref"]]
+                # An evicted judgment's requirement was checked when the citing judgment was appended
+                # (a new judgment re-hydrates the judgments it addresses first).
+                foreign = [ref for ref in item.get("judgment_refs", []) if ref in prior and prior[ref]["requirement_ref"] != item["requirement_ref"]]
                 if foreign:
                     raise _continuity_error(_errors.CONTINUITY_REFERENCE_INVALID, "judgment continuity requirement conflict", kind, index, item,
                                             field="judgment_refs", expected=f"judgments about the same requirement {item['requirement_ref']}",
@@ -1583,14 +3424,17 @@ def _validate_continuity(state: dict[str, object]) -> None:
                                             field=body_field, expected="non-empty text of at most 16384 characters")
 
 
-def _continuity_open(state: dict[str, object]) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-    """Return (unincorporated, unresolved judgments, latest judgments) in ledger order."""
+def _continuity_open(state: dict[str, object], *, latest: bool = True) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """Return (unincorporated, unresolved judgments, latest judgments) in ledger order.
+
+    Open evidence is never evicted, and every judgment that cites a hot observation or resolves a
+    hot judgment stays hot (``_hot_keep``), so the first two come from the hot lists alone. Latest
+    judgments combine hot judgments with ``settled.latest`` (``_judgment_keys``); ``latest=False``
+    skips them.
+    """
     data = state.get("evidence_continuity", {})
     judgments = data.get("judgments", [])
     incorporated = {(j["requirement_ref"], ref) for j in judgments for ref in j["observation_refs"]}
-    latest = {}
-    for judgment in judgments:
-        latest[(judgment["requirement_ref"], judgment["candidate"])] = judgment
     pending = [{"requirement_ref": ref, "observation_id": observation["id"], "candidate": observation["candidate"], "handoff_id": observation["handoff_id"]}
                for observation in data.get("observations", []) for ref in observation["requirement_refs"] if (ref, observation["id"]) not in incorporated]
     cited = {ref for j in judgments for ref in j["observation_refs"]}
@@ -1607,7 +3451,9 @@ def _continuity_open(state: dict[str, object]) -> tuple[list[dict[str, object]],
                for later in judgments[index + 1:]):
             continue
         unresolved.append({key: j[key] for key in ("id", "candidate", "requirement_ref", "outcome")})
-    latest_items = [{**{key: item[key] for key in ("id", "candidate", "requirement_ref", "outcome")}, "observation_ref_count": len(item["observation_refs"])} for item in latest.values()]
+    latest_items = [{"id": row[2], "candidate": candidate, "requirement_ref": requirement,
+                     "outcome": _JUDGMENT_OUTCOMES[row[3] % 4], "observation_ref_count": row[4]}
+                    for (requirement, candidate), row in _judgment_keys(state)] if latest else []
     return pending, unresolved, latest_items
 
 
@@ -1844,17 +3690,53 @@ def append_observations(state: dict[str, object], entries: list[tuple[str, dict[
     return _append_continuity_items(state, [("observations", actor, payload) for actor, payload in entries])
 
 
+def _continuity_referents(state: dict[str, object], additions: list[tuple[str, str | None, object]]) -> list[tuple[str, str]]:
+    """Evicted objects whose fields new continuity additions are checked against: the handoff of a new
+    observation, the parent of a new handoff and the judgments a new judgment addresses."""
+    if not _eviction_entries(state):
+        return []
+    index_map = _index_map(state)
+    wanted: list[tuple[str, str]] = []
+    for kind, _, value in additions:
+        if not isinstance(value, dict):
+            continue
+        if kind == "observations" and isinstance(value.get("handoff_id"), str) and value["handoff_id"] in index_map["handoffs"]:
+            wanted.append(("handoffs", value["handoff_id"]))
+        elif kind == "handoffs" and isinstance(value.get("parent_handoff_id"), str) and value["parent_handoff_id"] in index_map["handoffs"]:
+            wanted.append(("handoffs", value["parent_handoff_id"]))
+        elif kind == "judgments" and isinstance(value.get("judgment_refs"), list):
+            wanted.extend(("judgments", ref) for ref in value["judgment_refs"] if isinstance(ref, str) and ref in index_map["judgments"])
+    return wanted
+
+
 def _append_continuity_items(state: dict[str, object], additions: list[tuple[str, str | None, object]],
                              *, bump: bool = True, trusted: bool = False) -> list[str]:
     """Validate and commit continuity additions atomically in memory.
 
     ``trusted`` marks additions built by Core itself (gate overrides, mechanical
     observations, ingested typed claims); only those may carry Core-assigned fields.
+    Evicted objects the additions are checked against are re-hydrated first (see
+    ``_continuity_referents``); on any error ``state`` is left unchanged.
     """
+    wanted = _continuity_referents(state, additions)
+    if not wanted:
+        return _append_continuity_hot(state, additions, bump=bump, trusted=trusted)
+    snapshot = copy.deepcopy(state)
+    try:
+        _rehydrate_from_state(state, wanted)
+        return _append_continuity_hot(state, additions, bump=bump, trusted=trusted)
+    except BaseException:
+        state.clear()
+        state.update(snapshot)
+        raise
+
+
+def _append_continuity_hot(state: dict[str, object], additions: list[tuple[str, str | None, object]],
+                           *, bump: bool = True, trusted: bool = False) -> list[str]:
     stamp = state["revision"] + 1
     evidence_refs = copy.deepcopy(state["evidence_refs"])
     data = copy.deepcopy(state["evidence_continuity"]) if "evidence_continuity" in state else {name: [] for name in _CONTINUITY_KINDS}
-    known_sources = {item["id"] for item in evidence_refs}
+    known_sources = {item["id"] for item in evidence_refs} | _known_ids(state, "evidence_refs")
     appended: list[str] = []
     for batch_index, (kind, actor, value) in enumerate(additions):
         index = len(data[kind])
@@ -1866,7 +3748,7 @@ def _append_continuity_items(state: dict[str, object], additions: list[tuple[str
             raise _continuity_error(_errors.CONTINUITY_INVALID, "continuity objects carry no revision field", kind, index, item,
                                     field="revision", expected="omitted", extra={"batch_index": batch_index})
         assigned = sorted(_CORE_ASSIGNED_CONTINUITY_FIELDS[kind] & item.keys())
-        if kind == "observations" and item.get("provenance") == MECHANISM_PRODUCER:
+        if kind == "observations" and item.get("provenance") in (MECHANISM_PRODUCER, FOREIGN_RUNNER_PROVENANCE):
             assigned.append("provenance")
         if assigned and not trusted:
             raise _continuity_error(_errors.CONTINUITY_INVALID, "continuity field is assigned by Core", kind, index, item,
@@ -1944,6 +3826,22 @@ def task_get(root: Path, object_id: str) -> dict[str, object]:
         ("check", state.get("checks", [])),
     ) + tuple((kind, values) for kind, values in state.get("evidence_continuity", {}).items())
     matches = [(kind, item) for kind, values in collections for item in values if item.get("id") == identifier]
+    if not matches and _eviction_entries(state):
+        located = next(((name, bucket[identifier]) for name, bucket in _index_map(state).items() if identifier in bucket), None)
+        if located is not None:
+            # Evicted: the full object comes from its verified segment (a schema-10 stub inside it is
+            # completed from its own version-1 segment).
+            name, position = located
+            kind = _OBJECT_TYPES.get(name, name)
+            try:
+                item, sha = _evicted_object(root, state, name, identifier, position)
+                item = hydrate_archived(root, state, "verification_results" if name == "check_runs" else name, item)
+            except ThalirisError as exc:
+                if exc.details is not None:
+                    exc.details["object_type"] = kind
+                raise
+            return {"ok": True, "task_id": state["task_id"], "revision": state["revision"], "object_type": kind,
+                    "object": item, "archived": {"segment": sha, "evicted": True}}
     if len(matches) != 1:
         recovery = None
         if identifier == state["task_id"]:
@@ -1956,7 +3854,21 @@ def task_get(root: Path, object_id: str) -> dict[str, object]:
                             recovery=recovery,
                             details={"id": identifier, "matches": len(matches)})
     kind, item = matches[0]
-    return {"ok": True, "task_id": state["task_id"], "revision": state["revision"], "object_type": kind, "object": item}
+    response = {"ok": True, "task_id": state["task_id"], "revision": state["revision"], "object_type": kind, "object": item}
+    if isinstance(item, dict) and "archived" in item:
+        # The hot ledger holds a stub; the full object comes from its verified segment.
+        collection = _TASK_GET_COLLECTIONS.get(kind, kind)
+        try:
+            response["object"] = hydrate_archived(root, state, collection, item)
+        except ThalirisError as exc:
+            if exc.details is not None:
+                exc.details["object_type"] = kind
+            raise
+        response["archived"] = {"segment": item["archived"]}
+    return response
+
+
+_TASK_GET_COLLECTIONS = {"source": "evidence_refs", "record": "records", "verification": "verification_results"}
 
 
 def artifact_get(root: Path, artifact_id: str) -> dict[str, object]:
@@ -2004,6 +3916,8 @@ def _task_status_packet(state: dict[str, object], evidence_offset: int = 0, *, v
         raise ValueError("invalid status view")
     goal = str(state["goal"])
     artifact_ids = [str(item["id"]) for item in state["artifact_refs"]]
+    # Counts include evicted objects (hot plus archive index totals).
+    totals = _collection_totals(state)
     if view == "compact":
         continuity = state.get("evidence_continuity", {})
         packet: dict[str, object] = {
@@ -2021,11 +3935,11 @@ def _task_status_packet(state: dict[str, object], evidence_offset: int = 0, *, v
             "Active Work": state["active_work"],
             "Pending Results": state["pending_results"],
             "Counts": {
-                "records": len(state["records"]),
-                "sources": len(state["evidence_refs"]),
+                "records": totals["records"],
+                "sources": totals["evidence_refs"],
                 "artifacts": len(state["artifact_refs"]),
-                "verification_observations": len(state["verification_results"]),
-                **{kind: len(continuity.get(kind, [])) for kind in _CONTINUITY_KINDS},
+                "verification_observations": totals["verification_results"],
+                **{kind: totals.get(kind, len(continuity.get(kind, []))) for kind in _CONTINUITY_KINDS},
             },
             "Recent Artifact IDs": artifact_ids[-8:],
             "Evidence": evidence_summary(state, evidence_offset),
@@ -2045,10 +3959,10 @@ def _task_status_packet(state: dict[str, object], evidence_offset: int = 0, *, v
             "Active Work": state["active_work"],
             "Pending Results": state["pending_results"],
             "Counts": {
-                "records": len(state["records"]),
-                "sources": len(state["evidence_refs"]),
+                "records": totals["records"],
+                "sources": totals["evidence_refs"],
                 "artifacts": len(state["artifact_refs"]),
-                "verification_observations": len(state["verification_results"]),
+                "verification_observations": totals["verification_results"],
             },
             "Recent Artifact IDs": artifact_ids[-8:],
             "Active Artifact Count": len(_artifact_activity(state["artifact_refs"])),
@@ -2111,7 +4025,7 @@ def task_artifact(root: Path, base_revision: int, artifact_id: str, path: str, s
         check_revision(state, base_revision)
         if artifact_id in _task_object_ids(state):
             raise ValueError("task object id already exists")
-        known_sources = {str(item["id"]) for item in state["evidence_refs"]}
+        known_sources = _known_ids(state, "evidence_refs")
         refs = evidence_refs or []
         if any(ref not in known_sources for ref in refs):
             raise ValueError("artifact source reference is unknown")
@@ -2172,7 +4086,7 @@ def task_record_verification(root: Path, base_revision: int, result_id: str, kin
             raise ValueError("task object id already exists")
         if source_refs is not None and source_paths is not None:
             raise ValueError("provide source refs or source paths, not both")
-        known_sources = {str(item["id"]) for item in state["evidence_refs"]}
+        known_sources = _known_ids(state, "evidence_refs")
         refs = source_refs or []
         if not all(isinstance(ref, str) for ref in refs) or len(set(refs)) != len(refs) or any(ref not in known_sources for ref in refs):
             raise ValueError("verification source reference is unknown")
@@ -2251,6 +4165,10 @@ STATUS_CHECKS_MAX = 16
 USAGE_FIELDS = ("model", "effort", "input_tokens", "output_tokens", "total_tokens", "cost_usd", "duration_ms",
                 "tool_uses", "outcome")
 USAGE_OUTCOMES = ("completed", "failed", "disposed", "unknown")
+# Optional usage field (schema 12): how ``cost_usd`` was obtained. ``metered`` is billed per token;
+# ``subscription-notional`` is a list-price estimate for a subscription run that billed nothing per call.
+USAGE_OPTIONAL_FIELDS = ("cost_basis",)
+USAGE_COST_BASES = ("metered", "subscription-notional", "unknown")
 ADVISORY_DEFAULTS = {"max_files": 3, "max_changed_lines": 150, "controller_tool_output_tokens": 30_000}
 ADVISORY_LINE_COUNT_MAX_PATHS = 64
 ADVISORY_LINE_COUNT_MAX_FILE_BYTES = 1024 * 1024
@@ -2298,8 +4216,27 @@ def _files_digest(files: list[dict[str, object]]) -> str:
     return _canonical_sha256(sorted([str(item["path"]), str(item["sha256"])] for item in files))
 
 
+def _cross_host_fields(kind: str, item: dict[str, object]) -> list[str]:
+    """Schema-12 content of one continuity object (foreign-run fields, provenance, usage cost basis)."""
+    if kind == "handoffs":
+        found = sorted(FOREIGN_HANDOFF_FIELDS & item.keys())
+        usage = item.get("usage")
+        if isinstance(usage, dict) and set(USAGE_OPTIONAL_FIELDS) & usage.keys():
+            found.append("usage.cost_basis")
+        return found
+    if kind == "observations" and item.get("provenance") == FOREIGN_RUNNER_PROVENANCE:
+        return ["provenance"]
+    return []
+
+
 def _feature_schema(state: dict[str, object]) -> int:
     """The lowest schema version able to hold this state's content."""
+    data = state.get("evidence_continuity")
+    if isinstance(data, dict):
+        for kind in ("handoffs", "observations"):
+            values = data.get(kind)
+            if any(isinstance(item, dict) and _cross_host_fields(kind, item) for item in (values if isinstance(values, list) else [])):
+                return _CROSS_HOST_SCHEMA_VERSION
     if _SCHEMA9_STATE_FIELDS & state.keys():
         return _VERIFICATION_SCHEMA_VERSION
     results = state.get("verification_results")
@@ -2316,7 +4253,7 @@ def _feature_schema(state: dict[str, object]) -> int:
                 if fields & item.keys() or (kind == "observations" and item.get("provenance") == MECHANISM_PRODUCER):
                     return _VERIFICATION_SCHEMA_VERSION
                 local = local or (kind == "observations" and item.get("provenance") == "controller-local")
-    return _CONTROLLER_LOCAL_SCHEMA_VERSION if local else _STATE_SCHEMA_VERSION
+    return _CONTROLLER_LOCAL_SCHEMA_VERSION if local else _BASE_SCHEMA_VERSION
 
 
 def _refuse_reserved_actor(actor: str) -> None:
@@ -2431,8 +4368,11 @@ def _claims_marker_problem(value: object) -> str | None:
 
 
 def _usage_problem(value: object) -> str | None:
-    if not isinstance(value, dict) or set(value) != set(USAGE_FIELDS):
-        return "a usage record with exactly the fields " + ", ".join(USAGE_FIELDS) + " (unknown values are null)"
+    if not isinstance(value, dict) or set(value) - set(USAGE_OPTIONAL_FIELDS) != set(USAGE_FIELDS):
+        return ("a usage record with exactly the fields " + ", ".join(USAGE_FIELDS) + " (unknown values are null)"
+                " and optionally " + ", ".join(USAGE_OPTIONAL_FIELDS))
+    if "cost_basis" in value and value["cost_basis"] not in USAGE_COST_BASES:
+        return "`cost_basis` one of " + ", ".join(USAGE_COST_BASES) + " when present"
     for key in ("model", "effort"):
         if value[key] is not None and (not isinstance(value[key], str) or not value[key].strip() or len(value[key]) > 128):
             return f"`{key}` a non-empty string of at most 128 characters, or null"
@@ -2506,7 +4446,7 @@ def _validate_verification_state(state: dict[str, object]) -> None:
     """Cross-object rules for schema-9 content; runs after continuity validation."""
     results = state["verification_results"]
     uses = bool(_SCHEMA9_STATE_FIELDS & state.keys()) or any("check_id" in item for item in results)
-    if uses and state["schema_version"] != _VERIFICATION_SCHEMA_VERSION:
+    if uses and state["schema_version"] < _VERIFICATION_SCHEMA_VERSION:
         raise ThalirisError(_errors.TASK_STATE_INVALID, "verification-first records require task schema 9",
                             recovery="preserve the state and use a compatible reader")
     checks = state.get("checks", [])
@@ -2718,6 +4658,8 @@ def _mechanical_tamper(state: dict[str, object], view: dict[str, object]) -> lis
     """Observations still owed for changed check files: one per (check, new files digest)."""
     recorded = {(item["mechanism"]["check_id"], item["mechanism"]["files_digest"])
                 for item in state.get("evidence_continuity", {}).get("observations", []) if "mechanism" in item}
+    if _eviction_entries(state):
+        recorded |= _archive_totals(state).mechanism.keys()
     taken = _task_object_ids(state)
     pending: list[dict[str, object]] = []
     for entry in view["checks"]:
@@ -2925,7 +4867,7 @@ def declare_checks(root: Path, state: dict[str, object], actor: str, payload: di
         raise _capacity_error("checks", CHECKS_MAX, len(checks))
     if written:
         state["checks"] = checks
-        state["schema_version"] = _VERIFICATION_SCHEMA_VERSION
+        state["schema_version"] = max(state["schema_version"], _VERIFICATION_SCHEMA_VERSION)
         state["revision"] = revision
     return written
 
@@ -3061,8 +5003,10 @@ def record_check_run(root: Path, state: dict[str, object], actor: str, run: dict
             for item in state["verification_results"] if str(item["id"]) not in drop]
     snapshot = copy.deepcopy(state)
     try:
+        # Evicted results of this check older than the kept history are dropped as hot ones are.
+        _forget_check_runs(state, str(declaration["id"]), number - (CHECK_RESULT_HISTORY - 1))
         state["verification_results"] = kept + [result]
-        state["schema_version"] = _VERIFICATION_SCHEMA_VERSION
+        state["schema_version"] = max(state["schema_version"], _VERIFICATION_SCHEMA_VERSION)
         view = verification_view(root, state, tree=str(run["tree_identity"]))
         mechanical = record_check_tamper(root, state, view=view, bump=False)
         state["revision"] += 1
@@ -3119,10 +5063,15 @@ def task_verify(root: Path, actor: str, check_id: str, *, base_revision: int | N
 # --- close gate ---
 
 def _latest_requirement_judgments(state: dict[str, object]) -> dict[str, dict[str, object]]:
-    latest: dict[str, dict[str, object]] = {}
-    for judgment in state.get("evidence_continuity", {}).get("judgments", []):
-        latest[str(judgment["requirement_ref"])] = judgment
-    return latest
+    """Per requirement (in order of its first judgment), its latest judgment over hot and evicted judgments:
+    ``{id, requirement_ref, candidate, outcome, overridden}`` (what the close gate and surfacing read)."""
+    latest: dict[str, tuple[int, dict[str, object]]] = {}
+    for (requirement, candidate), (_, last, identifier, code, _) in _judgment_keys(state):
+        current = latest.get(requirement)
+        if current is None or last > current[0]:
+            latest[requirement] = (last, {"id": identifier, "requirement_ref": requirement, "candidate": candidate,
+                                          "outcome": _JUDGMENT_OUTCOMES[code % 4], "overridden": code >= 4})
+    return {requirement: item for requirement, (_, item) in latest.items()}
 
 
 def surfaced_requirements(state: dict[str, object]) -> dict[str, object]:
@@ -3143,7 +5092,7 @@ def surfaced_requirements(state: dict[str, object]) -> dict[str, object]:
         judgment = latest.get(str(requirement["id"]))
         entry: dict[str, object] = {"requirement": requirement["id"], "kind": kind, "latest_judgment": None if judgment is None else {
             "id": judgment["id"], "outcome": judgment["outcome"], "candidate": judgment["candidate"],
-            "overridden": "override_reason" in judgment}}
+            "overridden": judgment["overridden"]}}
         if uncovered:
             entry["reason"] = "no-declared-check"
         entries.append(entry)
@@ -3188,7 +5137,7 @@ def close_state(root: Path | None, state: dict[str, object], *, override_reason:
             if actor is not None:
                 closure["by"] = actor
             state["closure"] = closure
-            state["schema_version"] = _VERIFICATION_SCHEMA_VERSION
+            state["schema_version"] = max(state["schema_version"], _VERIFICATION_SCHEMA_VERSION)
             extras["closure"] = closure
             extras["changed"] = ["closure"] + (["evidence_continuity"] if mechanical else [])
             if mechanical:
@@ -3205,10 +5154,22 @@ def close_state(root: Path | None, state: dict[str, object], *, override_reason:
 
 # --- typed claims and handoff usage ---
 
-def _handoff(state: dict[str, object], handoff_id: object) -> dict[str, object]:
+def _handoff(state: dict[str, object], handoff_id: object, *, rehydrate: bool = True) -> dict[str, object]:
+    """Read a handoff, rehydrating an evicted one only when the caller intends to mutate it."""
     for item in state.get("evidence_continuity", {}).get("handoffs", []):
         if item["id"] == handoff_id:
             return item
+    if isinstance(handoff_id, str) and _eviction_entries(state):
+        located = _index_map(state)["handoffs"].get(handoff_id)
+        if located is not None:
+            root = _archive_roots.get().get(str(state["task_id"]))
+            if root is None:
+                raise _archive_unavailable(handoff_id, None, "no project root is known for this task")
+            if not rehydrate:
+                item, _ = _evicted_object(root, state, "handoffs", handoff_id, located)
+                return hydrate_archived(root, state, "handoffs", item)
+            _rehydrate(root, state, [("handoffs", handoff_id)])
+            return _handoff(state, handoff_id)
     raise ThalirisError(_errors.HANDOFF_NOT_FOUND, "handoff is not registered",
                         recovery="use the id of a handoff registered in this task; nothing was recorded",
                         details={"handoff_id": _preview(handoff_id)})
@@ -3245,9 +5206,20 @@ def ingest_claims(state: dict[str, object], handoff_id: str, text: object) -> di
     left as it is (``already_ingested``); a missing/malformed marker may be
     replaced once by a later readable block. One revision when anything is
     written; the caller writes the state.
+
+    A foreign-runner handoff (``executor_host`` set) takes claims only from its foreign result
+    (whose claim observations carry ``provenance="foreign-runner"``). Any other ingest, such as
+    the relay's own SubagentStop, changes nothing and
+    reports ``ingested_by: foreign-runner``: ``already_ingested`` once the result is recorded.
     """
-    handoff = _handoff(state, handoff_id)
-    parsed = parse_claim_block(text)
+    handoff = _handoff(state, handoff_id, rehydrate=False)
+    if "executor_host" in handoff:
+        return _foreign_ingest_refusal(handoff)
+    return _ingest_claims(state, _handoff(state, handoff_id), parse_claim_block(text))
+
+
+def _ingest_claims(state: dict[str, object], handoff: dict[str, object], parsed: dict[str, object],
+                   *, provenance: str | None = None) -> dict[str, object]:
     prior = handoff.get("claims")
     if prior is not None and (prior["status"] == "present" or parsed["status"] != "present"):
         return {"handoff_id": handoff["id"], "status": prior["status"], "already_ingested": True, "changed": False,
@@ -3280,6 +5252,8 @@ def ingest_claims(state: dict[str, object], handoff_id: str, text: object) -> di
             counted = {(support["requirement"], support["evidence"]) for other in data["handoffs"]
                        if other["candidate"] == handoff["candidate"] and other.get("claims", {}).get("status") == "present"
                        for support in other["claims"]["supports"]}
+            # Supports already counted on evicted handoffs of this candidate (dedupe keys in the index).
+            evicted_keys = _archive_totals(state).support_keys.get(str(handoff["candidate"]), set()) if _eviction_entries(state) else set()
             declared = {str(check["id"]) for check in state.get("checks", [])}
             supports: list[dict[str, object]] = []
             pending: list[dict[str, object]] = []
@@ -3288,7 +5262,7 @@ def ingest_claims(state: dict[str, object], handoff_id: str, text: object) -> di
                 assigned = claim["requirement"] in handoff["requirement_refs"]
                 if assigned and claim["polarity"] == "supports":
                     key = (claim["requirement"], claim["evidence"])
-                    if key in counted:
+                    if key in counted or (evicted_keys and _support_key(handoff["candidate"], claim["requirement"], claim["evidence"]) in evicted_keys):
                         duplicates += 1
                     else:
                         counted.add(key)
@@ -3304,6 +5278,7 @@ def ingest_claims(state: dict[str, object], handoff_id: str, text: object) -> di
             for identifier, claim in zip(ids, pending):
                 record = {key: claim[key] for key in ("requirement", "polarity", "basis", "evidence", "text_truncated", "normalized") if key in claim}
                 additions.append(("observations", str(handoff["producer"]), {
+                    **({"provenance": provenance} if provenance else {}),
                     "id": identifier, "candidate": handoff["candidate"], "handoff_id": handoff["id"],
                     "requirement_refs": [claim["requirement"]] if claim["assigned"] else [],
                     "source_refs": [identifier + ".s"], "text": claim["text"], "claim": record,
@@ -3316,7 +5291,7 @@ def ingest_claims(state: dict[str, object], handoff_id: str, text: object) -> di
                       "duplicates": duplicates, "supports": supports, "observations": ids}
             response.update(observations=ids, supports=_support_counts(supports), duplicates=duplicates)
         handoff["claims"] = marker
-        state["schema_version"] = _VERIFICATION_SCHEMA_VERSION
+        state["schema_version"] = max(state["schema_version"], _VERIFICATION_SCHEMA_VERSION, _feature_schema(state))
         if additions:
             _append_continuity_items(state, additions, bump=False, trusted=True)
         else:
@@ -3369,21 +5344,39 @@ def set_handoff_usage(state: dict[str, object], handoff_id: str, usage: object) 
     non-null value replaces the stored one, null or absent keeps it. One
     revision; the caller writes the state. Returns the stored usage.
     """
+    handoff = _handoff(state, handoff_id, rehydrate=False)
+    if "executor_host" in handoff:
+        # A foreign-runner handoff's usage is the foreign model's, recorded with its result
+        # (``record_foreign_result``); the relay's own stop report does not overwrite it.
+        _merged_usage(handoff, usage)  # still refuse a malformed report
+        return dict(handoff["usage"]) if isinstance(handoff.get("usage"), dict) else {field: None for field in USAGE_FIELDS}
+    merged = _merged_usage(handoff, usage)
     handoff = _handoff(state, handoff_id)
-    if not isinstance(usage, dict) or not usage or set(usage) - set(USAGE_FIELDS):
-        unknown = sorted(set(usage) - set(USAGE_FIELDS))[:8] if isinstance(usage, dict) else []
+    handoff["usage"] = merged
+    state["schema_version"] = max(state["schema_version"], _VERIFICATION_SCHEMA_VERSION, _feature_schema(state))
+    state["revision"] += 1
+    return merged
+
+
+def _merged_usage(handoff: dict[str, object], usage: object) -> dict[str, object]:
+    """The handoff's usage merged with a report (see ``set_handoff_usage``); HANDOFF_USAGE_INVALID when malformed."""
+    allowed = set(USAGE_FIELDS) | set(USAGE_OPTIONAL_FIELDS)
+    if not isinstance(usage, dict) or not usage or set(usage) - allowed:
+        unknown = sorted(set(usage) - allowed)[:8] if isinstance(usage, dict) else []
         raise ThalirisError(_errors.HANDOFF_USAGE_INVALID, "invalid handoff usage",
                             recovery="report only the listed fields; nothing was recorded",
-                            details={"expected": "a non-empty object with any of " + ", ".join(USAGE_FIELDS), "unknown_fields": unknown})
+                            details={"expected": "a non-empty object with any of " + ", ".join((*USAGE_FIELDS, *USAGE_OPTIONAL_FIELDS)),
+                                     "unknown_fields": unknown})
     prior = handoff.get("usage") or {}
     merged = {field: usage[field] if usage.get(field) is not None else prior.get(field) for field in USAGE_FIELDS}
+    for field in USAGE_OPTIONAL_FIELDS:
+        value = usage.get(field) if usage.get(field) is not None else prior.get(field)
+        if value is not None:
+            merged[field] = value
     problem = _usage_problem(merged)
     if problem:
         raise ThalirisError(_errors.HANDOFF_USAGE_INVALID, "invalid handoff usage",
                             recovery="correct the named field; nothing was recorded", details={"expected": problem})
-    handoff["usage"] = merged
-    state["schema_version"] = _VERIFICATION_SCHEMA_VERSION
-    state["revision"] += 1
     return merged
 
 
@@ -3396,10 +5389,438 @@ def task_handoff_usage(root: Path, handoff_id: str, input_file: str | dict[str, 
         state = _load_state(root, active=True)
         if base_revision is not None:
             check_revision(state, base_revision)
+        foreign = "executor_host" in _handoff(state, handoff_id, rehydrate=False)
         stored = set_handoff_usage(state, handoff_id, usage)
-        _write_state(root, state)
+        if not foreign:
+            _write_state(root, state)
+    if foreign:
+        return {**_task_ack(state, []), "handoff_id": handoff_id, "usage": stored,
+                "ignored": "foreign-runner usage is recorded with the foreign result"}
     return {**_task_ack(state, ["evidence_continuity"]), "handoff_id": handoff_id, "usage": stored}
 
+
+
+# --- cross-host managed children (schema 12) -------------------------------------------------------
+#
+# A Controller on one Host may dispatch a managed child to the other Host's model. That model runs as
+# a separate process (``claude -p`` or ``codex app-server``/``exec``) started by a deterministic
+# launcher in the dispatching adapter; a cheap relay subagent on the dispatching Host only carries
+# native notification and UI. Core records the run on the handoff (see FOREIGN_HANDOFF_FIELDS):
+#
+#   reserve_foreign_handoff  executor_host, prompt_sha256 (+ the prompt body), run_state reserved
+#   register_foreign_launch  foreign_session_hash and transport_agent_id_hash (set once), launched
+#   bind_foreign_session     the foreign Host's adapter recognises its pre-registered session: bound
+#   record_foreign_result    result_sha256 (+ body), result_source foreign-runner, claims, usage,
+#                            completed | failed
+#   cancel_foreign_run       cancelled (from reserved, launched or bound), with a bounded reason
+#
+# Every field is Core-assigned and every function runs under the ordinary task lock, revision and
+# validation rules. Nothing here grants authority: a binding only tells the foreign adapter which
+# handoff, role and candidate the session serves so it can deny Controller authority. Foreign-runner
+# handoffs cannot be the parent of another handoff (``FOREIGN_DELEGATION_REFUSED``). The prompt and
+# result bodies are content-addressed sidecar files ``tasks/<task id>/bodies/<sha256>.txt`` under the
+# context directory that eviction never moves. The protocol both adapters implement is
+# docs/thaliris-cross-host-protocol.md.
+
+_CONTEXT_DIR = _STATE_NAME.split("/")[0]
+
+
+def foreign_session_hash(session_id: str) -> str:
+    """The ``foreign_session_hash`` of a pre-registered foreign session id: sha256 of its UTF-8 bytes."""
+    if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 256 or _ALL_CONTROL_CHARACTERS.search(session_id):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid foreign session id",
+                            details={"expected": "a non-empty session id of at most 256 characters"})
+    try:
+        return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as exc:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid foreign session id",
+                            details={"expected": "UTF-8 text"}) from exc
+
+
+def _foreign_handoff_problem(item: dict[str, object]) -> str | None:
+    """Static coherence of a handoff's foreign-run fields (transition order is enforced by the API)."""
+    present = FOREIGN_HANDOFF_FIELDS & item.keys()
+    if not present:
+        return None
+    if item.get("executor_host") not in FOREIGN_HOSTS or not {"prompt_sha256", "run_state"} <= present:
+        return "executor_host claude|codex together with prompt_sha256 and run_state"
+    if item.get("producer") not in FOREIGN_READONLY_ROLES:
+        return "a read-only foreign role: " + ", ".join(FOREIGN_READONLY_ROLES)
+    if item["run_state"] not in FOREIGN_RUN_STATES:
+        return "run_state one of " + ", ".join(FOREIGN_RUN_STATES)
+    for field in ("foreign_session_hash", "transport_agent_id_hash", "prompt_sha256", "result_sha256"):
+        if field in item and not _is_hex64(item[field]):
+            return f"`{field}` a lowercase sha256 hex digest"
+    run = item["run_state"]
+    if run == "reserved" and "foreign_session_hash" in item:
+        return "no foreign_session_hash before the launch"
+    if run in ("launched", "bound", "completed", "failed") and not {"foreign_session_hash", "transport_agent_id_hash"} <= present:
+        return "foreign_session_hash and transport_agent_id_hash once launched"
+    if "foreign_session_hash" in present and "transport_agent_id_hash" not in present:
+        return "transport_agent_id_hash whenever a foreign session was registered"
+    result = {"result_sha256", "result_source"} & present
+    if result and (len(result) != 2 or item["result_source"] != FOREIGN_RESULT_SOURCE):
+        return "result_sha256 together with result_source foreign-runner"
+    if (run in ("completed", "failed")) != bool(result):
+        return "a recorded result exactly on a completed or failed run"
+    if ("claims" in item) != bool(result) or ("usage" in item and not result):
+        return "claims exactly on a recorded result and usage only on a recorded result"
+    if (run == "cancelled") != ("cancel_reason" in item):
+        return "a cancel_reason exactly on a cancelled run"
+    if "cancel_reason" in item and (not isinstance(item["cancel_reason"], str) or not item["cancel_reason"].strip()
+                                    or len(item["cancel_reason"]) > FOREIGN_CANCEL_REASON_MAX
+                                    or _ALL_CONTROL_CHARACTERS.search(item["cancel_reason"])):
+        return f"cancel_reason a single-line text of 1 to {FOREIGN_CANCEL_REASON_MAX} characters"
+    return None
+
+
+def _foreign_ingest_refusal(handoff: dict[str, object]) -> dict[str, object]:
+    recorded = handoff.get("result_source") == FOREIGN_RESULT_SOURCE
+    prior = handoff.get("claims") or {}
+    return {"handoff_id": handoff["id"], "status": prior.get("status", "pending"), "already_ingested": recorded, "changed": False,
+            "ingested_by": FOREIGN_RESULT_SOURCE,
+            "reason": ("already ingested by foreign runner" if recorded else
+                       "claims of a foreign-runner handoff are ingested from its foreign result only"),
+            "observations": [], "unassigned": [], "supports": _support_counts(prior.get("supports", [])), "duplicates": 0,
+            "total": prior.get("total", 0), "truncated": prior.get("truncated", False), "invalid": prior.get("invalid", 0)}
+
+
+def _foreign_handoff(state: dict[str, object], handoff_id: object) -> dict[str, object]:
+    handoff = _handoff(state, handoff_id, rehydrate=False)
+    if "executor_host" not in handoff:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "handoff is not run by a foreign Host",
+                            recovery="use the id of a handoff reserved with reserve_foreign_handoff; nothing was recorded",
+                            details={"handoff_id": handoff["id"]})
+    return handoff
+
+
+def _run_conflict(handoff: dict[str, object], operation: str, allowed: tuple[str, ...]) -> ThalirisError:
+    return ThalirisError(_errors.FOREIGN_RUN_STATE_CONFLICT, f"foreign run cannot {operation} from run_state {handoff['run_state']}",
+                         recovery="re-read the handoff; run states only move forward and each step happens once; nothing was recorded",
+                         details={"handoff_id": handoff["id"], "run_state": handoff["run_state"], "expected": list(allowed)})
+
+
+def _hash_argument(value: object, field: str) -> str:
+    if not _is_hex64(value):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, f"invalid {field}",
+                            details={"field": field, "expected": "a lowercase sha256 hex digest", "got": _preview(value)})
+    return str(value)
+
+
+def _body_path(root: Path, task_id: str, sha256: str) -> Path:
+    if str(uuid.UUID(task_id)) != task_id or not _is_hex64(sha256):
+        raise ValueError("invalid foreign body identity")
+    return _safe_without_final_symlink(root, f"{_CONTEXT_DIR}/tasks/{task_id}/bodies/{sha256}.txt")
+
+
+def _body_bytes(text: object, field: str, *, allow_empty: bool = False) -> bytes:
+    if not isinstance(text, str) or (not allow_empty and not text.strip()):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, f"invalid foreign {field}",
+                            details={"field": field, "expected": "text" + ("" if allow_empty else " that is not blank")})
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, f"invalid foreign {field}",
+                            details={"field": field, "expected": "UTF-8 text"}) from exc
+    if len(raw) > FOREIGN_BODY_MAX_BYTES:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, f"foreign {field} is too large",
+                            details={"field": field, "limit": FOREIGN_BODY_MAX_BYTES, "count": len(raw), "unit": "UTF-8 bytes"})
+    return raw
+
+
+def _write_body(root: Path, task_id: str, sha: str, raw: bytes) -> None:
+    """Write a content-addressed body before the state that names it (an orphan body is harmless)."""
+    try:
+        target = _body_path(root, task_id, sha)
+        if not target.exists():
+            _atomic_write(target, raw)
+            return
+        if target.is_file() and target.stat().st_size == len(raw) and _file_digest(target) == sha:
+            return
+    except (OSError, ValueError) as exc:
+        raise ThalirisError(_errors.FOREIGN_BODY_UNAVAILABLE, "foreign body could not be stored", details={"sha256": sha}) from exc
+    raise ThalirisError(_errors.FOREIGN_BODY_UNAVAILABLE, "foreign body path holds different bytes", details={"sha256": sha})
+
+
+def _state_root(state: dict[str, object], root: Path | None) -> Path:
+    root = root or _archive_roots.get().get(str(state.get("task_id")))
+    if root is None:
+        raise ThalirisError(_errors.FOREIGN_BODY_UNAVAILABLE, "foreign body location is unknown",
+                            recovery="load the task through Core (or pass root) so its bodies can be written; nothing was recorded")
+    return root
+
+
+def reserve_foreign_handoff(state: dict[str, object], record: object, *, executor_host: str, prompt: str,
+                            transport_agent_id_hash: str | None = None, root: Path | None = None) -> dict[str, object]:
+    """Register one handoff that a foreign Host's model will run (``run_state: reserved``).
+
+    ``record`` is an ordinary handoff registration (``id, parent_handoff_id, candidate, producer,
+    requirement_refs`` and optionally ``durable_paths``); Core adds ``executor_host``, the prompt
+    digest and ``run_state``, plus ``transport_agent_id_hash`` when the relay is already known. The
+    prompt body is stored before the state. A parent that is itself foreign is refused. One
+    revision; the caller writes the state.
+    """
+    if executor_host not in FOREIGN_HOSTS:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid executor host",
+                            details={"field": "executor_host", "expected": " or ".join(FOREIGN_HOSTS), "got": _preview(executor_host)})
+    if not isinstance(record, dict):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid foreign handoff registration", details={"expected": "a handoff object"})
+    if record.get("producer") not in FOREIGN_READONLY_ROLES:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid foreign handoff role",
+                            details={"field": "producer", "expected": list(FOREIGN_READONLY_ROLES)})
+    assigned = sorted(_CORE_ASSIGNED_CONTINUITY_FIELDS["handoffs"] & record.keys())
+    if assigned:
+        raise _continuity_error(_errors.CONTINUITY_INVALID, "continuity field is assigned by Core", "handoffs",
+                                len(_continuity(state)["handoffs"]), record, field=assigned[0], expected="omitted",
+                                extra={"fields": assigned})
+    raw = _body_bytes(prompt, "prompt")
+    sha = hashlib.sha256(raw).hexdigest()
+    item = {**record, "executor_host": executor_host, "prompt_sha256": sha, "run_state": "reserved"}
+    if transport_agent_id_hash is not None:
+        item["transport_agent_id_hash"] = _hash_argument(transport_agent_id_hash, "transport_agent_id_hash")
+    root = _state_root(state, root)
+    candidate = copy.deepcopy(state)
+    _append_continuity_items(candidate, [("handoffs", None, item)], trusted=True)
+    _write_body(root, str(state["task_id"]), sha, raw)
+    state.update(candidate)
+    return {"handoff_id": item["id"], "executor_host": executor_host, "prompt_sha256": sha, "run_state": "reserved"}
+
+
+def register_foreign_launch(state: dict[str, object], handoff_id: str, foreign_session_hash: str,
+                            transport_agent_id_hash: str) -> dict[str, object]:
+    """One-shot ``reserved -> launched``: pin the pre-registered foreign session and the relay identity.
+
+    Both are hashes. ``transport_agent_id_hash`` is set once: a value given at reservation must be
+    repeated exactly. A second launch, or a session hash a live run already holds, is refused. One
+    revision; the caller writes the state.
+    """
+    session = _hash_argument(foreign_session_hash, "foreign_session_hash")
+    transport = _hash_argument(transport_agent_id_hash, "transport_agent_id_hash")
+    handoff = _foreign_handoff(state, handoff_id)
+    if handoff["run_state"] != "reserved":
+        raise _run_conflict(handoff, "launch", ("reserved",))
+    if handoff.get("transport_agent_id_hash", transport) != transport:
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "relay identity does not match the reservation",
+                            recovery="launch the run from the relay the handoff was reserved for; nothing was recorded",
+                            details={"handoff_id": handoff["id"], "field": "transport_agent_id_hash"})
+    snapshot = copy.deepcopy(state)
+    try:
+        handoff.update(foreign_session_hash=session, transport_agent_id_hash=transport, run_state="launched")
+        _validate_continuity(state)
+        state["revision"] += 1
+    except BaseException:
+        state.clear()
+        state.update(snapshot)
+        raise
+    return {"handoff_id": handoff["id"], "run_state": "launched", "executor_host": handoff["executor_host"]}
+
+
+def bind_foreign_session(state: dict[str, object], foreign_session_hash: str) -> tuple[dict[str, object] | None, bool]:
+    """(binding, changed) for a session hash, or (None, False) when no hot handoff holds exactly this hash.
+
+    The first bind of a launched run moves it to ``bound`` (one revision; the caller writes the
+    state); every later bind returns the same binding unchanged. A settled run still binds, so its
+    adapter can keep denying authority. The binding carries no authority: ``authority`` is always
+    ``none`` and the session is a FOREIGN_CHILD of the named handoff and role.
+    """
+    session = _hash_argument(foreign_session_hash, "foreign_session_hash")
+    matches = [item for item in _continuity(state)["handoffs"] if item.get("foreign_session_hash") == session]
+    if not matches:
+        return None, False
+    live = [item for item in matches if item["run_state"] in FOREIGN_LIVE_RUN_STATES]
+    handoff = (live or matches)[-1]
+    changed = False
+    if handoff["run_state"] == "launched" and state.get("status") == "ACTIVE":
+        handoff["run_state"] = "bound"
+        state["revision"] += 1
+        changed = True
+    binding = {"binding": "FOREIGN_CHILD", "authority": "none", "task_id": state["task_id"], "handoff_id": handoff["id"],
+               "role": handoff["producer"], "candidate": handoff["candidate"], "requirement_refs": list(handoff["requirement_refs"]),
+               "parent_handoff_id": handoff["parent_handoff_id"], "executor_host": handoff["executor_host"],
+               "run_state": handoff["run_state"], "live": handoff["run_state"] in FOREIGN_LIVE_RUN_STATES}
+    return binding, changed
+
+
+def record_foreign_result(state: dict[str, object], handoff_id: str, result_text: str, claims_block: str | None = None,
+                          usage: dict[str, object] | None = None, *, outcome: str = "completed",
+                          root: Path | None = None) -> dict[str, object]:
+    """Record a foreign run's result once: ``launched|bound -> completed|failed``.
+
+    Stores the result body and digest with ``result_source: foreign-runner``, records ``usage``
+    (``USAGE_FIELDS`` plus optional ``cost_basis``; a null outcome takes the run outcome) and
+    ingests the ``thaliris-claims`` block of ``claims_block`` (default: ``result_text``) with
+    ``provenance: foreign-runner`` on every claim observation. This is the handoff's only claims
+    ingest. A second result is refused. One revision; the caller writes the state.
+    """
+    if outcome not in ("completed", "failed"):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid foreign run outcome",
+                            details={"field": "outcome", "expected": "completed or failed", "got": _preview(outcome)})
+    raw = _body_bytes(result_text, "result", allow_empty=True)
+    root = _state_root(state, root)
+    handoff = _foreign_handoff(state, handoff_id)
+    if "result_source" in handoff:
+        raise ThalirisError(_errors.FOREIGN_RUN_STATE_CONFLICT, "foreign result is already recorded",
+                            recovery="a foreign run records one result; nothing was recorded",
+                            details={"handoff_id": handoff["id"], "run_state": handoff["run_state"], "result_sha256": handoff["result_sha256"]})
+    if handoff["run_state"] not in ("launched", "bound"):
+        raise _run_conflict(handoff, "record a result", ("launched", "bound"))
+    parsed = parse_claim_block(result_text)
+    if claims_block is not None:
+        _body_bytes(claims_block, "claims_block", allow_empty=True)
+        if parse_claim_block(claims_block) != parsed:
+            raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "foreign claims block differs from the result body",
+                                details={"field": "claims_block", "expected": "the final fenced claims block from result_text or null"})
+    snapshot = copy.deepcopy(state)
+    try:
+        merged = None
+        if usage is not None:
+            report = dict(usage) if isinstance(usage, dict) else usage
+            if isinstance(report, dict) and report.get("outcome") is None:
+                report["outcome"] = outcome
+            merged = _merged_usage(handoff, report)
+        sha = hashlib.sha256(raw).hexdigest()
+        handoff.update(run_state=outcome, result_sha256=sha, result_source=FOREIGN_RESULT_SOURCE)
+        if merged is not None:
+            handoff["usage"] = merged
+        claims = _ingest_claims(state, handoff, parsed, provenance=FOREIGN_RUNNER_PROVENANCE)
+        state["schema_version"] = max(state["schema_version"], _CROSS_HOST_SCHEMA_VERSION)
+        _write_body(root, str(state["task_id"]), sha, raw)
+    except BaseException:
+        state.clear()
+        state.update(snapshot)
+        raise
+    return {"handoff_id": handoff["id"], "run_state": outcome, "result_sha256": sha, "result_source": FOREIGN_RESULT_SOURCE,
+            "usage": merged, "claims": {key: value for key, value in claims.items() if key != "changed"}}
+
+
+def cancel_foreign_run(state: dict[str, object], handoff_id: str, reason: str) -> tuple[dict[str, object], bool]:
+    """(response, changed): ``reserved|launched|bound -> cancelled`` with a bounded reason.
+
+    Cancelling a cancelled run changes nothing; a completed or failed run cannot be cancelled. One
+    revision when changed; the caller writes the state.
+    """
+    if (not isinstance(reason, str) or not reason.strip() or len(reason) > FOREIGN_CANCEL_REASON_MAX
+            or _ALL_CONTROL_CHARACTERS.search(reason)):
+        raise ThalirisError(_errors.FOREIGN_RUN_INVALID, "invalid cancel reason",
+                            details={"field": "reason", "expected": f"a single-line text of 1 to {FOREIGN_CANCEL_REASON_MAX} characters"})
+    handoff = _foreign_handoff(state, handoff_id)
+    if handoff["run_state"] == "cancelled":
+        return {"handoff_id": handoff["id"], "run_state": "cancelled", "already_cancelled": True,
+                "cancel_reason": handoff["cancel_reason"]}, False
+    if handoff["run_state"] not in FOREIGN_LIVE_RUN_STATES:
+        raise _run_conflict(handoff, "be cancelled", FOREIGN_LIVE_RUN_STATES)
+    snapshot = copy.deepcopy(state)
+    try:
+        handoff.update(run_state="cancelled", cancel_reason=reason)
+        _validate_continuity(state)
+        state["revision"] += 1
+    except BaseException:
+        state.clear()
+        state.update(snapshot)
+        raise
+    return {"handoff_id": handoff["id"], "run_state": "cancelled", "already_cancelled": False, "cancel_reason": reason}, True
+
+
+def foreign_body(root: Path, state: dict[str, object], handoff_id: str, kind: str = "prompt") -> str:
+    """The verified prompt or result body of a foreign-runner handoff (FOREIGN_BODY_UNAVAILABLE when unreadable)."""
+    if kind not in ("prompt", "result"):
+        raise ValueError("foreign body kind must be prompt or result")
+    handoff = _foreign_handoff(state, handoff_id)
+    sha = handoff.get(f"{kind}_sha256")
+    if sha is None:
+        raise ThalirisError(_errors.FOREIGN_BODY_UNAVAILABLE, f"foreign {kind} is not recorded",
+                            details={"handoff_id": handoff["id"], "run_state": handoff["run_state"]})
+
+    def unavailable(reason: str) -> ThalirisError:
+        return ThalirisError(_errors.FOREIGN_BODY_UNAVAILABLE, f"foreign {kind} body is unavailable",
+                             recovery="restore the body file with its exact bytes (its sha256 is its name); the ledger is intact",
+                             details={"handoff_id": handoff["id"], "sha256": sha, "reason": reason})
+    try:
+        target = _body_path(root, str(state["task_id"]), str(sha))
+        if not target.is_file():
+            raise FileNotFoundError(target)
+        with target.open("rb") as stream:
+            raw = stream.read(FOREIGN_BODY_MAX_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise unavailable("missing") from exc
+    except (OSError, ValueError) as exc:
+        raise unavailable("unreadable") from exc
+    if len(raw) > FOREIGN_BODY_MAX_BYTES:
+        raise unavailable("oversized")
+    if hashlib.sha256(raw).hexdigest() != sha:
+        raise unavailable("sha256 mismatch")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise unavailable("invalid UTF-8") from exc
+
+
+# Root-level, locked forms of the foreign-run functions. A supplied ``base_revision`` is enforced
+# strictly; without one the write is serialized by the task lock like ``task-observe``.
+
+def _foreign_transaction(root: Path, base_revision: int | None, body, *, active: bool = True, require_revision: bool = False):
+    root = _repo_root(root)
+    with _lock(root):
+        state = _load_state(root, active=active)
+        if base_revision is not None or require_revision:
+            check_revision(state, base_revision)
+        result, changed = body(root, state)
+        if changed:
+            _write_state(root, state)
+    return state, result, changed
+
+
+def task_foreign_reserve(root: Path, actor: str, base_revision: int, handoff: dict[str, object], *, executor_host: str,
+                         prompt: str, transport_agent_id_hash: str | None = None) -> dict[str, object]:
+    """Adapter-called: reserve a foreign-runner handoff (see ``reserve_foreign_handoff``); strict CAS."""
+    _bounded_label(actor, "continuity actor")
+    _refuse_reserved_actor(actor)
+    state, result, _ = _foreign_transaction(root, base_revision, lambda root, state: (reserve_foreign_handoff(
+        state, handoff, executor_host=executor_host, prompt=prompt, transport_agent_id_hash=transport_agent_id_hash, root=root), True),
+        require_revision=True)
+    return {**_task_ack(state, ["evidence_continuity"]), "foreign": result}
+
+
+def task_foreign_launch(root: Path, handoff_id: str, foreign_session_hash: str, transport_agent_id_hash: str,
+                        *, base_revision: int | None = None) -> dict[str, object]:
+    """Launcher-called: ``register_foreign_launch`` under the task lock."""
+    state, result, _ = _foreign_transaction(root, base_revision, lambda root, state: (register_foreign_launch(
+        state, handoff_id, foreign_session_hash, transport_agent_id_hash), True))
+    return {**_task_ack(state, ["evidence_continuity"]), "foreign": result}
+
+
+def task_foreign_bind(root: Path, foreign_session_hash: str, *, base_revision: int | None = None) -> dict[str, object]:
+    """Foreign-adapter-called: ``bind_foreign_session`` for the selected task (``binding`` null when none matches)."""
+    state, binding, changed = _foreign_transaction(root, base_revision, lambda root, state: bind_foreign_session(
+        state, foreign_session_hash), active=False)
+    return {**_task_ack(state, ["evidence_continuity"] if changed else []), "binding": binding}
+
+
+def task_foreign_result(root: Path, handoff_id: str, result_text: str, claims_block: str | None = None,
+                        usage: dict[str, object] | None = None, *, outcome: str = "completed",
+                        base_revision: int | None = None) -> dict[str, object]:
+    """Launcher-called: ``record_foreign_result`` under the task lock."""
+    state, result, _ = _foreign_transaction(root, base_revision, lambda root, state: (record_foreign_result(
+        state, handoff_id, result_text, claims_block, usage, outcome=outcome, root=root), True))
+    return {**_task_ack(state, ["evidence_continuity"]), "foreign": result}
+
+
+def task_foreign_cancel(root: Path, handoff_id: str, reason: str, *, base_revision: int | None = None) -> dict[str, object]:
+    """Adapter- or launcher-called: ``cancel_foreign_run`` under the task lock."""
+    state, result, changed = _foreign_transaction(root, base_revision, lambda root, state: cancel_foreign_run(state, handoff_id, reason))
+    return {**_task_ack(state, ["evidence_continuity"] if changed else []), "foreign": result}
+
+
+def task_foreign_body(root: Path, handoff_id: str, kind: str = "prompt") -> dict[str, object]:
+    """Launcher-called: the verified prompt (or result) body of a foreign-runner handoff of the selected task."""
+    root = _repo_root(root)
+    with _lock(root):
+        state = _load_state(root)
+        text = foreign_body(root, state, handoff_id, kind)
+        handoff = _foreign_handoff(state, handoff_id)
+    return {"ok": True, "task_id": state["task_id"], "handoff_id": handoff_id, "kind": kind,
+            "sha256": handoff[f"{kind}_sha256"], "run_state": handoff["run_state"], "role": handoff["producer"],
+            "candidate": handoff["candidate"], "executor_host": handoff["executor_host"], "text": text}
 
 # --- lane counter and advisories ---
 
@@ -3600,17 +6021,20 @@ def lane_advisories(root: Path | None, state: dict[str, object], contract: dict[
 def _verification_section(state: dict[str, object], view: dict[str, object] | None, live: bool) -> dict[str, object] | None:
     continuity = state.get("evidence_continuity", {})
     overrides = [item for item in continuity.get("judgments", []) if "override_reason" in item]
+    archived = _archive_totals(state) if _eviction_entries(state) else _Totals()
+    override_total = len(overrides) + archived.overrides
     requirements = continuity.get("requirements", [])
     kinds = any({"kind", "surface"} & item.keys() for item in requirements)
-    if view is None and not overrides and not kinds:
+    if view is None and not override_total and not kinds:
         return None
     section: dict[str, object] = {}
     if view is not None:
         entries = view["checks"]
         tallies = {status: sum(entry["status"] == status for entry in entries) for status in CHECK_STATUSES}
         ordered = sorted(entries, key=lambda entry: entry["status"] == "green")
-        recorded = {(item["mechanism"]["check_id"], item["mechanism"]["files_digest"]): item["id"]
-                    for item in continuity.get("observations", []) if "mechanism" in item}
+        recorded = dict(archived.mechanism)
+        recorded.update({(item["mechanism"]["check_id"], item["mechanism"]["files_digest"]): item["id"]
+                         for item in continuity.get("observations", []) if "mechanism" in item})
         section.update({
             "live": live, "tree_identity": view["tree_identity"] or ("NOT_COMPUTED" if live else TREE_UNKNOWN),
             "checks_total": len(entries), **tallies,
@@ -3633,11 +6057,12 @@ def _verification_section(state: dict[str, object], view: dict[str, object] | No
                      if item.get("kind", REQUIREMENT_KIND_DEFAULT) != REQUIREMENT_KIND_DEFAULT and item["id"] not in covered]
         if uncovered:
             section["uncovered_requirements"] = uncovered[:32]
-    if overrides or "closure" in state:
+    if override_total or "closure" in state:
+        # The last 8 overridden judgments always stay hot (``_hot_keep``).
         listed = [{"judgment_id": item["id"], "requirement_ref": item["requirement_ref"],
                    "override_reason": item["override_reason"][:160], "overridden_checks": [check["id"] for check in item["overridden_checks"]][:8]}
                   for item in overrides[-8:]]
-        section["overrides"] = {"total": len(overrides), "judgments": listed}
+        section["overrides"] = {"total": override_total, "judgments": listed}
         closure = state.get("closure")
         if closure is not None and closure["gate"] == "overridden":
             section["overrides"]["close"] = {"override_reason": closure["override_reason"][:160],
@@ -3646,67 +6071,65 @@ def _verification_section(state: dict[str, object], view: dict[str, object] | No
 
 
 def _claims_section(state: dict[str, object]) -> dict[str, object] | None:
+    """Claims totals over hot and evicted handoffs; the listed ids come from hot handoffs (the last 8
+    of each list always stay hot, see ``_hot_keep``)."""
     handoffs = [item for item in state.get("evidence_continuity", {}).get("handoffs", []) if "claims" in item]
-    if not handoffs:
+    archived = _archive_totals(state) if _eviction_entries(state) else _Totals()
+    if not handoffs and not archived.claims["ingested"]:
         return None
     without = [item["id"] for item in handoffs if item["claims"]["status"] != "present"]
-    supports: dict[str, int] = {}
+    supports: dict[str, int] = dict(archived.supports)
     for item in handoffs:
         for requirement, count in _support_counts(item["claims"].get("supports", [])).items():
             supports[requirement] = supports.get(requirement, 0) + count
     truncated = [item["id"] for item in handoffs if item["claims"].get("truncated")]
+    truncated_total = len(truncated) + archived.claims["truncated"]
     section: dict[str, object] = {
-        "handoffs_ingested": len(handoffs),
+        "handoffs_ingested": len(handoffs) + archived.claims["ingested"],
         "handoffs_without_typed_claims": {
-            "total": len(without), "ids": without[-8:],
-            "missing": sum(item["claims"]["status"] == "missing" for item in handoffs),
-            "malformed": sum(item["claims"]["status"] == "malformed" for item in handoffs)},
+            "total": len(without) + archived.claims["missing"] + archived.claims["malformed"], "ids": without[-8:],
+            "missing": sum(item["claims"]["status"] == "missing" for item in handoffs) + archived.claims["missing"],
+            "malformed": sum(item["claims"]["status"] == "malformed" for item in handoffs) + archived.claims["malformed"]},
         "supports": dict(sorted(supports.items())[:32]),
     }
-    if truncated:
-        section["handoffs_with_truncated_claims"] = {"total": len(truncated), "ids": truncated[-8:]}
+    if truncated_total:
+        section["handoffs_with_truncated_claims"] = {"total": truncated_total, "ids": truncated[-8:]}
     return section
 
 
 def _usage_totals(records: list[dict[str, object]]) -> dict[str, object]:
-    totals: dict[str, object] = {"handoffs": len(records)}
-    for field in ("input_tokens", "output_tokens", "total_tokens", "cost_usd", "duration_ms", "tool_uses"):
-        values = []
-        for record in records:
-            value = record[field]
-            if value is None and field == "total_tokens" and record["input_tokens"] is not None and record["output_tokens"] is not None:
-                value = record["input_tokens"] + record["output_tokens"]
-            if value is not None:
-                values.append(value)
-        totals[field] = (round(sum(values), 6) if field == "cost_usd" else sum(values)) if values else None
-    return totals
+    """Totals of usage records; cost is summed exactly and rounded once (see ``_UsageSum``)."""
+    totals = _UsageSum()
+    for record in records:
+        totals.add(record)
+    return totals.view()
 
 
-def _usage_groups(groups: dict[str, list[dict[str, object]]]) -> dict[str, object]:
-    ranked = sorted(groups.items(), key=lambda pair: (-len(pair[1]), pair[0]))
-    result = {name: {key: value for key, value in _usage_totals(records).items() if key in ("handoffs", "total_tokens", "cost_usd")}
-              for name, records in ranked[:8]}
+def _usage_groups(groups: dict[str, _UsageSum]) -> dict[str, object]:
+    ranked = sorted(((name, total) for name, total in groups.items() if total.handoffs), key=lambda pair: (-pair[1].handoffs, pair[0]))
+    result = {name: total.view() for name, total in ranked[:8]}
     if len(ranked) > 8:
-        rest = [record for _, records in ranked[8:] for record in records]
-        result["(other)"] = {key: value for key, value in _usage_totals(rest).items() if key in ("handoffs", "total_tokens", "cost_usd")}
+        rest = _UsageSum(_USAGE_GROUP_FIELDS)
+        for _, total in ranked[8:]:
+            rest.merge(total)
+        result["(other)"] = rest.view()
     return result
 
 
 def usage_summary(state: dict[str, object]) -> dict[str, object] | None:
-    """Small aggregate of adapter-reported dispatch usage: totals, by role (handoff producer) and by model."""
-    handoffs = [item for item in state.get("evidence_continuity", {}).get("handoffs", []) if "usage" in item]
-    if not handoffs:
+    """Small aggregate of adapter-reported dispatch usage: totals, by role (handoff producer) and by model.
+
+    Hot handoffs and the usage totals of evicted handoffs combine exactly. ``outcomes`` lists
+    outcomes in order of first appearance, evicted handoffs (oldest segment first) before hot ones.
+    """
+    totals = _archive_totals(state) if _eviction_entries(state) else _Totals()
+    for item in state.get("evidence_continuity", {}).get("handoffs", []):
+        if "usage" in item:
+            totals.add("handoffs", {"producer": item["producer"], "usage": item["usage"]})
+    if not totals.usage.handoffs:
         return None
-    by_role: dict[str, list[dict[str, object]]] = {}
-    by_model: dict[str, list[dict[str, object]]] = {}
-    outcomes: dict[str, int] = {}
-    for item in handoffs:
-        usage = item["usage"]
-        by_role.setdefault(str(item["producer"]), []).append(usage)
-        by_model.setdefault(str(usage["model"] or "unknown"), []).append(usage)
-        outcomes[str(usage["outcome"] or "unknown")] = outcomes.get(str(usage["outcome"] or "unknown"), 0) + 1
-    return {"totals": _usage_totals([item["usage"] for item in handoffs]), "by_role": _usage_groups(by_role),
-            "by_model": _usage_groups(by_model), "outcomes": outcomes}
+    return {"totals": totals.usage.view(), "by_role": _usage_groups(totals.by_role),
+            "by_model": _usage_groups(totals.by_model), "outcomes": {key: count for key, count in totals.outcomes.items() if count}}
 
 
 def _feature_sections(root: Path | None, state: dict[str, object], contract: dict[str, object] | None) -> dict[str, object]:
@@ -3724,6 +6147,9 @@ def _feature_sections(root: Path | None, state: dict[str, object], contract: dic
     usage = usage_summary(state)
     if usage is not None:
         sections["Usage"] = usage
+    archive = archive_summary(state)
+    if archive is not None:
+        sections["Archive"] = archive
     if contract is not None and contract.get("execution_mode") == "adaptive":
         sections["Advisories"] = lane_advisories(root, state, contract, view=view)
     return sections
@@ -3743,7 +6169,8 @@ def task_promote(root: Path, actor: str, base_revision: int, input_file: str | N
         check_revision(state, base_revision)
         sources = {str(item["id"]): item for item in state["evidence_refs"]}
         artifacts = {str(item["id"]): item for item in state["artifact_refs"]}
-        known_refs = set(sources) | set(artifacts)
+        evicted_sources = _index_map(state)["evidence_refs"] if _eviction_entries(state) else {}
+        known_refs = set(sources) | set(artifacts) | set(evicted_sources)
         writes: dict[str, bytes] = {}
         promoted: list[str] = []
         promotion_ids: set[str] = set()
@@ -3779,8 +6206,12 @@ def task_promote(root: Path, actor: str, base_revision: int, input_file: str | N
                 if key in described:
                     return
                 source = sources.get(source_id)
+                if source is None and source_id in evicted_sources:
+                    source, _ = _evicted_object(root, state, "evidence_refs", source_id, evicted_sources[source_id])
                 if source is None:
                     raise ValueError("artifact provenance source reference is unknown")
+                # Durable provenance needs the full locator and summary, never an archive preview.
+                source = hydrate_archived(root, state, "evidence_refs", source)
                 described.add(key)
                 descriptor = {
                     "type": "source",

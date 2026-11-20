@@ -9,14 +9,16 @@ from __future__ import annotations
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
+import shlex
+import stat
 import sys
 import time
 
 from thaliris import core
 
-from . import __version__, guards, roles, store
+from . import __version__, guards, roles, store, xhost
 
 AGENT_TOOLS = frozenset({"Agent", "Task"})
 SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
@@ -44,6 +46,12 @@ def runner_command() -> str:
     # The interpreter running this hook is the discovered Python >= 3.11; naming it
     # avoids depending on whichever `python` the Bash tool resolves.
     return f'"{Path(sys.executable).as_posix()}" "{runner_path()}"'
+
+
+def relay_command(handoff_id: str = '') -> str:
+    python = shlex.quote(Path(sys.executable).as_posix())
+    runner = shlex.quote(runner_path())
+    return f'{python} {runner} xhost-run --handoff {handoff_id}'
 
 
 def _deny(reason: str) -> dict:
@@ -245,7 +253,7 @@ def evidence_packet(root: Path, task_id: str) -> str | None:
 
 # ---------------------------------------------------------------- PreToolUse
 
-def _marker(prompt: str) -> dict | None:
+def _marker(prompt: str, *, foreign: bool = False) -> dict | None:
     found = _MARKER.findall(prompt)
     if not found:
         return None
@@ -255,7 +263,10 @@ def _marker(prompt: str) -> dict | None:
         value = json.loads(found[0])
     except ValueError as exc:
         raise Refusal("The `thaliris-evidence:` marker must be one line of JSON.") from exc
-    if (not isinstance(value, dict) or set(value) - {"candidate", "requirement_refs", "durable_paths"}
+    keys = {"candidate", "requirement_refs", "durable_paths"}
+    if foreign:
+        keys |= {"codex_model", "codex_effort"}
+    if (not isinstance(value, dict) or set(value) - keys
             or not isinstance(value.get("candidate"), str) or not value["candidate"]
             or not isinstance(value.get("requirement_refs", []), list)
             or not all(isinstance(ref, str) for ref in value.get("requirement_refs", []))
@@ -268,7 +279,11 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
     caller = _caller(payload)
     is_child, caller_role, agent_id = caller["child"], caller["role"], caller["agent_id"]
     # New dispatches resolve only from the verified registry: writing an agent file mints no role.
-    target_role = roles.role_for_agent_type(tool_input.get("subagent_type"))
+    agent_type = tool_input.get("subagent_type")
+    relay = roles.codex_relay(agent_type)
+    if relay is not None:
+        return _dispatch_codex(payload, tool_input, caller, relay)
+    target_role = roles.role_for_agent_type(agent_type)
     if target_role is None:
         if is_child and caller_role is not None:
             return _deny("Thaliris children delegate discovery only to a fresh `thaliris:investigator` Scanner; "
@@ -349,6 +364,72 @@ def _dispatch(payload: dict, tool_input: dict) -> dict | None:
     if entry["handoff_id"]:
         updated["prompt"] = prompt.rstrip() + f"\n\nthaliris-handoff: {entry['handoff_id']}"
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated}}
+
+
+def _dispatch_codex(payload: dict, tool_input: dict, caller: dict, relay: roles.RoleRegistration) -> dict:
+    session = store.native_id(payload.get('session_id'))
+    if caller['child'] or caller['foreign'] or payload.get('agent_type') or session is None or payload.get('permission_mode') == 'plan':
+        return _deny('Codex dispatch requires a managed Claude Controller outside plan mode.')
+    if any(tool_input.get(key) is not None for key in ('model', 'effort', 'isolation', 'resume', 'fork', 'remote')):
+        return _deny('Start a fresh local Codex dispatch. Select its model and effort in the evidence marker.')
+    prompt, tool_use_id = tool_input.get('prompt'), payload.get('tool_use_id')
+    if not isinstance(prompt, str) or not prompt.strip() or not isinstance(tool_use_id, str) or not tool_use_id:
+        return _deny('Codex dispatch requires a selected prompt and a native Agent tool-use id.')
+    association, problem = store.inspect_session(session)
+    if association is None:
+        return _deny(store.problem_text(problem) if problem else 'Codex dispatch needs an associated ACTIVE task.')
+    try:
+        marker = _marker(prompt, foreign=True)
+        if marker is None or not marker.get('requirement_refs') or marker.get('durable_paths'):
+            raise Refusal('Codex dispatch requires a thaliris-evidence marker with a candidate and requirement refs.')
+        model, effort = xhost.dispatch_options(marker)
+        selected = xhost.prompt_envelope(xhost.prompt_for(relay.id, prompt, marker), model, effort)
+        with store.transaction(*association) as ctx:
+            contract = ctx['authority']['contract']
+            if contract.get('execution_mode') == 'single-agent' or contract.get('execution_constraint') is not None:
+                raise Refusal('The frozen execution mode or model constraint does not permit Codex dispatch.')
+            entry = store.reserve(ctx, role=relay.id, subagent_type=tool_input['subagent_type'], tool_use_id=tool_use_id,
+                                  parent='controller', prompt=selected, model=relay.binding.model,
+                                  background=bool(tool_input.get('run_in_background')), association=marker,
+                                  role_binding=roles.codex_binding_snapshot(tool_input['subagent_type']),
+                                  foreign={'session_hash': core.foreign_session_hash(session), 'model': model, 'effort': effort,
+                                           'base_revision': ctx['state']['revision']})
+    except (Refusal, ValueError, RuntimeError, OSError) as exc:
+        return _deny(f'Codex dispatch refused: {exc}')
+    command = relay_command(entry['handoff_id'])
+    updated = {**tool_input, 'description': f'Codex {relay.id}', 'prompt':
+               f'Run this exact Bash command once in the foreground (timeout 600000 ms):\n\n{command}\n\n'
+               'Return the summary only. Do not add claims or retry.'}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated}}
+
+
+def _relay_tool(payload: dict) -> dict:
+    tool_input = payload.get('tool_input')
+    if (payload.get('tool_name') != 'Bash' or payload.get('permission_mode') == 'plan'
+            or not isinstance(tool_input, dict) or tool_input.get('run_in_background')
+            or tool_input.get('dangerouslyDisableSandbox')):
+        return _deny('A Codex relay may only run its exact foreground launcher command.')
+    command = tool_input.get('command')
+    prefix = relay_command()
+    handoff_id = command.removeprefix(prefix) if isinstance(command, str) and command.startswith(prefix) else ''
+    session, agent = store.native_id(payload.get('session_id')), store.native_id(payload.get('agent_id'))
+    if not re.fullmatch(r'H[0-9a-f]{8}', handoff_id) or session is None or agent is None or store.foreign_signal():
+        return _deny('The launcher command or its native relay identity could not be verified.')
+    association = store.resolve_session(session)
+    if association is None:
+        return _deny('The relay has no associated ACTIVE task.')
+    try:
+        root, task_id = association
+        with store.transaction(root, task_id) as ctx:
+            store.bind_from_host(ctx, agent, payload.get('agent_type'), payload.get('transcript_path'))
+            xhost.authorize_relay(ctx, handoff_id, session, agent)
+    except (ValueError, OSError, RuntimeError) as exc:
+        return _deny(f'Codex relay refused: {exc}')
+    suffix = f' --task-id {task_id} --native-session {session} --native-agent {agent}'
+    output = {'hookEventName': 'PreToolUse', 'updatedInput': {**tool_input, 'command': command + suffix, 'timeout': 600000}}
+    if _approve_runner(payload, 'xhost-run'):
+        output.update(permissionDecision='allow', permissionDecisionReason='Exact launcher for this managed Codex relay')
+    return {'hookSpecificOutput': output}
 
 
 APPROVE_SETTING = "CLAUDE_PLUGIN_OPTION_AUTO_APPROVE_RUNNER"
@@ -470,6 +551,8 @@ def _shell(payload: dict, tool_input: dict) -> dict | None:
         if invocation["forged_identity"]:
             return _deny("`--native-session` and `--native-agent` are supplied by the adapter hook; remove them.")
         subcommand = invocation["subcommand"]
+        if subcommand == 'xhost-run':
+            return _deny('Only the matching native Codex relay may run this launcher.')
         if caller["foreign"] and subcommand not in guards.READ_ONLY_COMMANDS:
             return _deny(f"`{subcommand}` establishes or uses Thaliris authority, and this session is an unmanaged foreign "
                          f"session ({caller['foreign']}): it was spawned by another agent and is UNKNOWN, not the Controller. "
@@ -591,8 +674,101 @@ def _mcp(payload: dict, tool: str) -> dict | None:
     return _deny(reason) if reason else None
 
 
+def _incoming_cwd_matches(root: Path, cwd: object) -> bool:
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd or any(part == ".." for part in cwd.replace("\\", "/").split("/")):
+        return False
+    path = Path(cwd)
+    if not path.is_absolute():
+        return False
+    try:
+        return os.path.normcase(str(path.resolve(strict=True))) == os.path.normcase(str(root.resolve(strict=True)))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _incoming_reparse(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+
+def _incoming_path_in_root(root: Path, value: object) -> bool:
+    if (not isinstance(value, str) or not value or "\x00" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        return False
+    if any(part == ".." for part in value.replace("\\", "/").split("/")):
+        return False
+    path = Path(value)
+    windows = PureWindowsPath(value)
+    if windows.drive and ":" in value[len(windows.drive):]:  # reject Windows alternate data streams
+        return False
+    if not path.is_absolute():
+        if windows.drive or windows.root or ":" in value:
+            return False
+        try:
+            path = root.resolve(strict=True) / path
+        except (OSError, RuntimeError, ValueError):
+            return False
+    try:
+        root = root.resolve(strict=True)
+        relative = path.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    current = root
+    for part in relative.parts:
+        if part in ("", "."):
+            continue
+        current = current / part
+        if _incoming_reparse(current):
+            return False
+    try:
+        return path.resolve(strict=False).is_relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _incoming_pattern_is_scoped(value: object) -> bool:
+    if (not isinstance(value, str) or not value or "\x00" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        return False
+    if any(part == ".." for part in value.replace("\\", "/").split("/")):
+        return False
+    windows = PureWindowsPath(value)
+    return not windows.drive and not windows.root and not Path(value).is_absolute()
+
+
+def _incoming_read_allowed(tool: object, tool_input: object, root: Path) -> bool:
+    if not isinstance(tool_input, dict):
+        return False
+    if tool == "Read":
+        return _incoming_path_in_root(root, tool_input.get("file_path"))
+    if tool not in {"Grep", "Glob"}:
+        return False
+    if "path" in tool_input:
+        if not _incoming_path_in_root(root, tool_input["path"]):
+            return False
+    if tool == "Grep":
+        return (isinstance(tool_input.get("pattern"), str)
+                and ("glob" not in tool_input or _incoming_pattern_is_scoped(tool_input["glob"])))
+    return _incoming_pattern_is_scoped(tool_input.get("pattern"))
+
+
 def pre_tool_use(payload: dict) -> dict | None:
     tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
+    session = payload.get('session_id')
+    if xhost.is_incoming(session):
+        context = xhost.incoming_context(session)
+        if (tool in ('Read', 'Grep', 'Glob') and payload.get('agent_id') is None and context is not None
+                and _incoming_cwd_matches(context[1], payload.get('cwd'))
+                and _incoming_read_allowed(tool, tool_input, context[1])):
+            return None
+        return _deny('Foreign Claude sessions may only use Read, Grep and Glob within the exact bound project root.')
+    if xhost.relay_identity(payload):
+        return _relay_tool(payload)
     if isinstance(tool, str) and tool.startswith("mcp__"):
         return _mcp(payload, tool)
     if not isinstance(tool_input, dict):
@@ -634,7 +810,7 @@ def _record_usage(association: tuple[Path, str], match, measured: dict, outcome:
     try:
         with store.transaction(*association) as ctx:
             entry = match(ctx["lifecycle"])
-            if entry is None or not entry.get("handoff_id") or store.handoff(ctx["state"], entry["handoff_id"]) is None:
+            if entry is None or entry.get('foreign') or not entry.get("handoff_id") or store.handoff(ctx["state"], entry["handoff_id"]) is None:
                 return None
             usage = {"model": entry.get("observed_model") or entry.get("requested_model"), "effort": entry.get("requested_effort"),
                      **measured, "outcome": "disposed" if entry["disposed"] else outcome}
@@ -840,6 +1016,10 @@ def post_tool_use(payload: dict) -> dict | None:
                 ctx["lifecycle_changed"] = True
             store.record_host_facts(ctx, entry, payload.get("transcript_path"))
             summary = entry
+    if summary and summary.get('foreign') and status == 'completed':
+        xhost.cancel_runs(association, lambda item: item['tool_use_id'] == payload.get('tool_use_id'),
+                          'Native Codex relay returned before a result')
+        revision = core._load_state(root)['revision']
     if payload.get("agent_id") is not None:
         return None  # A nested Scanner result belongs to its parent; global evidence stays with the Controller.
     lines = [gaps] if gaps else []
@@ -873,6 +1053,7 @@ def post_tool_use_failure(payload: dict) -> dict | None:
     association = store.resolve_session(payload.get("session_id"))
     if association is None:
         return None
+    xhost.cancel_runs(association, lambda item: item['tool_use_id'] == payload.get('tool_use_id'), 'Native Agent tool failed or was interrupted')
     with store.transaction(*association, observe_only=True) as ctx:
         for entry in ctx["lifecycle"]["dispatches"]:
             if entry["tool_use_id"] == payload.get("tool_use_id"):
@@ -907,6 +1088,8 @@ def subagent_start(payload: dict) -> dict | None:
         return _context("SubagentStart", gaps + " Keep decision-changing observations, with their sources, in your final report.")
     if agent_id is None or not _managed_child_type(payload, association):
         return None
+    if roles.codex_relay(payload.get('agent_type')) is not None:
+        return None  # The relay receives its exact command from Agent PreToolUse, with no task context.
     lines = [f"Thaliris runner for this session: `{runner_command()}` (run it as one direct command)."]
     entry, closed = None, None
     if association is not None:
@@ -1104,7 +1287,8 @@ def subagent_stop(payload: dict) -> dict | None:
     if _interim_stop(association, agent_id, payload):
         return None  # not the final report: no claims are ingested and the handoff stays open until the real completion
     message = payload.get("last_assistant_message")
-    claims, diagnostic = _ingest_claims(association, agent_id, payload, message)
+    relay = roles.codex_relay(payload.get('agent_type'))
+    claims, diagnostic = (None, None) if relay else _ingest_claims(association, agent_id, payload, message)
     with store.transaction(*association, observe_only=True) as ctx:
         entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
         if entry is not None:
@@ -1113,6 +1297,8 @@ def subagent_stop(payload: dict) -> dict | None:
             store.set_status(ctx, entry, "stopped", final_message_chars=len(message) if isinstance(message, str) else None,
                              **({"claims": claims} if claims else {}))
             store.record_host_facts(ctx, entry, payload.get("transcript_path"))
+    if relay is not None:
+        xhost.cancel_runs(association, lambda item: item['agent_id'] == agent_id, 'Native Codex relay stopped before a result')
     return None
 
 
@@ -1129,7 +1315,8 @@ def _ingest_claims(association: tuple[Path, str], agent_id: str, payload: dict, 
         with store.transaction(*association) as ctx:  # ledger write: authority check, then re-anchor on change
             entry = store.bind_from_host(ctx, agent_id, payload.get("agent_type"), payload.get("transcript_path"))
             if (entry is None or entry["binding"] not in store.EXACT_BINDINGS or not entry.get("handoff_id") or entry["disposed"]
-                    or entry["native_status"] in store.TERMINAL_STATUSES or store.handoff(ctx["state"], entry["handoff_id"]) is None):
+                    or entry.get('foreign') or entry["native_status"] in store.TERMINAL_STATUSES
+                    or store.handoff(ctx["state"], entry["handoff_id"]) is None):
                 return None, None
             kept = entry.get("interim_claims") if isinstance(entry.get("interim_claims"), dict) else None
             if kept and isinstance(kept.get("message"), str) and core.parse_claim_block(message)["status"] != "present":
@@ -1262,6 +1449,14 @@ def _mode_preference() -> str:
 
 
 def session_start(payload: dict) -> dict | None:
+    session = payload.get('session_id')
+    if xhost.is_incoming(session):
+        binding = xhost.incoming_binding(session)
+        if binding is None:
+            return _context('SessionStart', 'Foreign Claude session has no live exact managed binding. No tools or Thaliris authority are available.')
+        return _context('SessionStart', f"You are the managed foreign Claude {binding['role']} for handoff {binding['handoff_id']}. "
+                        'Use Read, Grep and Glob only. Keep evidence and claims in your final report for the launcher. '
+                        'You have no Controller authority or delegation capability.')
     foreign = store.foreign_signal()
     if foreign:
         # Never the Controller guidance: this session was spawned by another agent and is not bound to Thaliris.
@@ -1320,7 +1515,7 @@ def user_prompt_submit(payload: dict) -> dict | None:
     it changed since the session last saw it; an unchanged packet repeated every
     turn is noise, not continuity.
     """
-    if payload.get("agent_id") is not None or store.foreign_signal():
+    if payload.get("agent_id") is not None or store.foreign_signal() or xhost.has_selector(payload.get('session_id')):
         return None
     association = store.resolve_session(payload.get("session_id"))
     if association is not None:
@@ -1365,10 +1560,21 @@ def user_prompt_submit(payload: dict) -> dict | None:
     return _context("UserPromptSubmit", "\n".join(lines)) if lines else None
 
 
+def session_end(payload: dict) -> None:
+    session = store.native_id(payload.get('session_id'))
+    if session is None or payload.get('agent_id') is not None or store.foreign_signal() or xhost.has_selector(session):
+        return
+    association = store.resolve_session(session)
+    if association is not None:
+        digest = core.foreign_session_hash(session)
+        xhost.cancel_runs(association, lambda item: (item.get('foreign') or {}).get('session_hash') == digest,
+                          'Dispatching Claude session ended')
+
+
 HANDLERS = {
     "PreToolUse": pre_tool_use, "PostToolUse": post_tool_use, "PostToolUseFailure": post_tool_use_failure,
     "SubagentStart": subagent_start, "SubagentStop": subagent_stop, "SessionStart": session_start,
-    "UserPromptSubmit": user_prompt_submit,
+    "UserPromptSubmit": user_prompt_submit, "SessionEnd": session_end,
 }
 
 
@@ -1382,9 +1588,13 @@ def _load_project_roles(payload: dict) -> None:
 def _fail_closed(event: str, payload: dict) -> bool:
     """A crashed hook must not silently admit a managed Thaliris dispatch."""
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-    return (event == "PreToolUse" and payload.get("tool_name") in AGENT_TOOLS
-            and roles.role_for_agent_type(tool_input.get("subagent_type")) is not None
-            and store.read_session(payload.get("session_id")) is not None)
+    return event == 'PreToolUse' and (xhost.is_incoming(payload.get('session_id'))
+            or roles.codex_relay(payload.get('agent_type')) is not None
+            or (payload.get('agent_type') is None and store.native_id(payload.get('agent_id')) is not None
+                and store.read_session(payload.get('session_id')) is not None)
+            or (payload.get('tool_name') in AGENT_TOOLS and (roles.codex_relay(tool_input.get('subagent_type')) is not None
+                or (roles.role_for_agent_type(tool_input.get('subagent_type')) is not None
+                    and store.read_session(payload.get('session_id')) is not None))))
 
 
 def main(event: str) -> int:
@@ -1396,8 +1606,11 @@ def main(event: str) -> int:
         return 0
     started, error = time.perf_counter(), None
     try:
-        _load_project_roles(payload)
-        result = HANDLERS[event](payload)
+        if xhost.is_incoming(payload.get('session_id')):
+            result = HANDLERS[event](payload) if event in ('SessionStart', 'PreToolUse') else None
+        else:
+            _load_project_roles(payload)
+            result = HANDLERS[event](payload)
     except Exception as exc:  # Hooks degrade to transparent, except managed dispatch.
         error = f"{type(exc).__name__}: {exc}"
         print(f"thaliris hook {event} failed: {error}", file=sys.stderr)

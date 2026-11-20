@@ -92,6 +92,16 @@ def _associated(session_id):
     return os.path.isfile(os.path.join(_home(), "sessions", key + ".json"))
 
 
+def _foreign_session(session_id):
+    if os.environ.get("THALIRIS_FOREIGN_CHILD", "").strip() == "1":
+        return True
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    selector = os.path.join(os.path.expanduser("~"), ".thaliris", "xhost-sessions", key + ".json")
+    return os.path.lexists(selector)
+
+
 def _degraded_decision(data):
     """Without a working runtime, ordinary work stays transparent (a broken guard must
     not lock the Host, H057/H088). Only actions that would silently lose their guard
@@ -105,7 +115,10 @@ def _degraded_decision(data):
     tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     reason = None
-    if tool in ("Agent", "Task") and str(tool_input.get("subagent_type", "")).startswith("thaliris:") and _associated(payload.get("session_id")):
+    if (_foreign_session(payload.get("session_id")) or str(payload.get("agent_type", "")).startswith("thaliris:codex-")
+            or (tool in ("Agent", "Task") and str(tool_input.get("subagent_type", "")).startswith("thaliris:codex-"))):
+        reason = "Thaliris runtime is unavailable, so this foreign session or relay cannot be verified."
+    elif tool in ("Agent", "Task") and str(tool_input.get("subagent_type", "")).startswith("thaliris:") and _associated(payload.get("session_id")):
         reason = "Thaliris runtime is unavailable, so this managed dispatch cannot be reserved or bound. Repair the plugin runtime first; ordinary work is unaffected."
     elif payload.get("agent_type") == "thaliris:reviewer" and tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         reason = "The reviewer role is non-writing (Thaliris runtime unavailable; refusing conservatively)."

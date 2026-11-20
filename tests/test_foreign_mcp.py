@@ -80,10 +80,10 @@ def test_mcp_classification():
         "spawn", "spawn", "read", "read", "read", "mutating", "mutating", "read", "read", "unknown", "unknown"]
 
 
-def test_hooks_json_registers_the_mcp_matcher_behind_the_filter():
+def test_hooks_json_filters_all_tools_including_mcp_and_unknown_foreign_tools():
     groups = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
-    mcp = [group for group in groups if group["matcher"] == "mcp__.*"]
-    assert len(mcp) == 1 and mcp[0]["hooks"][0]["command"].endswith('thaliris-hook" PreToolUse --filter')
+    assert len(groups) == 1 and groups[0]["matcher"] == "*"
+    assert groups[0]["hooks"][0]["command"].endswith('thaliris-hook" PreToolUse --filter')
 
 
 # ------------------------------------------------------- B. foreign-session demotion
@@ -117,25 +117,26 @@ def test_foreign_session_gets_no_controller_guidance(task, monkeypatch):
 def test_foreign_session_cannot_establish_or_use_authority(task, monkeypatch, signal):
     task_id = task["task_id"]
     monkeypatch.setenv(*signal)
-    # Hook layer: a Controller command through the runner is refused, a read-only view still passes.
+    managed_launcher_marker = signal[0] == store.FOREIGN_MARKER
+    # Both deny authority. A launcher-marked session also has no runner capability.
     for command in (f"attach --task-id {task_id} --reason x", "task-start g", "close --base-revision 1", "judge --base-revision 1",
                     "dispose --id H1", "mode --mode delegated", "observe --text x", "register --base-revision 1", "bootstrap"):
         call = _tool(task, "Bash", {"command": f"{hooks.runner_command()} {command}"})
         call["session_id"] = OTHER
         denied = run_hook("PreToolUse", call)
-        assert _decision(denied) == "deny" and "foreign" in _reason(denied), command
+        assert _decision(denied) == "deny" and "foreign" in _reason(denied).lower(), command
         assert "updatedInput" not in denied["hookSpecificOutput"]
     status = _tool(task, "Bash", {"command": f"{hooks.runner_command()} status"})
     status["session_id"] = OTHER
-    assert _decision(run_hook("PreToolUse", status)) == "allow"
+    assert _decision(run_hook("PreToolUse", status)) == ("deny" if managed_launcher_marker else "allow")
     # Runner layer: the backstop when the hook is bypassed (`python -m thaliris_claude ... --native-session x`).
     for command in (["attach", "--task-id", task_id, "--reason", "x"], ["task-start", "g", "--human-instruction", "i"],
                     ["close", "--base-revision", "1"], ["bootstrap"]):
         code, out = run_cli(*command, session=OTHER)
-        assert code != 0 and "FOREIGN_SESSION" in out["error"], command
+        assert code != 0 and ("FOREIGN_CHILD" if managed_launcher_marker else "FOREIGN_SESSION") in out["error"], command
     assert store.read_session(OTHER) is None
     code, _ = run_cli("status", "--task-id", task_id, session=OTHER)
-    assert code == 0
+    assert (code != 0) == managed_launcher_marker
 
 
 def test_an_ordinary_session_can_still_attach_and_task_start(task):
@@ -153,11 +154,12 @@ def test_generic_subagent_writes_by_session_kind(task, monkeypatch):
     target = str(task["root"] / "app.py")
     write = _tool(task, "Write", {"file_path": target, "content": "x"}, agent_id="g", agent_type="general-purpose")
     assert hooks._caller(write)["writes"] is None and run_hook("PreToolUse", write) is None  # ordinary session: unchanged
-    for signal in ((store.BRIDGE_DEPTH, "1"), (store.FOREIGN_MARKER, "1")):
+    for signal, reason in (((store.BRIDGE_DEPTH, "1"), "non-writing"),
+                           ((store.FOREIGN_MARKER, "1"), "only use Read, Grep and Glob")):
         monkeypatch.setenv(*signal)
         assert hooks._caller(write)["writes"] is False
         denied = run_hook("PreToolUse", write)
-        assert _decision(denied) == "deny" and "non-writing" in _reason(denied)
+        assert _decision(denied) == "deny" and reason in _reason(denied)
         monkeypatch.delenv(signal[0])
 
 

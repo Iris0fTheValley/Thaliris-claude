@@ -2,18 +2,13 @@
 # Hook entry for Claude Code (invoked as `sh .../thaliris-hook <Event> [--filter]`,
 # the same convention as Anthropic's own plugins).
 #
-# Bash/Edit/Write calls are most of a session's tool calls, and the plugin is
-# user-scoped, so this entry first decides without Python whether the adapter
-# could have anything to say. `--filter` passes a call on only when its payload
-# mentions Thaliris, `.context`, `.project-identity`, settings, the lifecycle file or the role registry; every decision
-# the Python guards can make for such a call needs one of those (a Thaliris
-# child's agent_type contains "thaliris"; the one exception, a foreign session, is below). UserPromptSubmit runs every turn and
-# is skipped while no session has a Thaliris task. With a cached Python >= 3.11
-# the rest starts one interpreter; on a cache miss any Python runs the launcher,
-# which discovers and caches one. With no Python the hook stays transparent.
+# The user-scoped PreToolUse hook has a fast path for unrelated tools. Foreign
+# sessions and relays need the hook for every tool. Agent routing and messaging
+# also need Python even when the payload does not mention Thaliris.
 event=$1
 bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 home=${THALIRIS_CLAUDE_HOME:-$HOME/.thaliris/claude}
+selectors=${USERPROFILE:-$HOME}/.thaliris/xhost-sessions
 
 has_task() {
   for association in "$home"/sessions/*.json; do
@@ -46,12 +41,30 @@ if [ "$2" = "--lane" ]; then
   esac
 fi
 [ "$2" = "--lane" ] || payload=$(cat)
-# A session spawned by another agent (AGENT_BRIDGE_DEPTH, THALIRIS_FOREIGN_CHILD) is judged by Python alone: its generic
-# subagents are read-only without any Thaliris word in the payload. Python decides what the values mean.
-if [ "$2" = "--filter" ] && [ -z "${AGENT_BRIDGE_DEPTH:-}${THALIRIS_FOREIGN_CHILD:-}" ]; then
-  case $payload in
-    *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*|*[Cc][Ll][Aa][Uu][Dd][Ee]-[Rr][Oo][Ll][Ee][Ss]*|*[Pp][Rr][Oo][Jj][Ee][Cc][Tt]-[Ii][Dd][Ee][Nn][Tt][Ii][Tt][Yy]*) ;;
-    *) exit 0 ;;
+has_selector() {
+  [ -d "$selectors" ] || return 1
+  command -v sha256sum >/dev/null 2>&1 || return 0
+  rest=${payload#*\"session_id\"}
+  rest=${rest#*\"}
+  session=${rest%%\"*}
+  case $session in
+    ''|*[!A-Za-z0-9._:-]*) return 0 ;;
+  esac
+  digest=$(printf '%s' "$session" | sha256sum) || return 0
+  selector=$selectors/${digest%% *}.json
+  [ -e "$selector" ] || [ -L "$selector" ]
+}
+if [ "$2" = "--filter" ] && [ -z "${AGENT_BRIDGE_DEPTH:-}${THALIRIS_FOREIGN_CHILD:-}" ] && ! has_selector; then
+  rest=${payload#*\"tool_name\"}
+  rest=${rest#*\"}
+  tool=${rest%%\"*}
+  case $tool in
+    Agent|Task|SendMessage|Skill) ;;
+    *) case $payload in
+      *'"agent_id"'*) ;;
+      *[Tt][Hh][Aa][Ll][Ii][Rr][Ii][Ss]*|*.[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*|*[Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss]*|*[Ll][Ii][Ff][Ee][Cc][Yy][Cc][Ll][Ee]*|*[Cc][Ll][Aa][Uu][Dd][Ee]-[Rr][Oo][Ll][Ee][Ss]*|*[Pp][Rr][Oo][Jj][Ee][Cc][Tt]-[Ii][Dd][Ee][Nn][Tt][Ii][Tt][Yy]*) ;;
+      *) exit 0 ;;
+    esac ;;
   esac
 fi
 
@@ -73,4 +86,12 @@ for candidate in python3 python py; do
     run "$candidate"
   fi
 done
+# With no usable interpreter, passing a managed foreign tool through would lose
+# its boundary. An ordinary plugin process still degrades to transparent.
+if [ "$event" = "PreToolUse" ]; then
+  case "${THALIRIS_FOREIGN_CHILD:-}:$payload" in
+    1:*|*'thaliris:codex-'*) printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Thaliris foreign runtime is unavailable"}}' ;;
+    *) ! has_selector || printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Thaliris foreign selector cannot be verified"}}' ;;
+  esac
+fi
 exit 0

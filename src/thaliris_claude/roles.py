@@ -450,6 +450,30 @@ ROLE_REGISTRY: dict[str, RoleRegistration] = {
     ),
 }
 
+CODEX_ROLES = ("investigator", "reviewer", "reasoning-specialist")
+_CODEX_RELAYS = {
+    f"{PLUGIN_NAMESPACE}:codex-{role}": RoleRegistration(
+        RoleSpec(role, "Run the exact launcher command in the handoff once, in the foreground. "
+                      "Return its short summary verbatim. Use no other tool, add no claims, and do not retry.\n",
+                 f"Codex {ROLE_REGISTRY[role].spec.purpose}"),
+        ClaudeExecutionBinding(agent_name=f"codex-{role}", model="haiku", tools=("Bash",),
+                               description=f"Runs a read-only Codex {role} as a managed foreign child. "
+                                           "Requires a Controller task and a thaliris-evidence marker.",
+                               repo_write_allowed=False),
+    )
+    for role in CODEX_ROLES
+}
+
+
+def codex_relay(agent_type: object) -> RoleRegistration | None:
+    return _CODEX_RELAYS.get(agent_type) if isinstance(agent_type, str) else None
+
+
+def codex_binding_snapshot(agent_type: str) -> dict:
+    relay = _CODEX_RELAYS[agent_type]
+    return {"role": relay.id, "subagent_type": agent_type, "source": "builtin", "writes": False,
+            "delegates": [], "default_model": relay.binding.model, "tools": list(relay.binding.tools)}
+
 
 def role_choices() -> tuple[str, ...]:
     return tuple(ROLE_REGISTRY)
@@ -611,6 +635,9 @@ def role_for_agent_type(agent_type: object) -> str | None:
     roles are project agents `thaliris-<name>`. Anything else is a generic agent."""
     if not isinstance(agent_type, str):
         return None
+    relay = codex_relay(agent_type)
+    if relay is not None:
+        return relay.id
     for role in child_roles():
         if ROLE_REGISTRY[role].binding.subagent_type == agent_type:
             return role
@@ -664,7 +691,10 @@ def delegation_allowed(role: str, target: str) -> bool:
 
 def render_agent(role: str) -> str:
     """Render one plugin agent file. Frontmatter carries execution facts only."""
-    registration = ROLE_REGISTRY[role]
+    return _render_registration(ROLE_REGISTRY[role])
+
+
+def _render_registration(registration: RoleRegistration) -> str:
     binding = registration.binding
     # A JSON string is a valid YAML scalar and survives the ": " in descriptions.
     lines = ["---", f"name: {binding.agent_name}", f"description: {json.dumps(binding.description)}"]
@@ -681,7 +711,9 @@ def render_agent(role: str) -> str:
 
 
 def rendered_agents() -> dict[str, str]:
-    return {f"agents/{ROLE_REGISTRY[role].binding.agent_name}.md": render_agent(role) for role in child_roles()}
+    agents = {f"agents/{ROLE_REGISTRY[role].binding.agent_name}.md": render_agent(role) for role in child_roles()}
+    agents.update({f"agents/{relay.binding.agent_name}.md": _render_registration(relay) for relay in _CODEX_RELAYS.values()})
+    return agents
 
 
 def render_role_table() -> str:
@@ -691,4 +723,6 @@ def render_role_table() -> str:
         model = "`sonnet` or `opus`, by difficulty" if role == "focused-implementer" else f"`{binding.model or 'inherit'}`"
         rows.append(f"| {ROLE_REGISTRY[role].spec.purpose} | `{binding.subagent_type}` | {model} | "
                     f"{'yes' if binding.repo_write_allowed else 'no'} | {', '.join(sorted(binding.allowed_delegation_targets)) or '—'} |")
+    for agent_type, relay in _CODEX_RELAYS.items():
+        rows.append(f"| {relay.spec.purpose} | `{agent_type}` | Codex default (`haiku` relay) | no | — |")
     return "\n".join(rows)
